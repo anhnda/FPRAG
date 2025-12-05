@@ -217,9 +217,9 @@ class BlockCascadeTester:
     def measure_cascade_error(self, texts, n_samples=100):
         """Measure error after each block for original, AWQ, and PRAQ."""
         results = {
-            'block_0': {'awq': [], 'praq': []},
-            'block_1': {'awq': [], 'praq': []},
-            'block_2': {'awq': [], 'praq': []}
+            'block_0': {'awq': [], 'praq': [], 'original': []},
+            'block_1': {'awq': [], 'praq': [], 'original': []},
+            'block_2': {'awq': [], 'praq': [], 'original': []}
         }
 
         # Collect hidden states at each block
