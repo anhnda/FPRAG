@@ -6,6 +6,7 @@ from datasets import load_dataset
 from tqdm import tqdm
 import numpy as np
 import random
+import argparse
 
 
 class LayerMSEComparator:
@@ -420,24 +421,62 @@ def find_layer_by_id(model, layer_id):
 
 
 def main():
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(
+        description="Compare AWQ vs FastRPRAQ on a specific layer",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    parser.add_argument(
+        "--layer-id",
+        type=int,
+        default=28,
+        help="Transformer layer ID to analyze (e.g., 0, 16, 28)"
+    )
+    parser.add_argument(
+        "--keep-ratio",
+        type=float,
+        default=0.5,
+        help="Fraction of channels to keep in FP16 (e.g., 0.2, 0.5, 0.7)"
+    )
+    parser.add_argument(
+        "--layer-type",
+        type=str,
+        default="gate",
+        choices=["gate", "up", "down"],
+        help="MLP layer type to analyze (gate_proj, up_proj, or down_proj)"
+    )
+    parser.add_argument(
+        "--n-calib",
+        type=int,
+        default=500,
+        help="Number of calibration samples"
+    )
+    parser.add_argument(
+        "--n-val",
+        type=int,
+        default=2000,
+        help="Number of validation samples"
+    )
+    args = parser.parse_args()
+
     # Configuration
     model_name = "openbmb/MiniCPM-2B-sft-bf16"
-    target_layer_id = 28  # Layer to analyze
+    target_layer_id = args.layer_id
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    n_calib_samples = 500
-    n_val_samples = 2000
-    keep_ratio = 0.5  # Keep 50% channels in FP16
+    n_calib_samples = args.n_calib
+    n_val_samples = args.n_val
+    keep_ratio = args.keep_ratio
     seed = 42
 
     print("=" * 80)
     print(f"LAYER-LEVEL MSE COMPARISON: AWQ vs FastRPRAQ")
     print("=" * 80)
     print(f"Model: {model_name}")
-    print(f"Target layer: {target_layer_id}")
+    print(f"Target layer: {target_layer_id} ({args.layer_type}_proj)")
     print(f"Device: {device}")
     print(f"Calibration samples: {n_calib_samples}")
     print(f"Validation samples: {n_val_samples}")
-    print(f"Keep ratio: {keep_ratio}")
+    print(f"Keep ratio: {keep_ratio} ({int(keep_ratio*100)}% FP16, {int((1-keep_ratio)*100)}% INT4)")
     print("=" * 80)
 
     # Load model and tokenizer
@@ -452,11 +491,19 @@ def main():
     model.eval()
 
     # Find target layer
-    print(f"\nSearching for layer {target_layer_id}...")
-    layer_name = find_layer_by_id(model, target_layer_id)
+    print(f"\nSearching for layer {target_layer_id} ({args.layer_type}_proj)...")
+
+    # Find specific layer type
+    layer_name = None
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear):
+            if f".{target_layer_id}." in name and f"{args.layer_type}_proj" in name.lower():
+                layer_name = name
+                break
 
     if layer_name is None:
-        print(f"ERROR: Could not find layer {target_layer_id}")
+        print(f"ERROR: Could not find layer {target_layer_id} with type {args.layer_type}_proj")
+        print(f"Try --layer-type gate, --layer-type up, or --layer-type down")
         return
 
     print(f"Found target layer: {layer_name}")
