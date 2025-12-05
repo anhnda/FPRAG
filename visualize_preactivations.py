@@ -133,13 +133,16 @@ class PreActivationAnalyzer:
             # Concatenate all pre-activations
             Z = torch.cat(preacts_list, dim=0)  # [total_tokens, out_features]
 
+            # Convert to float32 for quantile computation (quantile requires float32/64)
+            Z = Z.float()
+
             # Compute per-channel statistics
             z_mean = Z.mean(dim=0)  # [out_features]
             z_std = Z.std(dim=0)    # [out_features]
             z_min = Z.min(dim=0)[0]
             z_max = Z.max(dim=0)[0]
 
-            # Compute percentiles
+            # Compute percentiles (requires float32/64 dtype)
             z_p05 = torch.quantile(Z, 0.05, dim=0)
             z_p95 = torch.quantile(Z, 0.95, dim=0)
 
