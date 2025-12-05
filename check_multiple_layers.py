@@ -8,6 +8,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
 from tqdm import tqdm
 import random
+import argparse
 
 
 def load_wikitext2(split="train", n_samples=None, seed=42):
@@ -242,11 +243,49 @@ def find_mlp_layers(model, num_blocks=3):
 
 
 def main():
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(
+        description="Multi-layer MSE comparison: AWQ vs FastRPRAQ",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    parser.add_argument(
+        "--keep-ratio",
+        type=float,
+        default=0.2,
+        help="Fraction of channels to keep in FP16"
+    )
+    parser.add_argument(
+        "--n-calib",
+        type=int,
+        default=500,
+        help="Number of calibration samples"
+    )
+    parser.add_argument(
+        "--n-val",
+        type=int,
+        default=2000,
+        help="Number of validation samples"
+    )
+    parser.add_argument(
+        "--num-blocks",
+        type=int,
+        default=3,
+        help="Number of transformer blocks to sample (3 blocks × 3 layers = 9 layers)"
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for reproducibility"
+    )
+    args = parser.parse_args()
+
+    # Configuration
     model_name = "openbmb/MiniCPM-2B-sft-bf16"
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    n_calib = 500
-    n_val = 2000
-    keep_ratio = 0.5
+    n_calib = args.n_calib
+    n_val = args.n_val
+    keep_ratio = args.keep_ratio
 
     print("=" * 80)
     print("MULTI-LAYER MSE COMPARISON: AWQ vs FastRPRAQ")
@@ -254,7 +293,8 @@ def main():
     print(f"Device: {device}")
     print(f"Calibration samples: {n_calib}")
     print(f"Validation samples: {n_val}")
-    print(f"Keep ratio: {keep_ratio}")
+    print(f"Keep ratio: {keep_ratio} ({int(keep_ratio*100)}% FP16, {int((1-keep_ratio)*100)}% INT4)")
+    print(f"Random seed: {args.seed}")
     print("=" * 80)
 
     # Load model
@@ -268,17 +308,17 @@ def main():
     )
     model.eval()
 
-    # Find layers to test (3 blocks × 3 layers each = 9 layers)
-    mlp_layers = find_mlp_layers(model, num_blocks=3)
-    print(f"\nTesting {len(mlp_layers)} MLP layers from 3 blocks:")
+    # Find layers to test
+    mlp_layers = find_mlp_layers(model, num_blocks=args.num_blocks)
+    print(f"\nTesting {len(mlp_layers)} MLP layers from {args.num_blocks} blocks:")
     print(f"(Each block has 3 layers: gate_proj, up_proj, down_proj)")
     for layer in mlp_layers:
         print(f"  - {layer}")
 
     # Load data
     print("\nLoading datasets...")
-    calib_texts = load_wikitext2("train", n_samples=n_calib)
-    val_texts = load_wikitext2("validation", n_samples=n_val)
+    calib_texts = load_wikitext2("train", n_samples=n_calib, seed=args.seed)
+    val_texts = load_wikitext2("validation", n_samples=n_val, seed=args.seed)
 
     # Test each layer
     results = []
@@ -312,16 +352,37 @@ def main():
         praq_wins = sum(1 for r in results if r['improvement'] > 0)
 
         print(f"\nLayers tested: {len(results)}")
-        print(f"PRAQ wins: {praq_wins}/{len(results)}")
+        print(f"PRAQ wins: {praq_wins}/{len(results)} ({100*praq_wins/len(results):.0f}%)")
         print(f"Average improvement: {avg_improvement:+.2f}%")
+        print(f"Keep ratio: {keep_ratio} ({int(keep_ratio*100)}% FP16, {int((1-keep_ratio)*100)}% INT4)")
 
         print("\n" + "-" * 80)
         print(f"{'Layer':<50} {'AWQ MSE':<12} {'PRAQ MSE':<12} {'Improvement':<12}")
         print("-" * 80)
         for r in results:
             layer_short = r['layer'].split('.')[-2] + '.' + r['layer'].split('.')[-1]
-            print(f"{layer_short:<50} {r['mse_awq']:<12.6f} {r['mse_praq']:<12.6f} {r['improvement']:+11.2f}%")
+            winner = "✓" if r['improvement'] > 0 else "✗"
+            print(f"{layer_short:<50} {r['mse_awq']:<12.6f} {r['mse_praq']:<12.6f} {r['improvement']:+11.2f}% {winner}")
         print("-" * 80)
+
+        # Show statistics by layer type
+        gate_results = [r for r in results if 'gate' in r['layer']]
+        up_results = [r for r in results if 'up' in r['layer']]
+        down_results = [r for r in results if 'down' in r['layer']]
+
+        print("\nBreakdown by layer type:")
+        if gate_results:
+            gate_avg = sum(r['improvement'] for r in gate_results) / len(gate_results)
+            gate_wins = sum(1 for r in gate_results if r['improvement'] > 0)
+            print(f"  gate_proj: {gate_wins}/{len(gate_results)} wins, avg {gate_avg:+.2f}%")
+        if up_results:
+            up_avg = sum(r['improvement'] for r in up_results) / len(up_results)
+            up_wins = sum(1 for r in up_results if r['improvement'] > 0)
+            print(f"  up_proj:   {up_wins}/{len(up_results)} wins, avg {up_avg:+.2f}%")
+        if down_results:
+            down_avg = sum(r['improvement'] for r in down_results) / len(down_results)
+            down_wins = sum(1 for r in down_results if r['improvement'] > 0)
+            print(f"  down_proj: {down_wins}/{len(down_results)} wins, avg {down_avg:+.2f}%")
 
 
 if __name__ == "__main__":
