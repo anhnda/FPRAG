@@ -329,7 +329,7 @@ def visualize_focused_layer(df, Z, layer_name, save_dir="./visualizations/focuse
 def main():
     # Configuration
     model_name = "openbmb/MiniCPM-2B-sft-bf16"
-    target_layer_id = 16  # Layer number to analyze
+    target_layer_id = 28  # Layer number to analyze
     device = "cuda" if torch.cuda.is_available() else "cpu"
     n_samples = 100
     save_dir = f"./visualizations/layer_{target_layer_id}_focused"
