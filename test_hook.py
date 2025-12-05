@@ -32,7 +32,7 @@ inputs = tokenizer('Hello world', return_tensors='pt')
 inputs = {k: v.to('cuda') for k, v in inputs.items()}
 
 with torch.no_grad():
-    output = model(**inputs)
+    output = model(**inputs, use_cache=False)
 
 print(f"\n✓ Inference complete")
 print(f"✓ Hook was called {call_count[0]} times")
