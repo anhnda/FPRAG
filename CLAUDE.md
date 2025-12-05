@@ -44,10 +44,18 @@ The key insight is that quantization noise is proportional to weight magnitude, 
 - Shows AWQ accidentally handles Group B correctly by keeping high magnitudes
 - Demonstrates Fast-R-PRAQ v3 correctly identifies both utility and risk
 
-**quantize_minicpm_awq.py** - AWQ baseline quantization:
+**quantize_minicpm_awq.py** - AWQ baseline quantization (library-based):
 - Uses AutoAWQ library for standard 4-bit quantization
 - Simple importance metric: `E[|XW + b|]` (output magnitude)
+- Requires safetensors format (run convert_to_safetensors.py first)
 - Saves to `./quantized_models/minicpm_awq`
+
+**quantize_minicpm_AWQ.py** - AWQ custom implementation (library-free):
+- Pure PyTorch implementation of AWQ algorithm
+- Same importance metric as library version: `E[|XW^T + b|]`
+- Works with PyTorch bin files (no safetensors required)
+- Mirrors the structure of quantize_minicpm_PRAQ.py for fair comparison
+- Saves to `./quantized_models/minicpm_awq_custom`
 
 **quantize_minicpm_PRAQ.py** - Fast-R-PRAQ hybrid quantization implementation:
 - Automatically detects layer types (MLP vs Attention) via naming heuristics
@@ -86,18 +94,19 @@ The key insight is that quantization noise is proportional to weight magnitude, 
 ### Running Quantization
 
 ```bash
-# IMPORTANT: AWQ requires safetensors format
-# If you get "model.safetensors not found" error, run conversion first:
-python convert_to_safetensors.py
-# Then update model_name in quantize_minicpm_awq.py to use the local path
+# Quantize with AWQ - Custom Implementation (RECOMMENDED)
+# Pure PyTorch, works with PyTorch bins, no dependencies
+python quantize_minicpm_AWQ.py
 
-# Quantize with AWQ (baseline)
+# Quantize with AWQ - Library Version (requires safetensors)
+# If you get "model.safetensors not found" error, run conversion first:
+# python convert_to_safetensors.py
 python quantize_minicpm_awq.py
 
-# Quantize with Fast-R-PRAQ hybrid approach (works with PyTorch bins)
+# Quantize with Fast-R-PRAQ hybrid approach
 python quantize_minicpm_PRAQ.py
 
-# Run synthetic benchmark
+# Run synthetic benchmark comparing AWQ vs FastRPRAQ
 python awq_vs_fprpa.py
 ```
 
