@@ -81,8 +81,7 @@ def main():
     print("\nLoading model for AWQ quantization...")
     model = AutoAWQForCausalLM.from_pretrained(
         model_name,
-        trust_remote_code=True,
-        safetensors=True
+        trust_remote_code=True
     )
 
     # Load calibration data
