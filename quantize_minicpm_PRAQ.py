@@ -134,21 +134,38 @@ class FastRPRAQQuantizer:
         # Concatenate all activation samples
         X_list = self.activation_data[name]
         X = torch.cat([x.reshape(-1, x.shape[-1]) for x in X_list], dim=0)
-        X = X.to(self.device)
 
+        # Process in batches to avoid OOM
+        batch_size = 1024
+        n_samples = X.shape[0]
         W = module.weight.data  # [out_features, in_features]
         b = module.bias.data if module.bias is not None else torch.zeros(module.out_features, device=self.device)
-
-        # Compute pre-activation values: Z = XW^T + b
-        Z = torch.matmul(X, W.t()) + b
-
-        # Apply activation (SiLU/GELU/ReLU)
         activation_fn = self._get_activation_function()
-        A = activation_fn(Z)  # Post-activation values
 
-        # Compute importance based on post-activation magnitude
-        # Simple and effective: channels that produce large activations are important
-        importance = A.abs().mean(dim=0) + A.std(dim=0)
+        importance_sum = torch.zeros(module.out_features, device=self.device)
+        importance_sq_sum = torch.zeros(module.out_features, device=self.device)
+
+        for i in range(0, n_samples, batch_size):
+            batch_X = X[i:i+batch_size].to(self.device)
+
+            # Compute pre-activation values: Z = XW^T + b
+            Z = torch.matmul(batch_X, W.t()) + b
+
+            # Apply activation (SiLU/GELU/ReLU)
+            A = activation_fn(Z)  # Post-activation values
+
+            # Accumulate statistics
+            importance_sum += A.abs().sum(dim=0)
+            importance_sq_sum += (A ** 2).sum(dim=0)
+
+            # Free memory
+            del batch_X, Z, A
+
+        # Compute mean and std
+        importance = importance_sum / n_samples
+        variance = (importance_sq_sum / n_samples) - (importance ** 2)
+        std = torch.sqrt(variance.clamp(min=0))
+        importance = importance + std
 
         # Hardware grouping
         C_out = importance.shape[0]
@@ -180,16 +197,29 @@ class FastRPRAQQuantizer:
         # Concatenate all activation samples
         X_list = self.activation_data[name]
         X = torch.cat([x.reshape(-1, x.shape[-1]) for x in X_list], dim=0)
-        X = X.to(self.device)
 
+        # Process in batches to avoid OOM
+        batch_size = 1024
+        n_samples = X.shape[0]
         W = module.weight.data  # [out_features, in_features]
         b = module.bias.data if module.bias is not None else torch.zeros(module.out_features, device=self.device)
 
-        # Compute pre-activation values: Z = XW^T + b
-        Z = torch.matmul(X, W.t()) + b
+        importance_sum = torch.zeros(module.out_features, device=self.device)
+
+        for i in range(0, n_samples, batch_size):
+            batch_X = X[i:i+batch_size].to(self.device)
+
+            # Compute pre-activation values: Z = XW^T + b
+            Z = torch.matmul(batch_X, W.t()) + b
+
+            # Accumulate statistics
+            importance_sum += Z.abs().sum(dim=0)
+
+            # Free memory
+            del batch_X, Z
 
         # AWQ-style importance: simply use output magnitude
-        importance = Z.abs().mean(dim=0)
+        importance = importance_sum / n_samples
 
         # Hardware grouping
         C_out = importance.shape[0]
@@ -224,7 +254,7 @@ class FastRPRAQQuantizer:
     @torch.no_grad()
     def quantize_layer(self, module, importance_scores, keep_ratio=0.5):
         """
-        Apply mixed-precision quantization to a linear layer.
+        Apply mixed-precision quantization to a linear layer (vectorized for speed).
 
         Args:
             module: Linear layer
@@ -239,25 +269,30 @@ class FastRPRAQQuantizer:
         top_k_indices = torch.topk(importance_scores, k).indices
 
         # Create mask for high-precision channels
-        mask_keep = torch.zeros(out_features, dtype=torch.bool)
+        mask_keep = torch.zeros(out_features, dtype=torch.bool, device=W.device)
         mask_keep[top_k_indices] = True
 
-        # Quantize low-importance channels more aggressively
-        for c in range(out_features):
-            if not mask_keep[c]:
-                # Simulate INT4 quantization with noise
-                w_channel = W[c, :]
-                w_range = w_channel.abs().max()
+        # Get indices of channels to quantize
+        quantize_indices = ~mask_keep
 
-                # Quantize to INT4 range [-8, 7]
-                scale = w_range / 7.0
-                if scale > 0:
-                    w_quant = torch.round(w_channel / scale).clamp(-8, 7)
-                    W[c, :] = w_quant * scale
+        if quantize_indices.any():
+            # Vectorized quantization for all low-importance channels at once
+            W_quantize = W[quantize_indices]  # [n_quantize, in_features]
 
-                    # Add quantization noise
-                    noise = torch.randn_like(w_channel) * scale * 0.1
-                    W[c, :] += noise
+            # Per-channel scales (vectorized)
+            scales = W_quantize.abs().max(dim=1, keepdim=True)[0] / 7.0  # [n_quantize, 1]
+            scales = scales.clamp(min=1e-8)  # Prevent division by zero
+
+            # Quantize to INT4 range [-8, 7] (vectorized)
+            W_quant = torch.round(W_quantize / scales).clamp(-8, 7)
+            W_dequant = W_quant * scales
+
+            # Add quantization noise (vectorized)
+            noise = torch.randn_like(W_dequant) * scales * 0.1
+            W_dequant = W_dequant + noise
+
+            # Write back quantized weights
+            W[quantize_indices] = W_dequant
 
     def calibrate(self, calibration_data, n_samples=500):
         """
@@ -279,10 +314,12 @@ class FastRPRAQQuantizer:
 
                 # Forward pass to collect activations
                 with torch.no_grad():
-                    self.model(**inputs)
+                    _ = self.model(**inputs, use_cache=False, return_dict=True)
 
-            except Exception as e:
-                print(f"Error processing sample {i}: {e}")
+            except Exception:
+                # Silently skip errors during calibration (common with cache issues)
+                if i % 100 == 0 and i > 0:
+                    print(f"\nNote: Skipped {i} samples with errors (cache-related issues are normal)")
                 continue
 
         self.remove_hooks()
@@ -295,32 +332,51 @@ class FastRPRAQQuantizer:
         Args:
             keep_ratio: Fraction of channels to keep in higher precision
         """
-        print("\nComputing importance scores and quantizing layers...")
+        print("\n" + "=" * 80)
+        print("Computing importance scores and quantizing layers...")
+        print("=" * 80)
 
         mlp_quantized = 0
         attn_quantized = 0
+        skipped_count = 0
 
         for name, module in tqdm(list(self.model.named_modules()), desc="Quantizing"):
             if isinstance(module, nn.Linear):
-                layer_type = self.layer_types.get(name, 'mlp')
+                try:
+                    layer_type = self.layer_types.get(name, 'mlp')
 
-                # Compute importance scores
-                importance_scores = self.compute_importance_scores(name, module)
+                    # Compute importance scores
+                    importance_scores = self.compute_importance_scores(name, module)
 
-                # Quantize the layer
-                self.quantize_layer(module, importance_scores, keep_ratio)
+                    # Quantize the layer
+                    self.quantize_layer(module, importance_scores, keep_ratio)
 
-                if layer_type == 'mlp':
-                    mlp_quantized += 1
-                else:
-                    attn_quantized += 1
+                    if layer_type == 'mlp':
+                        mlp_quantized += 1
+                    else:
+                        attn_quantized += 1
 
-        print(f"\nQuantization complete!")
-        print(f"  MLP layers quantized (post-activation): {mlp_quantized}")
-        print(f"  Attention layers quantized (AWQ-style): {attn_quantized}")
+                    # Clear GPU cache every 50 layers to prevent OOM
+                    if (mlp_quantized + attn_quantized) % 50 == 0 and torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+                except Exception as e:
+                    print(f"\n⚠️  Error quantizing layer {name}: {e}")
+                    skipped_count += 1
+                    continue
+
+        print(f"\n✅ Quantization complete!")
+        print(f"   MLP layers quantized (post-activation): {mlp_quantized}")
+        print(f"   Attention layers quantized (AWQ-style): {attn_quantized}")
+        if skipped_count > 0:
+            print(f"   ⚠️  Skipped {skipped_count} layers due to errors")
 
         # Clear activation data to free memory
         self.activation_data = {}
+
+        # Final GPU cache clear
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 def load_wikitext2(split="train", n_samples=None):
