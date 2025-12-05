@@ -164,7 +164,7 @@ class LayerMSEComparator:
     def compute_awq_importance(self, X):
         """
         Compute AWQ-style importance scores.
-        Matches the implementation in quantize_minicpm_AWQ.py
+        Uses the original AWQ metric: E[|XW^T + b|]
 
         Args:
             X: Input activations [tokens, in_features]
@@ -180,14 +180,8 @@ class LayerMSEComparator:
         if b is not None:
             Z = Z + b
 
-        # AWQ importance: E[|Z|] per channel + stability term
-        Z_abs = Z.abs()
-        importance = Z_abs.mean(dim=0)
-
-        # Add variance term for stability (matching full model implementation)
-        variance = (Z_abs ** 2).mean(dim=0) - (importance ** 2)
-        std = torch.sqrt(variance.clamp(min=0))
-        importance = importance + std * 0.1
+        # AWQ importance: E[|Z|] per channel (original AWQ paper)
+        importance = Z.abs().mean(dim=0)
 
         return importance
 

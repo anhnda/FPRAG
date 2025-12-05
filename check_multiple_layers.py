@@ -91,7 +91,9 @@ class LayerTester:
 
     @torch.no_grad()
     def compute_awq_importance(self, X):
-        """Compute AWQ importance."""
+        """
+        Compute AWQ importance using original AWQ metric: E[|XW^T + b|]
+        """
         W = self.target_module.weight.data.cpu().float()
         b = self.target_module.bias.data.cpu().float() if self.target_module.bias is not None else None
 
@@ -99,6 +101,7 @@ class LayerTester:
         if b is not None:
             Z = Z + b
 
+        # AWQ importance: E[|Z|] per channel (original AWQ paper)
         return Z.abs().mean(dim=0)
 
     @torch.no_grad()

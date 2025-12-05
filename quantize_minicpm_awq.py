@@ -64,6 +64,7 @@ class AWQQuantizer:
         Compute AWQ importance scores.
 
         AWQ Metric: E[|Z|] where Z = XW^T + b (pre-activation output)
+        This matches the original AWQ paper.
 
         Args:
             name: Layer name
@@ -86,7 +87,6 @@ class AWQQuantizer:
         b = module.bias.data if module.bias is not None else torch.zeros(module.out_features, device=self.device)
 
         importance_sum = torch.zeros(module.out_features, device=self.device)
-        importance_sq_sum = torch.zeros(module.out_features, device=self.device)
 
         for i in range(0, n_samples, batch_size):
             batch_X = X[i:i+batch_size].to(self.device)
@@ -96,18 +96,12 @@ class AWQQuantizer:
 
             # Accumulate statistics
             importance_sum += Z.abs().sum(dim=0)
-            importance_sq_sum += (Z ** 2).sum(dim=0)
 
             # Free memory
             del batch_X, Z
 
-        # Compute mean and std
+        # AWQ importance: E[|Z|] (original AWQ paper)
         importance = importance_sum / n_samples
-        variance = (importance_sq_sum / n_samples) - (importance ** 2)
-        std = torch.sqrt(variance.clamp(min=0))
-
-        # Add small variance term for stability
-        importance = importance + std * 0.1
 
         return importance.cpu()
 
