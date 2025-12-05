@@ -4,6 +4,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
 from tqdm import tqdm
 import os
+import argparse
 
 
 class AWQQuantizer:
@@ -243,15 +244,40 @@ def load_wikitext2(split="train", n_samples=None):
 
 
 def main():
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(
+        description="AWQ quantization for MiniCPM-2B",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    parser.add_argument(
+        "--keep-ratio",
+        type=float,
+        default=0.2,
+        help="Fraction of channels to keep in FP16 (0.1=aggressive, 0.5=conservative)"
+    )
+    parser.add_argument(
+        "--n-calib",
+        type=int,
+        default=500,
+        help="Number of calibration samples"
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="./quantized_models/minicpm_awq_custom",
+        help="Output directory for quantized model"
+    )
+    args = parser.parse_args()
+
     # Configuration
-    model_name = "openbmb/MiniCPM-2B-sft-bf16"  # MiniCPM-2.4B
+    model_name = "openbmb/MiniCPM-2B-sft-bf16"
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    n_calib_samples = 500
-    keep_ratio = 0.5  # Keep 50% channels in higher precision
-    output_dir = "./quantized_models/minicpm_awq_custom"
+    n_calib_samples = args.n_calib
+    keep_ratio = args.keep_ratio
+    output_dir = args.output_dir
 
     print("=" * 80)
-    print("AWQ (Activation-aware Weight Quantization) for MiniCPM-2.4")
+    print("AWQ (Activation-aware Weight Quantization) for MiniCPM-2B")
     print("=" * 80)
     print("Method: Simple activation magnitude importance")
     print("  Importance = E[|XW^T + b|] per output channel")
@@ -259,7 +285,7 @@ def main():
     print(f"Device: {device}")
     print(f"Model: {model_name}")
     print(f"Calibration samples: {n_calib_samples}")
-    print(f"Keep ratio: {keep_ratio}")
+    print(f"Keep ratio: {keep_ratio} ({int(keep_ratio*100)}% FP16, {int((1-keep_ratio)*100)}% INT4)")
     print(f"Output directory: {output_dir}")
     print("=" * 80)
 
@@ -319,6 +345,12 @@ def main():
     print("  - Importance: E[|XW^T + b|] - mean absolute activation")
     print("  - All linear layers quantized with same strategy")
     print(f"  - Keep ratio: {keep_ratio} ({int(keep_ratio*100)}% in FP16, {int((1-keep_ratio)*100)}% in INT4)")
+
+    # Calculate average bits per weight
+    avg_bits = keep_ratio * 16 + (1 - keep_ratio) * 4
+    compression = 16 / avg_bits
+    print(f"  - Average bits per weight: {avg_bits:.1f}")
+    print(f"  - Compression ratio: {compression:.2f}×")
     print("=" * 80)
 
 
