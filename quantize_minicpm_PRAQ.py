@@ -39,8 +39,16 @@ class FastRPRAQQuantizer:
         mlp_count = sum(1 for t in self.layer_types.values() if t == 'mlp')
         attn_count = sum(1 for t in self.layer_types.values() if t == 'attention')
         print(f"\n[Layer Detection]")
-        print(f"  MLP layers (post-activation quantization): {mlp_count}")
+        print(f"  MLP layers (risk-aware quantization): {mlp_count}")
         print(f"  Attention layers (AWQ-style quantization): {attn_count}")
+
+        # Show examples of each type
+        mlp_examples = [name for name, t in self.layer_types.items() if t == 'mlp'][:3]
+        attn_examples = [name for name, t in self.layer_types.items() if t == 'attention'][:3]
+        if mlp_examples:
+            print(f"  MLP examples: {mlp_examples}")
+        if attn_examples:
+            print(f"  Attention examples: {attn_examples}")
 
     def _detect_layer_types(self):
         """
@@ -188,16 +196,12 @@ class FastRPRAQQuantizer:
         # Final importance: probability of activation × utility magnitude
         raw_importance = prob_active * magnitude
 
-        # Hardware grouping
-        C_out = raw_importance.shape[0]
-        if self.group_size > 0 and C_out % self.group_size == 0:
-            grouped = raw_importance.view(-1, self.group_size)
-            group_scores = grouped.sum(dim=1)
-            final_importance = group_scores.repeat_interleave(self.group_size)
-        else:
-            final_importance = raw_importance
+        # NOTE: Hardware grouping disabled for fair comparison with AWQ
+        # AWQ doesn't use grouping, so we shouldn't either
+        # Grouping would force all channels in a group to have the same importance,
+        # which destroys the fine-grained risk-aware importance scores
 
-        return final_importance.cpu()
+        return raw_importance.cpu()
 
     @torch.no_grad()
     def compute_importance_scores_attention(self, name, module):
@@ -242,16 +246,9 @@ class FastRPRAQQuantizer:
         # AWQ-style importance: simply use output magnitude
         importance = importance_sum / n_samples
 
-        # Hardware grouping
-        C_out = importance.shape[0]
-        if self.group_size > 0 and C_out % self.group_size == 0:
-            grouped = importance.view(-1, self.group_size)
-            group_scores = grouped.sum(dim=1)
-            final_importance = group_scores.repeat_interleave(self.group_size)
-        else:
-            final_importance = importance
+        # NOTE: Hardware grouping disabled for fair comparison with AWQ
 
-        return final_importance.cpu()
+        return importance.cpu()
 
     @torch.no_grad()
     def compute_importance_scores(self, name, module):
