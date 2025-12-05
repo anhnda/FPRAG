@@ -351,6 +351,10 @@ def visualize_error_propagation(errors, output_dir="./visualizations/error_propa
     """Visualize how errors accumulate through blocks."""
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
+    if not errors['awq'] or not errors['praq']:
+        print("  Skipping visualization (no data)")
+        return
+
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
     blocks = list(range(len(errors['awq'])))
@@ -450,6 +454,15 @@ def main():
     print("\n" + "=" * 80)
     print("ANALYSIS")
     print("=" * 80)
+
+    if not errors['awq'] or not errors['praq']:
+        print("⚠ No error data collected!")
+        print("  This likely means block outputs were not captured properly.")
+        print("  Possible issues:")
+        print("    - Hook registration failed")
+        print("    - Model architecture different than expected")
+        print("    - All samples failed during inference")
+        return
 
     final_ratio = errors['praq'][-1] / errors['awq'][-1]
     if final_ratio > 1.05:
