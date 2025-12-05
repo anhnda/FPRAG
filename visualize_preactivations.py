@@ -87,6 +87,9 @@ class PreActivationAnalyzer:
         print(f"Collecting pre-activation data from {min(max_samples, len(texts))} samples...")
         self.model.eval()
 
+        successful_samples = 0
+        failed_samples = 0
+
         for i, text in enumerate(tqdm(texts[:max_samples], desc="Processing")):
             if i >= max_samples:
                 break
@@ -101,13 +104,18 @@ class PreActivationAnalyzer:
                 inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
                 # Forward pass to collect activations
-                self.model(**inputs)
+                # Disable caching to avoid compatibility issues
+                self.model(**inputs, use_cache=False)
+                successful_samples += 1
 
             except Exception as e:
-                print(f"Error processing sample {i}: {e}")
+                print(f"\nError processing sample {i}: {e}")
+                failed_samples += 1
                 continue
 
-        print("Data collection complete!")
+        print(f"\nData collection complete!")
+        print(f"  Successful: {successful_samples} samples")
+        print(f"  Failed: {failed_samples} samples")
 
     def compute_statistics(self):
         """
@@ -425,9 +433,24 @@ def main():
     # Remove hooks
     analyzer.remove_hooks()
 
+    # Debug: Check if data was collected
+    print(f"\nData collected for {len(analyzer.preactivation_data)} layers")
+    if len(analyzer.preactivation_data) == 0:
+        print("ERROR: No data was collected!")
+        print("This could mean:")
+        print("  1. No forward pass was executed")
+        print("  2. All samples failed to process")
+        print("  3. The model architecture doesn't have linear layers")
+        return
+
     # Compute statistics
     print("\nComputing statistics...")
     stats = analyzer.compute_statistics()
+
+    print(f"Statistics computed for {len(stats)} layers")
+    if len(stats) == 0:
+        print("ERROR: No statistics were computed!")
+        return
 
     # Analyze hypothesis
     print("\nAnalyzing Fast-R-PRAQ hypothesis...")
@@ -439,6 +462,15 @@ def main():
     print("=" * 80)
     print(f"\nTesting: Do 'critical' channels exist?")
     print("Critical = Dead (mean < -3) + Risky (upper bound > -3) + High Weight\n")
+
+    if not analysis:
+        print("ERROR: No layers were analyzed!")
+        print("This could mean:")
+        print("  1. No linear layers were found in the model")
+        print("  2. No activation data was collected")
+        print("  3. The hooks failed to capture data")
+        print("\nPlease check the model architecture and hook registration.")
+        return
 
     total_critical = 0
     total_channels = 0
@@ -456,31 +488,40 @@ def main():
             print()
 
     print("=" * 80)
-    print(f"OVERALL: {total_critical} / {total_channels} ({total_critical/total_channels*100:.2f}%) channels are CRITICAL")
+    if total_channels == 0:
+        print("ERROR: No channels were analyzed!")
+        print("Please check if statistics were computed correctly.")
+    else:
+        print(f"OVERALL: {total_critical} / {total_channels} ({total_critical/total_channels*100:.2f}%) channels are CRITICAL")
     print("=" * 80)
 
-    if total_critical > 0:
-        print("\n✅ HYPOTHESIS CONFIRMED:")
-        print("   Critical channels exist in real models!")
-        print("   Fast-R-PRAQ's approach is necessary to handle these risky channels.")
-    else:
-        print("\n❌ HYPOTHESIS REJECTED:")
-        print("   No critical channels found.")
-        print("   Fast-R-PRAQ may be over-engineering for this model.")
+    if total_channels > 0:
+        if total_critical > 0:
+            print("\n✅ HYPOTHESIS CONFIRMED:")
+            print("   Critical channels exist in real models!")
+            print("   Fast-R-PRAQ's approach is necessary to handle these risky channels.")
+        else:
+            print("\n❌ HYPOTHESIS REJECTED:")
+            print("   No critical channels found.")
+            print("   Fast-R-PRAQ may be over-engineering for this model.")
 
     # Create visualizations
-    print("\n\nCreating visualizations...")
+    if total_channels > 0 and len(stats) > 0:
+        print("\n\nCreating visualizations...")
 
-    # Visualize a few representative layers
-    layers_to_visualize = list(stats.keys())[:5]  # First 5 layers
+        # Visualize a few representative layers
+        layers_to_visualize = list(stats.keys())[:5]  # First 5 layers
 
-    for layer_name in tqdm(layers_to_visualize, desc="Visualizing layers"):
-        visualize_layer(layer_name, stats[layer_name], analysis[layer_name], save_dir)
+        for layer_name in tqdm(layers_to_visualize, desc="Visualizing layers"):
+            visualize_layer(layer_name, stats[layer_name], analysis[layer_name], save_dir)
 
-    # Create summary visualization
-    create_summary_visualization(analysis, save_dir)
+        # Create summary visualization
+        create_summary_visualization(analysis, save_dir)
 
-    print(f"\n✅ Visualizations saved to: {save_dir}")
+        print(f"\n✅ Visualizations saved to: {save_dir}")
+    else:
+        print("\nSkipping visualizations due to missing data.")
+
     print("\nAnalysis complete!")
 
 
