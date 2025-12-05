@@ -229,9 +229,11 @@ class BlockCascadeTester:
 
             for block_idx in range(self.num_blocks):
                 block_outputs = []
+                hook_call_count = [0]  # Use list to allow mutation in closure
 
-                def make_hook(outputs_list):
+                def make_hook(outputs_list, counter):
                     def hook_fn(module, input, output):
+                        counter[0] += 1
                         # Capture block output
                         if isinstance(output, tuple):
                             out = output[0].detach()
@@ -247,7 +249,7 @@ class BlockCascadeTester:
                 hook = None
                 for name, module in self.model.named_modules():
                     if name == block_name:
-                        hook = module.register_forward_hook(make_hook(block_outputs))
+                        hook = module.register_forward_hook(make_hook(block_outputs, hook_call_count))
                         print(f"    Registered hook on {block_name}")
                         break
 
@@ -256,13 +258,22 @@ class BlockCascadeTester:
 
                 # Run inference
                 self.model.eval()
+                success_count = 0
+                error_count = 0
                 for text in tqdm(texts[:n_samples], desc=f"Block {block_idx} ({method_name})", leave=False):
                     try:
                         inputs = self.tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
                         inputs = {k: v.to(self.device) for k, v in inputs.items()}
                         self.model(**inputs, use_cache=False)
-                    except:
+                        success_count += 1
+                    except Exception as e:
+                        error_count += 1
+                        if error_count <= 3:  # Print first 3 errors
+                            print(f"\n    Error during inference: {e}")
                         continue
+
+                print(f"    Inference: {success_count} successful, {error_count} failed")
+                print(f"    Hook called {hook_call_count[0]} times")
 
                 if hook:
                     hook.remove()
