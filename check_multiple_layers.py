@@ -196,21 +196,49 @@ class LayerTester:
         }
 
 
-def find_mlp_layers(model, num_layers=5):
-    """Find MLP layers to test."""
-    mlp_layers = []
+def find_mlp_layers(model, num_blocks=3):
+    """
+    Find MLP layers to test. Tests all 3 components (gate_proj, up_proj, down_proj)
+    from multiple transformer blocks.
+
+    Args:
+        num_blocks: Number of transformer blocks to sample
+
+    Returns:
+        List of layer names covering all MLP components
+    """
+    # Group by transformer block
+    blocks = {}
     for name, module in model.named_modules():
         if isinstance(module, nn.Linear):
             name_lower = name.lower()
-            if any(kw in name_lower for kw in ['gate', 'up_proj', 'down_proj']):
-                mlp_layers.append(name)
+            if 'mlp' in name_lower:
+                # Extract block number (e.g., "model.layers.5.mlp.gate_proj" -> 5)
+                parts = name.split('.')
+                for i, part in enumerate(parts):
+                    if part == 'layers' and i + 1 < len(parts):
+                        block_id = int(parts[i + 1])
+                        if block_id not in blocks:
+                            blocks[block_id] = []
+                        blocks[block_id].append(name)
+                        break
 
-    # Sample evenly from different depths
-    if len(mlp_layers) > num_layers:
-        step = len(mlp_layers) // num_layers
-        mlp_layers = [mlp_layers[i * step] for i in range(num_layers)]
+    # Sample blocks evenly across model depth
+    sorted_blocks = sorted(blocks.keys())
+    if len(sorted_blocks) > num_blocks:
+        step = len(sorted_blocks) // num_blocks
+        selected_blocks = [sorted_blocks[i * step] for i in range(num_blocks)]
+    else:
+        selected_blocks = sorted_blocks
 
-    return mlp_layers[:num_layers]
+    # Collect all layers from selected blocks
+    selected_layers = []
+    for block_id in selected_blocks:
+        # Sort to get consistent order: gate_proj, up_proj, down_proj
+        block_layers = sorted(blocks[block_id])
+        selected_layers.extend(block_layers)
+
+    return selected_layers
 
 
 def main():
@@ -240,9 +268,10 @@ def main():
     )
     model.eval()
 
-    # Find layers to test
-    mlp_layers = find_mlp_layers(model, num_layers=5)
-    print(f"\nTesting {len(mlp_layers)} MLP layers:")
+    # Find layers to test (3 blocks × 3 layers each = 9 layers)
+    mlp_layers = find_mlp_layers(model, num_blocks=3)
+    print(f"\nTesting {len(mlp_layers)} MLP layers from 3 blocks:")
+    print(f"(Each block has 3 layers: gate_proj, up_proj, down_proj)")
     for layer in mlp_layers:
         print(f"  - {layer}")
 
