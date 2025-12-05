@@ -1,7 +1,6 @@
 import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from awq import AutoAWQForCausalLM
 from datasets import load_dataset
 import numpy as np
 from tqdm import tqdm
@@ -126,14 +125,17 @@ def compare_models():
 
     # Configuration
     original_model_name = "openbmb/MiniCPM-2B-sft-bf16"
-    praq_model_path = "./quantized_models/minicpm_praq"
-    awq_model_path = "./quantized_models/minicpm_awq"
+    praq_model_path = "./quantized_models/minicpm_praq_hybrid"
+    awq_model_path = "./quantized_models/minicpm_awq_custom"
     n_eval_samples = 2000
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     print("=" * 80)
-    print("MiniCPM-2.4 Quantization Comparison: Fast-R-PRAQ vs AWQ")
+    print("MiniCPM-2B Quantization Comparison: Fast-R-PRAQ vs AWQ")
     print("=" * 80)
+    print(f"Comparing custom implementations:")
+    print(f"  - AWQ: Custom PyTorch implementation (quantize_minicpm_AWQ.py)")
+    print(f"  - PRAQ: Hybrid post-activation quantization (quantize_minicpm_PRAQ.py)")
     print(f"Device: {device}")
     print(f"Evaluation samples: {n_eval_samples}")
     print("=" * 80)
@@ -223,22 +225,22 @@ def compare_models():
         results['praq'] = None
 
     # ===========================
-    # 3. Evaluate AWQ Model
+    # 3. Evaluate AWQ Model (Custom Implementation)
     # ===========================
     print("\n" + "=" * 80)
-    print("3. Evaluating AWQ Quantized Model")
+    print("3. Evaluating AWQ Quantized Model (Custom Implementation)")
     print("=" * 80)
 
     if os.path.exists(awq_model_path):
         try:
             print(f"Loading AWQ model: {awq_model_path}")
             tokenizer_awq = AutoTokenizer.from_pretrained(awq_model_path, trust_remote_code=True)
-            model_awq = AutoAWQForCausalLM.from_quantized(
+            model_awq = AutoModelForCausalLM.from_pretrained(
                 awq_model_path,
-                fuse_layers=True,
+                torch_dtype=torch.float16,
+                device_map=device,
                 trust_remote_code=True
             )
-            model_awq = model_awq.to(device)
 
             model_size_awq = get_model_size(model_awq)
             print(f"Model size: {model_size_awq:.2f} MB")
@@ -261,7 +263,7 @@ def compare_models():
             results['awq'] = None
     else:
         print(f"AWQ model not found at {awq_model_path}")
-        print("Please run quantize_minicpm_awq.py first")
+        print("Please run quantize_minicpm_AWQ.py first")
         results['awq'] = None
 
     # ===========================
