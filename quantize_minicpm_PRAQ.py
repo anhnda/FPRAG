@@ -5,6 +5,8 @@ from datasets import load_dataset
 from tqdm import tqdm
 import os
 import argparse
+import random
+import numpy as np
 
 
 class FastRPRAQQuantizer:
@@ -454,7 +456,21 @@ def main():
         default="./quantized_models/minicpm_praq_hybrid",
         help="Output directory for quantized model"
     )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for reproducibility"
+    )
     args = parser.parse_args()
+
+    # Set random seeds for reproducibility
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(args.seed)
+        torch.cuda.manual_seed_all(args.seed)
 
     # Configuration
     model_name = "openbmb/MiniCPM-2B-sft-bf16"
@@ -476,6 +492,7 @@ def main():
     print(f"Model: {model_name}")
     print(f"Calibration samples: {n_calib_samples}")
     print(f"Keep ratio: {keep_ratio} ({int(keep_ratio*100)}% FP16, {int((1-keep_ratio)*100)}% INT4)")
+    print(f"Random seed: {args.seed}")
     print(f"Output directory: {output_dir}")
     print("=" * 80)
 
