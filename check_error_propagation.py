@@ -57,9 +57,12 @@ class BlockCascadeTester:
                 else:
                     inp = input.detach()
 
+                # Flatten to [batch*seq_len, hidden_dim] to handle variable sequence lengths
+                inp_flat = inp.reshape(-1, inp.shape[-1])
+
                 if name not in activations:
                     activations[name] = []
-                activations[name].append(inp.cpu().float())
+                activations[name].append(inp_flat.cpu().float())
             return hook_fn
 
         # Register hooks for MLP layers in first N blocks
@@ -234,7 +237,9 @@ class BlockCascadeTester:
                             out = output[0].detach()
                         else:
                             out = output.detach()
-                        outputs_list.append(out.cpu().float())
+                        # Flatten to handle variable sequence lengths
+                        out_flat = out.reshape(-1, out.shape[-1])
+                        outputs_list.append(out_flat.cpu().float())
                     return hook_fn
 
                 # Hook the block output
@@ -275,7 +280,9 @@ class BlockCascadeTester:
                         out = output[0].detach()
                     else:
                         out = output.detach()
-                    outputs_list.append(out.cpu().float())
+                    # Flatten to handle variable sequence lengths
+                    out_flat = out.reshape(-1, out.shape[-1])
+                    outputs_list.append(out_flat.cpu().float())
                 return hook_fn
 
             block_name = f'model.layers.{block_idx}'
