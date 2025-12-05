@@ -266,6 +266,9 @@ class BlockCascadeTester:
                 # Store outputs
                 if block_outputs:
                     results[f'block_{block_idx}'][method_name] = torch.cat(block_outputs, dim=0)
+                    print(f"    Collected {len(block_outputs)} batches for block {block_idx}")
+                else:
+                    print(f"    WARNING: No outputs collected for block {block_idx}!")
 
         # Restore original weights and get ground truth
         print("\nCollecting ground truth...")
@@ -306,6 +309,9 @@ class BlockCascadeTester:
 
             if block_outputs:
                 results[f'block_{block_idx}']['original'] = torch.cat(block_outputs, dim=0)
+                print(f"  Collected {len(block_outputs)} batches for block {block_idx}")
+            else:
+                print(f"  WARNING: No ground truth collected for block {block_idx}!")
 
         return results
 
@@ -321,6 +327,11 @@ class BlockCascadeTester:
             original = results[block_key]['original']
             awq_out = results[block_key]['awq']
             praq_out = results[block_key]['praq']
+
+            # Check if results are tensors (not empty lists)
+            if not isinstance(original, torch.Tensor) or not isinstance(awq_out, torch.Tensor) or not isinstance(praq_out, torch.Tensor):
+                print(f"\nBlock {block_idx}: Skipping (no data collected)")
+                continue
 
             mse_awq = F.mse_loss(awq_out, original).item()
             mse_praq = F.mse_loss(praq_out, original).item()
