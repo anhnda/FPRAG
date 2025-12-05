@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import numpy as np
 import pandas as pd
+from scipy.stats import spearmanr
 from tqdm import tqdm
 import os
 
@@ -20,8 +21,10 @@ class FocusedLayerAnalyzer:
         self.tokenizer = tokenizer
         self.device = device
         self.preactivation_data = []
+        self.input_activations = []  # Store input activations for importance calculation
         self.hook = None
         self.target_layer_name = None
+        self.target_module = None
 
     def register_hook(self, layer_name):
         """
@@ -33,16 +36,16 @@ class FocusedLayerAnalyzer:
         self.target_layer_name = layer_name
 
         # Find the target module
-        target_module = None
+        self.target_module = None
         for name, module in self.model.named_modules():
             if name == layer_name:
-                target_module = module
+                self.target_module = module
                 break
 
-        if target_module is None:
+        if self.target_module is None:
             raise ValueError(f"Layer {layer_name} not found in model!")
 
-        if not isinstance(target_module, nn.Linear):
+        if not isinstance(self.target_module, nn.Linear):
             raise ValueError(f"Layer {layer_name} is not a Linear layer!")
 
         def hook_fn(module, input, output):
@@ -52,22 +55,23 @@ class FocusedLayerAnalyzer:
             else:
                 inp = input.detach()
 
+            # Reshape input to [batch * seq, hidden]
+            inp_flat = inp.reshape(-1, inp.shape[-1])
+
             # Compute pre-activation: Z = X @ W^T + b
             W = module.weight.data
             b = module.bias.data if module.bias is not None else None
-
-            # Reshape input to [batch * seq, hidden]
-            inp_flat = inp.reshape(-1, inp.shape[-1])
 
             # Compute pre-activation
             Z = torch.matmul(inp_flat, W.t())
             if b is not None:
                 Z = Z + b
 
-            # Store pre-activations (move to CPU to save memory)
+            # Store pre-activations and input activations (move to CPU to save memory)
             self.preactivation_data.append(Z.cpu().float())
+            self.input_activations.append(inp_flat.cpu().float())
 
-        self.hook = target_module.register_forward_hook(hook_fn)
+        self.hook = self.target_module.register_forward_hook(hook_fn)
         print(f"Registered hook on layer: {layer_name}")
 
     def remove_hook(self):
@@ -113,9 +117,64 @@ class FocusedLayerAnalyzer:
 
         print(f"\nData collection complete! Processed {successful_samples} samples")
 
+    def compute_awq_importance(self, Z):
+        """
+        Compute AWQ-style importance: simply the mean magnitude of pre-activations.
+
+        Args:
+            Z: Pre-activation tensor [tokens, channels]
+
+        Returns:
+            Importance scores per channel
+        """
+        # AWQ importance: E[|Z|] per channel
+        importance = Z.abs().mean(dim=0)
+        return importance.numpy()
+
+    def compute_praq_importance(self, Z, X, beta=3.0, tau=-3.0, noise_factor=0.2):
+        """
+        Compute Fast-R-PRAQ style importance with risk-awareness.
+
+        Args:
+            Z: Pre-activation tensor [tokens, channels]
+            X: Input activation tensor [tokens, in_features]
+            beta: Temperature for probability calculation
+            tau: Activation threshold (e.g., -3.0 for SiLU)
+            noise_factor: Expected quantization noise ratio
+
+        Returns:
+            Importance scores per channel
+        """
+        W = self.target_module.weight.data.cpu().float()  # [out_features, in_features]
+
+        # Compute signal statistics
+        z_mean = Z.mean(dim=0)  # [out_features]
+        z_std = Z.std(dim=0) + 1e-8  # [out_features]
+        z_upper = z_mean + 3 * z_std  # 3-sigma safety margin
+
+        # Sensitivity check: estimate quantization noise impact
+        x_mag = X.abs().mean()
+        w_mag = W.abs().mean(dim=1)  # Per output channel
+
+        estimated_noise_impact = x_mag * w_mag * noise_factor
+
+        # Risk-adjusted upper bound
+        z_risk_upper = z_upper + estimated_noise_impact
+
+        # Probability of activation (using sigmoid)
+        prob_active = torch.sigmoid(beta * (z_risk_upper - tau))
+
+        # Utility magnitude
+        magnitude = Z.abs().mean(dim=0) + z_std
+
+        # Final importance
+        raw_importance = prob_active * magnitude
+
+        return raw_importance.numpy()
+
     def compute_channel_statistics(self):
         """
-        Compute detailed statistics for each channel.
+        Compute detailed statistics for each channel, including importance scores.
 
         Returns:
             pandas DataFrame with per-channel statistics
@@ -123,9 +182,21 @@ class FocusedLayerAnalyzer:
         if len(self.preactivation_data) == 0:
             raise ValueError("No data collected! Call collect_data() first.")
 
-        # Concatenate all pre-activations
+        # Concatenate all pre-activations and input activations
         Z = torch.cat(self.preactivation_data, dim=0)  # [total_tokens, out_features]
+        X = torch.cat(self.input_activations, dim=0)   # [total_tokens, in_features]
         print(f"\nTotal activations collected: {Z.shape[0]} tokens x {Z.shape[1]} channels")
+
+        # Compute importance scores
+        print("Computing AWQ importance...")
+        awq_importance = self.compute_awq_importance(Z)
+
+        print("Computing Fast-R-PRAQ importance...")
+        praq_importance = self.compute_praq_importance(Z, X)
+
+        # Get weight magnitudes
+        W = self.target_module.weight.data.cpu().float()
+        weight_mag = W.abs().mean(dim=1).numpy()  # Per output channel
 
         # Compute per-channel statistics
         channel_stats = []
@@ -146,6 +217,9 @@ class FocusedLayerAnalyzer:
                 'p95': np.percentile(ch_data, 95),
                 'negative_ratio': (ch_data < 0).mean(),
                 'dead_ratio': (ch_data < -3.0).mean(),  # Ratio below SiLU threshold
+                'weight_magnitude': weight_mag[ch],
+                'awq_importance': awq_importance[ch],
+                'praq_importance': praq_importance[ch],
             }
 
             channel_stats.append(stats)
@@ -155,6 +229,14 @@ class FocusedLayerAnalyzer:
         # Add derived columns
         df['abs_mean'] = df['mean'].abs()
         df['range'] = df['max'] - df['min']
+
+        # Normalize importance scores to [0, 1] for easier comparison
+        df['awq_importance_norm'] = (df['awq_importance'] - df['awq_importance'].min()) / (df['awq_importance'].max() - df['awq_importance'].min())
+        df['praq_importance_norm'] = (df['praq_importance'] - df['praq_importance'].min()) / (df['praq_importance'].max() - df['praq_importance'].min())
+
+        # Rank channels by importance
+        df['awq_rank'] = df['awq_importance'].rank(ascending=False, method='min').astype(int)
+        df['praq_rank'] = df['praq_importance'].rank(ascending=False, method='min').astype(int)
 
         return df, Z
 
@@ -423,13 +505,47 @@ def main():
     print(f"  Std of means: {df['mean'].std():.4f}")
 
     print("\n" + "=" * 80)
+    print("IMPORTANCE SCORES COMPARISON")
+    print("=" * 80)
+    print(f"\nAWQ Importance:")
+    print(f"  Range: [{df['awq_importance'].min():.4f}, {df['awq_importance'].max():.4f}]")
+    print(f"  Mean: {df['awq_importance'].mean():.4f}")
+    print(f"\nFast-R-PRAQ Importance:")
+    print(f"  Range: [{df['praq_importance'].min():.4f}, {df['praq_importance'].max():.4f}]")
+    print(f"  Mean: {df['praq_importance'].mean():.4f}")
+
+    # Check rank correlation
+    rank_corr, _ = spearmanr(df['awq_importance'], df['praq_importance'])
+    print(f"\nRank Correlation (Spearman): {rank_corr:.4f}")
+    if rank_corr > 0.9:
+        print("  → Very high correlation: AWQ and PRAQ agree strongly")
+    elif rank_corr > 0.7:
+        print("  → High correlation: AWQ and PRAQ mostly agree")
+    elif rank_corr > 0.5:
+        print("  → Moderate correlation: Some disagreement between methods")
+    else:
+        print("  → Low correlation: Significant disagreement between methods")
+
+    print("\n" + "=" * 80)
     print("TOP 10 MOST NEGATIVE CHANNELS")
     print("=" * 80)
     negative_channels = df[df['mean'] < -3.0].sort_values('mean')
     if len(negative_channels) > 0:
-        print(negative_channels.head(10)[['channel', 'mean', 'std', 'min', 'max', 'dead_ratio']].to_string(index=False))
+        print(negative_channels.head(10)[['channel', 'mean', 'std', 'min', 'max', 'dead_ratio', 'awq_rank', 'praq_rank']].to_string(index=False))
     else:
         print("No channels with mean < -3.0 found!")
+
+    print("\n" + "=" * 80)
+    print("TOP 10 BY AWQ IMPORTANCE")
+    print("=" * 80)
+    top_awq = df.nlargest(10, 'awq_importance')
+    print(top_awq[['channel', 'mean', 'std', 'awq_importance', 'praq_importance', 'awq_rank', 'praq_rank']].to_string(index=False))
+
+    print("\n" + "=" * 80)
+    print("TOP 10 BY FAST-R-PRAQ IMPORTANCE")
+    print("=" * 80)
+    top_praq = df.nlargest(10, 'praq_importance')
+    print(top_praq[['channel', 'mean', 'std', 'awq_importance', 'praq_importance', 'awq_rank', 'praq_rank']].to_string(index=False))
 
     # Create visualizations
     print("\n\nCreating visualizations...")
