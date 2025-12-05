@@ -8,9 +8,12 @@ import os
 
 class FastRPRAQQuantizer:
     """
-    Hybrid Quantizer for Transformer Models.
-    - For MLP layers (with ReLU-family activations): Use post-activation importance
-    - For Attention layers: Use traditional AWQ-style importance
+    Fast Risk-aware Post-activation Quantization (Fast-R-PRAQ) for Transformer Models.
+
+    - For MLP layers: Use risk-aware pre-activation importance with quantization noise estimation
+      * Accounts for "risky dead neurons" that may resurrect after quantization
+      * Importance = P(activation) × magnitude, where P(activation) considers noise impact
+    - For Attention layers: Use traditional AWQ-style importance (pre-activation magnitude)
     """
 
     def __init__(self, model, tokenizer, device="cuda", beta=3.0, tau=-3.0,
@@ -117,9 +120,8 @@ class FastRPRAQQuantizer:
     @torch.no_grad()
     def compute_importance_scores_mlp(self, name, module):
         """
-        Compute importance scores for MLP layers using POST-ACTIVATION values.
-        Since ReLU-family activations drop negative values, we only care about
-        the magnitude of the activated output.
+        Compute importance scores for MLP layers using FastRPRAQ algorithm.
+        Uses risk-aware pre-activation statistics with quantization noise estimation.
 
         Args:
             name: Layer name
@@ -140,10 +142,11 @@ class FastRPRAQQuantizer:
         n_samples = X.shape[0]
         W = module.weight.data  # [out_features, in_features]
         b = module.bias.data if module.bias is not None else torch.zeros(module.out_features, device=self.device)
-        activation_fn = self._get_activation_function()
 
-        importance_sum = torch.zeros(module.out_features, device=self.device)
-        importance_sq_sum = torch.zeros(module.out_features, device=self.device)
+        # Accumulators for statistics
+        z_sum = torch.zeros(module.out_features, device=self.device)
+        z_sq_sum = torch.zeros(module.out_features, device=self.device)
+        z_abs_sum = torch.zeros(module.out_features, device=self.device)
 
         for i in range(0, n_samples, batch_size):
             batch_X = X[i:i+batch_size].to(self.device)
@@ -151,30 +154,48 @@ class FastRPRAQQuantizer:
             # Compute pre-activation values: Z = XW^T + b
             Z = torch.matmul(batch_X, W.t()) + b
 
-            # Apply activation (SiLU/GELU/ReLU)
-            A = activation_fn(Z)  # Post-activation values
-
             # Accumulate statistics
-            importance_sum += A.abs().sum(dim=0)
-            importance_sq_sum += (A ** 2).sum(dim=0)
+            z_sum += Z.sum(dim=0)
+            z_sq_sum += (Z ** 2).sum(dim=0)
+            z_abs_sum += Z.abs().sum(dim=0)
 
             # Free memory
-            del batch_X, Z, A
+            del batch_X, Z
 
-        # Compute mean and std
-        importance = importance_sum / n_samples
-        variance = (importance_sq_sum / n_samples) - (importance ** 2)
-        std = torch.sqrt(variance.clamp(min=0))
-        importance = importance + std
+        # Compute pre-activation statistics
+        z_mean = z_sum / n_samples
+        z_variance = (z_sq_sum / n_samples) - (z_mean ** 2)
+        z_std = torch.sqrt(z_variance.clamp(min=0)) + 1e-8
+        z_upper = z_mean + 3 * z_std  # 3-sigma safety margin
+
+        # Estimate quantization noise impact
+        X_cpu = X.to(self.device) if X.device != self.device else X
+        x_mag = X_cpu.abs().mean().item()
+        del X_cpu
+
+        w_mag = W.abs().mean(dim=1)  # Per output channel
+        estimated_noise_impact = x_mag * w_mag * self.noise_factor
+
+        # Risk-adjusted upper bound
+        z_risk_upper = z_upper + estimated_noise_impact
+
+        # Probability of activation (using sigmoid for smooth probability)
+        prob_active = torch.sigmoid(self.beta * (z_risk_upper - self.tau))
+
+        # Utility magnitude
+        magnitude = z_abs_sum / n_samples + z_std
+
+        # Final importance: probability of activation × utility magnitude
+        raw_importance = prob_active * magnitude
 
         # Hardware grouping
-        C_out = importance.shape[0]
+        C_out = raw_importance.shape[0]
         if self.group_size > 0 and C_out % self.group_size == 0:
-            grouped = importance.view(-1, self.group_size)
+            grouped = raw_importance.view(-1, self.group_size)
             group_scores = grouped.sum(dim=1)
             final_importance = group_scores.repeat_interleave(self.group_size)
         else:
-            final_importance = importance
+            final_importance = raw_importance
 
         return final_importance.cpu()
 
@@ -402,11 +423,13 @@ def main():
     output_dir = "./quantized_models/minicpm_praq_hybrid"
 
     print("=" * 80)
-    print("Hybrid Post-Activation Quantization for MiniCPM-2.4")
+    print("Fast Risk-aware Post-activation Quantization (Fast-R-PRAQ) for MiniCPM-2B")
     print("=" * 80)
     print("Strategy:")
-    print("  - MLP layers: Post-activation importance (ReLU-family drops negatives)")
-    print("  - Attention layers: AWQ-style importance (no activation)")
+    print("  - MLP layers: Risk-aware importance with quantization noise estimation")
+    print("    * Importance = P(activation) × magnitude")
+    print("    * P(activation) considers mean, std, and quantization noise impact")
+    print("  - Attention layers: AWQ-style pre-activation magnitude")
     print("=" * 80)
     print(f"Device: {device}")
     print(f"Model: {model_name}")
@@ -455,8 +478,10 @@ def main():
     print("=" * 80)
     print(f"Quantized model saved to: {output_dir}")
     print("\nQuantization approach:")
-    print("  - MLP layers: Post-activation based importance")
+    print("  - MLP layers: Risk-aware importance (Fast-R-PRAQ)")
+    print("    * Accounts for risky dead neurons with quantization noise estimation")
     print("  - Attention layers: AWQ-style magnitude based importance")
+    print(f"  - Parameters: beta={quantizer.beta}, tau={quantizer.tau}, noise_factor={quantizer.noise_factor}")
     print("=" * 80)
 
 
