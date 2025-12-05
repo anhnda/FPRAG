@@ -217,7 +217,7 @@ def visualize_layer(layer_name, stats, analysis, save_dir="./visualizations"):
     Create comprehensive visualizations for a single layer.
 
     Args:
-        layer_name: Name of the layer
+        layer_name: Name of the  layer
         stats: Statistics for the layer
         analysis: Analysis results for the layer
         save_dir: Directory to save plots
