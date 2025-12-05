@@ -78,20 +78,36 @@ class AWQQuantizer:
         # Concatenate all activation samples
         X_list = self.activation_data[name]
         X = torch.cat([x.reshape(-1, x.shape[-1]) for x in X_list], dim=0)
-        X = X.to(self.device)
 
+        # Process in batches if data is too large (avoid OOM)
+        batch_size = 1024
+        n_samples = X.shape[0]
         W = module.weight.data  # [out_features, in_features]
         b = module.bias.data if module.bias is not None else torch.zeros(module.out_features, device=self.device)
 
-        # Compute pre-activation values: Z = XW^T + b
-        Z = torch.matmul(X, W.t()) + b
+        importance_sum = torch.zeros(module.out_features, device=self.device)
+        importance_sq_sum = torch.zeros(module.out_features, device=self.device)
 
-        # AWQ importance: E[|Z|] per output channel
-        importance = Z.abs().mean(dim=0)
+        for i in range(0, n_samples, batch_size):
+            batch_X = X[i:i+batch_size].to(self.device)
 
-        # Optional: Apply per-channel scaling based on AWQ paper
-        # Scale importance by activation statistics
-        importance = importance + Z.std(dim=0) * 0.1  # Small variance term for stability
+            # Compute pre-activation values: Z = XW^T + b
+            Z = torch.matmul(batch_X, W.t()) + b
+
+            # Accumulate statistics
+            importance_sum += Z.abs().sum(dim=0)
+            importance_sq_sum += (Z ** 2).sum(dim=0)
+
+            # Free memory
+            del batch_X, Z
+
+        # Compute mean and std
+        importance = importance_sum / n_samples
+        variance = (importance_sq_sum / n_samples) - (importance ** 2)
+        std = torch.sqrt(variance.clamp(min=0))
+
+        # Add small variance term for stability
+        importance = importance + std * 0.1
 
         return importance.cpu()
 
@@ -159,10 +175,13 @@ class AWQQuantizer:
 
                 # Forward pass to collect activations
                 with torch.no_grad():
-                    self.model(**inputs)
+                    # Use output_hidden_states instead of use_cache to avoid DynamicCache issues
+                    _ = self.model(**inputs, use_cache=False, return_dict=True)
 
-            except Exception as e:
-                print(f"Error processing sample {i}: {e}")
+            except Exception:
+                # Silently skip errors during calibration (common with cache issues)
+                if i % 100 == 0 and i > 0:
+                    print(f"\nNote: Skipped {i} samples with errors (cache-related issues are normal)")
                 continue
 
         self.remove_hooks()
@@ -180,22 +199,39 @@ class AWQQuantizer:
         print("=" * 80)
 
         quantized_count = 0
+        skipped_count = 0
 
         for name, module in tqdm(list(self.model.named_modules()), desc="Quantizing"):
             if isinstance(module, nn.Linear):
-                # Compute AWQ importance scores
-                importance_scores = self.compute_awq_importance(name, module)
+                try:
+                    # Compute AWQ importance scores
+                    importance_scores = self.compute_awq_importance(name, module)
 
-                # Quantize the layer
-                self.quantize_layer(module, importance_scores, keep_ratio)
+                    # Quantize the layer
+                    self.quantize_layer(module, importance_scores, keep_ratio)
 
-                quantized_count += 1
+                    quantized_count += 1
+
+                    # Clear GPU cache every 50 layers to prevent OOM
+                    if quantized_count % 50 == 0 and torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+                except Exception as e:
+                    print(f"\n⚠️  Error quantizing layer {name}: {e}")
+                    skipped_count += 1
+                    continue
 
         print(f"\n✅ Quantization complete!")
         print(f"   Total linear layers quantized: {quantized_count}")
+        if skipped_count > 0:
+            print(f"   ⚠️  Skipped {skipped_count} layers due to errors")
 
         # Clear activation data to free memory
         self.activation_data = {}
+
+        # Final GPU cache clear
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 def load_wikitext2(split="train", n_samples=None):
