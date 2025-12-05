@@ -248,7 +248,11 @@ class BlockCascadeTester:
                 for name, module in self.model.named_modules():
                     if name == block_name:
                         hook = module.register_forward_hook(make_hook(block_outputs))
+                        print(f"    Registered hook on {block_name}")
                         break
+
+                if hook is None:
+                    print(f"    ERROR: Could not find module {block_name}")
 
                 # Run inference
                 self.model.eval()
@@ -293,7 +297,11 @@ class BlockCascadeTester:
             for name, module in self.model.named_modules():
                 if name == block_name:
                     hook = module.register_forward_hook(make_hook(block_outputs))
+                    print(f"  Registered hook on {block_name}")
                     break
+
+            if hook is None:
+                print(f"  ERROR: Could not find module {block_name}")
 
             self.model.eval()
             for text in tqdm(texts[:n_samples], desc=f"Block {block_idx} (original)", leave=False):
@@ -423,6 +431,13 @@ def main():
     print("Loading datasets...")
     calib_texts = load_wikitext2("train", n_samples=n_calib)
     val_texts = load_wikitext2("validation", n_samples=n_val)
+
+    # Print model structure for debugging
+    print("\nModel structure (first 3 layers):")
+    for name, module in model.named_modules():
+        if name.startswith('model.layers.0') or name.startswith('model.layers.1') or name.startswith('model.layers.2'):
+            if name.count('.') <= 2:  # Only show top-level modules
+                print(f"  {name}: {type(module).__name__}")
 
     # Create tester
     tester = BlockCascadeTester(model, tokenizer, num_blocks=num_blocks, device=device)
