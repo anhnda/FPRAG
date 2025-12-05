@@ -198,6 +198,20 @@ class LayerTester:
         abs_errors_awq = (Y_awq - Y_gt).abs()
         abs_errors_praq = (Y_praq - Y_gt).abs()
 
+        # For large tensors, sample for percentile computation to avoid memory issues
+        max_samples_for_quantile = 1_000_000
+        se_awq_flat = squared_errors_awq.flatten()
+        se_praq_flat = squared_errors_praq.flatten()
+
+        if se_awq_flat.numel() > max_samples_for_quantile:
+            # Sample uniformly for percentile computation
+            indices = torch.linspace(0, se_awq_flat.numel() - 1, max_samples_for_quantile, dtype=torch.long)
+            se_awq_sample = se_awq_flat[indices]
+            se_praq_sample = se_praq_flat[indices]
+        else:
+            se_awq_sample = se_awq_flat
+            se_praq_sample = se_praq_flat
+
         # Detailed statistics
         return {
             # Mean squared error
@@ -212,13 +226,13 @@ class LayerTester:
             'mse_std_awq': squared_errors_awq.std().item(),
             'mse_std_praq': squared_errors_praq.std().item(),
 
-            # Percentiles of squared errors
+            # Percentiles of squared errors (computed on sample if needed)
             'mse_p50_awq': squared_errors_awq.median().item(),
             'mse_p50_praq': squared_errors_praq.median().item(),
-            'mse_p95_awq': squared_errors_awq.flatten().quantile(0.95).item(),
-            'mse_p95_praq': squared_errors_praq.flatten().quantile(0.95).item(),
-            'mse_p99_awq': squared_errors_awq.flatten().quantile(0.99).item(),
-            'mse_p99_praq': squared_errors_praq.flatten().quantile(0.99).item(),
+            'mse_p95_awq': torch.quantile(se_awq_sample, 0.95).item(),
+            'mse_p95_praq': torch.quantile(se_praq_sample, 0.95).item(),
+            'mse_p99_awq': torch.quantile(se_awq_sample, 0.99).item(),
+            'mse_p99_praq': torch.quantile(se_praq_sample, 0.99).item(),
 
             # Maximum errors
             'mse_max_awq': squared_errors_awq.max().item(),
