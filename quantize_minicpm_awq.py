@@ -53,7 +53,10 @@ def prepare_calibration_data(texts, tokenizer, n_samples=500, max_length=512):
 
 def main():
     # Configuration
+    # NOTE: If you get "model.safetensors not found" error, run convert_to_safetensors.py first
+    # to convert the model, then use the local path here
     model_name = "openbmb/MiniCPM-2B-sft-bf16"  # MiniCPM-2.4B
+    # model_name = "./models/MiniCPM-2B-sft-bf16-safetensors"  # Use this if converted locally
     n_calib_samples = 500
     output_dir = "./quantized_models/minicpm_awq"
 
@@ -79,10 +82,27 @@ def main():
 
     # Load model for AWQ
     print("\nLoading model for AWQ quantization...")
-    model = AutoAWQForCausalLM.from_pretrained(
-        model_name,
-        trust_remote_code=True
-    )
+    try:
+        model = AutoAWQForCausalLM.from_pretrained(
+            model_name,
+            trust_remote_code=True,
+            use_cache=False
+        )
+    except OSError as e:
+        if "safetensors" in str(e):
+            print("\n" + "=" * 80)
+            print("ERROR: Model requires safetensors format")
+            print("=" * 80)
+            print("AutoAWQ requires models in safetensors format.")
+            print("\nSolution:")
+            print("1. Run the conversion script first:")
+            print("   python convert_to_safetensors.py")
+            print("\n2. Then update model_name in this script to:")
+            print("   model_name = './models/MiniCPM-2B-sft-bf16-safetensors'")
+            print("\n3. Run this script again")
+            print("=" * 80)
+            raise
+        raise
 
     # Load calibration data
     calib_texts = load_wikitext2(split="train", n_samples=n_calib_samples)

@@ -33,6 +33,12 @@ The key insight is that quantization noise is proportional to weight magnitude, 
 
 ### File Purposes
 
+**convert_to_safetensors.py** - Model format converter:
+- Converts models from PyTorch bin format to safetensors format
+- Required for AWQ quantization (AutoAWQ only accepts safetensors)
+- Downloads MiniCPM-2B and saves to `./models/MiniCPM-2B-sft-bf16-safetensors`
+- Run this first if you get "model.safetensors not found" error
+
 **awq_vs_fprpa.py** - Synthetic benchmark demonstrating the "loud silence" problem where naive methods fail:
 - Generates synthetic data with Group A (useful, active) and Group B (dangerous, saturated high-energy)
 - Shows AWQ accidentally handles Group B correctly by keeping high magnitudes
@@ -80,10 +86,15 @@ The key insight is that quantization noise is proportional to weight magnitude, 
 ### Running Quantization
 
 ```bash
+# IMPORTANT: AWQ requires safetensors format
+# If you get "model.safetensors not found" error, run conversion first:
+python convert_to_safetensors.py
+# Then update model_name in quantize_minicpm_awq.py to use the local path
+
 # Quantize with AWQ (baseline)
 python quantize_minicpm_awq.py
 
-# Quantize with Fast-R-PRAQ hybrid approach
+# Quantize with Fast-R-PRAQ hybrid approach (works with PyTorch bins)
 python quantize_minicpm_PRAQ.py
 
 # Run synthetic benchmark
