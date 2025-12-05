@@ -208,9 +208,10 @@ class BlockCascadeTester:
         for layer_name, (W, b) in weight_dict.items():
             for name, module in self.model.named_modules():
                 if name == layer_name and isinstance(module, nn.Linear):
-                    module.weight.data = W.to(self.device)
+                    # Convert to float16 to match model dtype
+                    module.weight.data = W.to(self.device).to(torch.float16)
                     if b is not None:
-                        module.bias.data = b.to(self.device)
+                        module.bias.data = b.to(self.device).to(torch.float16)
                     break
 
     @torch.no_grad()
