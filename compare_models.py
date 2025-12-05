@@ -54,6 +54,8 @@ def evaluate_perplexity(model, tokenizer, texts, max_length=512, device="cuda"):
     total_loss = 0
     total_tokens = 0
     total_time = 0
+    successful_samples = 0
+    failed_samples = 0
 
     losses = []
 
@@ -73,9 +75,9 @@ def evaluate_perplexity(model, tokenizer, texts, max_length=512, device="cuda"):
             if input_ids.shape[1] < 2:
                 continue
 
-            # Forward pass
+            # Forward pass (disable cache to avoid DynamicCache issues)
             start_time = time.time()
-            outputs = model(input_ids, labels=input_ids)
+            outputs = model(input_ids, labels=input_ids, use_cache=False)
             elapsed = time.time() - start_time
 
             loss = outputs.loss.item()
@@ -85,15 +87,24 @@ def evaluate_perplexity(model, tokenizer, texts, max_length=512, device="cuda"):
             total_tokens += n_tokens
             total_time += elapsed
             losses.append(loss)
+            successful_samples += 1
 
         except Exception as e:
-            print(f"Error processing sample: {e}")
+            failed_samples += 1
+            # Only print first few errors to avoid spam
+            if failed_samples <= 3:
+                print(f"\nError processing sample: {e}")
             continue
+
+    # Print summary of evaluation
+    if failed_samples > 0:
+        print(f"\n⚠️  Failed to process {failed_samples}/{len(texts)} samples")
+    print(f"Successfully processed {successful_samples}/{len(texts)} samples")
 
     # Compute metrics
     avg_loss = total_loss / total_tokens if total_tokens > 0 else float('inf')
-    perplexity = np.exp(avg_loss)
-    avg_time_per_sample = total_time / len(texts) if len(texts) > 0 else 0
+    perplexity = np.exp(avg_loss) if total_tokens > 0 else float('inf')
+    avg_time_per_sample = total_time / successful_samples if successful_samples > 0 else 0
     throughput = total_tokens / total_time if total_time > 0 else 0
 
     return {
@@ -102,7 +113,8 @@ def evaluate_perplexity(model, tokenizer, texts, max_length=512, device="cuda"):
         "avg_time_per_sample": avg_time_per_sample,
         "throughput_tokens_per_sec": throughput,
         "total_tokens": total_tokens,
-        "num_samples": len(texts)
+        "num_samples": successful_samples,
+        "failed_samples": failed_samples
     }
 
 
@@ -173,13 +185,18 @@ def compare_models():
         print(f"  Avg Loss: {results['original']['avg_loss']:.4f}")
         print(f"  Throughput: {results['original']['throughput_tokens_per_sec']:.2f} tokens/sec")
         print(f"  Model Size: {model_size_orig:.2f} MB")
+        if results['original'].get('failed_samples', 0) > 0:
+            print(f"  ⚠️  Failed samples: {results['original']['failed_samples']}")
 
         # Clean up
         del model_orig
         torch.cuda.empty_cache()
 
     except Exception as e:
-        print(f"Error evaluating original model: {e}")
+        print(f"\n❌ Error evaluating original model:")
+        print(f"   {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
         results['original'] = None
 
     # ===========================
@@ -211,13 +228,18 @@ def compare_models():
             print(f"  Avg Loss: {results['praq']['avg_loss']:.4f}")
             print(f"  Throughput: {results['praq']['throughput_tokens_per_sec']:.2f} tokens/sec")
             print(f"  Model Size: {model_size_praq:.2f} MB")
+            if results['praq'].get('failed_samples', 0) > 0:
+                print(f"  ⚠️  Failed samples: {results['praq']['failed_samples']}")
 
             # Clean up
             del model_praq
             torch.cuda.empty_cache()
 
         except Exception as e:
-            print(f"Error evaluating PRAQ model: {e}")
+            print(f"\n❌ Error evaluating PRAQ model:")
+            print(f"   {type(e).__name__}: {e}")
+            import traceback
+            traceback.print_exc()
             results['praq'] = None
     else:
         print(f"PRAQ model not found at {praq_model_path}")
@@ -253,13 +275,18 @@ def compare_models():
             print(f"  Avg Loss: {results['awq']['avg_loss']:.4f}")
             print(f"  Throughput: {results['awq']['throughput_tokens_per_sec']:.2f} tokens/sec")
             print(f"  Model Size: {model_size_awq:.2f} MB")
+            if results['awq'].get('failed_samples', 0) > 0:
+                print(f"  ⚠️  Failed samples: {results['awq']['failed_samples']}")
 
             # Clean up
             del model_awq
             torch.cuda.empty_cache()
 
         except Exception as e:
-            print(f"Error evaluating AWQ model: {e}")
+            print(f"\n❌ Error evaluating AWQ model:")
+            print(f"   {type(e).__name__}: {e}")
+            import traceback
+            traceback.print_exc()
             results['awq'] = None
     else:
         print(f"AWQ model not found at {awq_model_path}")
