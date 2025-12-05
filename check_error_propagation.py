@@ -260,7 +260,9 @@ class BlockCascadeTester:
                 self.model.eval()
                 success_count = 0
                 error_count = 0
-                for text in tqdm(texts[:n_samples], desc=f"Block {block_idx} ({method_name})", leave=False):
+                for idx, text in enumerate(texts[:n_samples]):
+                    if idx % 10 == 0:
+                        print(f"    Processing sample {idx}/{n_samples}...", end='\r')
                     try:
                         inputs = self.tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
                         inputs = {k: v.to(self.device) for k, v in inputs.items()}
@@ -271,6 +273,7 @@ class BlockCascadeTester:
                         if error_count <= 3:  # Print first 3 errors
                             print(f"\n    Error during inference: {e}")
                         continue
+                print()  # New line after progress
 
                 print(f"    Inference: {success_count} successful, {error_count} failed")
                 print(f"    Hook called {hook_call_count[0]} times")
@@ -315,13 +318,16 @@ class BlockCascadeTester:
                 print(f"  ERROR: Could not find module {block_name}")
 
             self.model.eval()
-            for text in tqdm(texts[:n_samples], desc=f"Block {block_idx} (original)", leave=False):
+            for idx, text in enumerate(texts[:n_samples]):
+                if idx % 10 == 0:
+                    print(f"  Processing sample {idx}/{n_samples}...", end='\r')
                 try:
                     inputs = self.tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
                     inputs = {k: v.to(self.device) for k, v in inputs.items()}
                     self.model(**inputs, use_cache=False)
                 except:
                     continue
+            print()  # New line after progress
 
             if hook:
                 hook.remove()
