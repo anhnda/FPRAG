@@ -170,9 +170,16 @@ class RealPRAQQuantizer:
 
             # Compute aggregated statistics for this input feature
             total_samples = n_samples * module.out_features
+
+            # Add numerical stability checks
+            if total_samples == 0:
+                input_salience[input_idx] = 0.0
+                continue
+
             z_mean = z_sum / total_samples
             z_variance = (z_sq_sum / total_samples) - (z_mean ** 2)
-            z_std = np.sqrt(max(0, z_variance)) + 1e-8
+            z_variance = max(0, z_variance)  # Ensure non-negative
+            z_std = np.sqrt(z_variance) + 1e-8
             z_upper = z_mean + 3 * z_std
 
             # Estimate quantization noise impact
@@ -183,14 +190,28 @@ class RealPRAQQuantizer:
             # Risk-adjusted upper bound
             z_risk_upper = z_upper + estimated_noise
 
-            # Probability of activation
-            prob_active = torch.sigmoid(torch.tensor(self.beta * (z_risk_upper - self.tau))).item()
+            # Probability of activation (clip to avoid numerical issues)
+            logit = self.beta * (z_risk_upper - self.tau)
+            logit = np.clip(logit, -20, 20)  # Prevent overflow in sigmoid
+            prob_active = 1.0 / (1.0 + np.exp(-logit))
 
-            # Magnitude
+            # Magnitude (use absolute value sum normalized)
             magnitude = z_abs_sum / total_samples + z_std
+
+            # Check for NaN/Inf and set to safe values
+            if np.isnan(prob_active) or np.isinf(prob_active):
+                prob_active = 0.0
+            if np.isnan(magnitude) or np.isinf(magnitude):
+                magnitude = 0.0
 
             # Risk-aware salience for this input feature
             input_salience[input_idx] = prob_active * magnitude
+
+        # Debug: Print statistics
+        valid_salience = input_salience[input_salience > 0]
+        if len(valid_salience) > 0:
+            print(f"      Salience stats: min={input_salience.min():.6f}, max={input_salience.max():.6f}, "
+                  f"mean={input_salience.mean():.6f}, nonzero={len(valid_salience)}/{len(input_salience)}")
 
         return input_salience
 
@@ -255,6 +276,25 @@ class RealPRAQQuantizer:
 
         if salience is None:
             return torch.ones(module.out_features)
+
+        # Check for invalid salience values
+        if torch.isnan(salience).any() or torch.isinf(salience).any():
+            print(f"    WARNING: Invalid salience values detected, using uniform scaling")
+            return torch.ones(module.out_features)
+
+        # Check if salience is all zeros or very small
+        if salience.max() < 1e-10:
+            print(f"    WARNING: Salience values too small, using uniform scaling")
+            return torch.ones(module.out_features)
+
+        # Normalize salience to prevent numerical issues
+        # Scale to [0.1, 10] range to avoid extreme values
+        salience_min = salience.min()
+        salience_max = salience.max()
+        if salience_max > salience_min:
+            salience = 0.1 + 9.9 * (salience - salience_min) / (salience_max - salience_min)
+        else:
+            salience = torch.ones_like(salience)
 
         # Get activations for reconstruction error measurement
         X_list = self.activation_data[name]
