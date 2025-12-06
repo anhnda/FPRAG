@@ -275,14 +275,16 @@ def analyze_comparison(results_dict):
                       f"(Δ={sign}{model['delta']:>6.4f}, {sign}{model['delta_pct']:>6.2f}%) "
                       f"| {model['throughput']:>7.1f} tok/s")
 
-    # Head-to-head: GW-AWQ vs GW-PRAQ
+    # Head-to-head comparisons
     print(f"\n{'='*80}")
-    print("HEAD-TO-HEAD COMPARISON")
+    print("HEAD-TO-HEAD COMPARISONS")
     print(f"{'='*80}")
 
     gw_awq = valid_results.get('GW-AWQ')
     gw_praq = valid_results.get('GW-PRAQ')
+    gwh_praq = valid_results.get('GWH-PRAQ')
 
+    # GW-AWQ vs GW-PRAQ
     if gw_awq and gw_praq:
         awq_ppl = gw_awq['perplexity']
         praq_ppl = gw_praq['perplexity']
@@ -309,6 +311,45 @@ def analyze_comparison(results_dict):
         print(f"\n  Throughput:")
         print(f"    GW-AWQ:  {awq_thr:.1f} tokens/sec")
         print(f"    GW-PRAQ: {praq_thr:.1f} tokens/sec")
+
+    # Hybrid PRAQ analysis
+    if gwh_praq:
+        print(f"\n{'─'*80}")
+        print("HYBRID PRAQ PERFORMANCE")
+        print(f"{'─'*80}")
+        hybrid_ppl = gwh_praq['perplexity']
+        print(f"\nGWH-PRAQ (Hybrid): {hybrid_ppl:.4f}")
+
+        if gw_awq:
+            delta_vs_awq = ((hybrid_ppl - gw_awq['perplexity']) / gw_awq['perplexity']) * 100
+            print(f"  vs GW-AWQ:  {delta_vs_awq:+.2f}%", end="")
+            if abs(delta_vs_awq) < 0.5:
+                print(" (essentially tied)")
+            elif delta_vs_awq < 0:
+                print(f" ✅ HYBRID WINS!")
+            else:
+                print(f" ❌ AWQ better")
+
+        if gw_praq:
+            delta_vs_praq = ((hybrid_ppl - gw_praq['perplexity']) / gw_praq['perplexity']) * 100
+            print(f"  vs GW-PRAQ: {delta_vs_praq:+.2f}%", end="")
+            if abs(delta_vs_praq) < 0.5:
+                print(" (essentially tied)")
+            elif delta_vs_praq < 0:
+                print(f" ✅ HYBRID WINS!")
+            else:
+                print(f" ❌ Pure PRAQ better")
+
+        if gw_awq and gw_praq:
+            best_baseline = min(gw_awq['perplexity'], gw_praq['perplexity'])
+            delta_vs_best = ((hybrid_ppl - best_baseline) / best_baseline) * 100
+            print(f"\n  vs Best Baseline: {delta_vs_best:+.2f}%")
+            if delta_vs_best < -0.5:
+                print("  🎯 HYBRID is the WINNER! (beats both AWQ and PRAQ)")
+            elif abs(delta_vs_best) < 0.5:
+                print("  🤝 Hybrid competitive with best baseline")
+            else:
+                print("  ⚠️  Hybrid didn't improve over baselines")
 
     # Compare group-wise vs per-channel (if available)
     print(f"\n{'='*80}")
@@ -546,6 +587,12 @@ def main():
         help="Path to Group-Wise PRAQ quantized model"
     )
     parser.add_argument(
+        "--gwh-praq-path",
+        type=str,
+        default="./quantized_models/minicpm_gwh_praq",
+        help="Path to Hybrid Group-Wise PRAQ quantized model"
+    )
+    parser.add_argument(
         "--full-awq-path",
         type=str,
         default="./quantized_models/minicpm_full_awq",
@@ -589,9 +636,10 @@ def main():
     print("  1. Original (FP16) - Baseline")
     print("  2. GW-AWQ - Group-wise + pre-activation importance")
     print("  3. GW-PRAQ - Group-wise + post-activation risk-aware importance")
+    print("  4. GWH-PRAQ - Hybrid (AWQ scaling + PRAQ error weighting)")
     if args.compare_full:
-        print("  4. Full-AWQ - Per-channel quantization (comparison)")
-        print("  5. Full-PRAQ - Per-channel quantization (comparison)")
+        print("  5. Full-AWQ - Per-channel quantization (comparison)")
+        print("  6. Full-PRAQ - Per-channel quantization (comparison)")
     print("="*80)
     print(f"Device: {device}")
     print(f"Evaluation samples: {args.n_eval}")
@@ -624,6 +672,14 @@ def main():
     results['GW-PRAQ'] = evaluate_model(
         args.gw_praq_path,
         "GW-PRAQ",
+        eval_texts,
+        device=device
+    )
+
+    # Evaluate Hybrid Group-Wise PRAQ
+    results['GWH-PRAQ'] = evaluate_model(
+        args.gwh_praq_path,
+        "GWH-PRAQ",
         eval_texts,
         device=device
     )
