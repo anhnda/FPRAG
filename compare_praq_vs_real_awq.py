@@ -121,13 +121,14 @@ def get_model_size(model):
     return size_mb
 
 
-def evaluate_model(model_path, model_name, eval_texts, device="cuda"):
+def evaluate_model(model_path, model_name, eval_texts, device="cuda", is_huggingface=False):
     """Evaluate a single model and return results."""
     print(f"\n{'='*80}")
     print(f"Evaluating: {model_name}")
     print(f"{'='*80}")
 
-    if not os.path.exists(model_path):
+    # Check if it's a HuggingFace model or local path
+    if not is_huggingface and not os.path.exists(model_path):
         print(f"❌ Model not found at {model_path}")
         return None
 
@@ -500,7 +501,8 @@ def main():
         args.original_model,
         "Original (FP16)",
         eval_texts,
-        device=device
+        device=device,
+        is_huggingface=True  # HuggingFace model, not local path
     )
 
     # Evaluate Real AWQ
