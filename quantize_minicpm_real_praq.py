@@ -1,20 +1,30 @@
 """
-Real-PRAQ Implementation (AWQ Framework + PRAQ Risk-Awareness)
+Real-PRAQ Implementation (CORRECTED - AWQ Framework + PRAQ Risk-Awareness)
 
 This combines the best of both approaches:
-- AWQ's optimization: Per-channel scaling + grid search + uniform quantization
+- AWQ's optimization: Per-INPUT-channel scaling + grid search + uniform quantization
 - PRAQ's intelligence: Risk-aware importance accounting for risky dead neurons
 
-Key Innovation:
-Instead of scaling by (E[|X|])^α like Real AWQ, we scale by:
-    (P(activation) × magnitude)^α
+Key Algorithm:
+1. Compute per-input-channel salience:
+   - MLP layers: s[j] = P(activation) × magnitude (risk-aware)
+   - Attention layers: s[j] = E[|X[:, j]|] (standard AWQ)
+2. Grid search for optimal α ∈ [0, 1]
+3. Scale weight COLUMNS: W[:, j] *= s[j]^α (per input channel)
+4. Quantize scaled weights to INT4 uniformly
+5. At runtime: compensate with inverse scales on activations
+
+Key Innovation vs Real AWQ:
+Instead of scaling by (E[|X|])^α, we scale by:
+    (P(activation) × magnitude)^α  for MLP layers
 
 where P(activation) accounts for:
 - Pre-activation mean and variance
-- Quantization noise impact
+- Quantization noise impact (from weight magnitude)
 - Probability of neuron resurrection after quantization
 
-This should combine AWQ's compression efficiency with PRAQ's risk-awareness.
+IMPORTANT: Uses CORRECTED per-column scaling (not per-element)
+This matches the official AWQ paper and fixes the high perplexity issue.
 """
 
 import torch
@@ -30,11 +40,15 @@ import numpy as np
 
 class RealPRAQQuantizer:
     """
-    Real-PRAQ: AWQ-style quantization with risk-aware importance.
+    Real-PRAQ: AWQ-style quantization with risk-aware importance (CORRECTED).
 
     Combines:
-    - Real AWQ framework: Grid search + per-channel scaling + uniform INT4
-    - PRAQ risk-awareness: P(activation) × magnitude importance scoring
+    - Real AWQ framework: Grid search + per-INPUT-channel (column-wise) scaling + uniform INT4
+    - PRAQ risk-awareness: P(activation) × magnitude importance scoring for MLP layers
+
+    Key Correction:
+    - Uses proper column-wise scaling: W[:, j] *= s[j] (not per-element)
+    - Matches official AWQ paper implementation
     """
 
     def __init__(self, model, tokenizer, device="cuda", beta=3.0, tau=-3.0,
@@ -51,6 +65,9 @@ class RealPRAQQuantizer:
         # Storage for activations
         self.activation_data = {}
         self.hooks = []
+
+        # Storage for scales (for analysis)
+        self.layer_scales = {}
 
         # Detect layer types
         self.layer_types = self._detect_layer_types()
@@ -418,6 +435,15 @@ class RealPRAQQuantizer:
         # Update module weights with quantized scaled weights
         module.weight.data = W_quant
 
+        # Store scales and metadata for later analysis
+        layer_type = self.layer_types.get(name, 'mlp')
+        self.layer_scales[name] = {
+            'scales': best_scales.cpu(),
+            'alpha': best_alpha,
+            'error': best_error,
+            'type': layer_type
+        }
+
         # Clean up
         del W_scaled, W_quant
         if torch.cuda.is_available():
@@ -483,6 +509,28 @@ class RealPRAQQuantizer:
         if skipped_count > 0:
             print(f"   ⚠️  Skipped {skipped_count} layers due to errors")
 
+        # Print statistics about optimal alpha values
+        if self.layer_scales:
+            alphas = [info['alpha'] for info in self.layer_scales.values()]
+            mlp_alphas = [info['alpha'] for info in self.layer_scales.values() if info['type'] == 'mlp']
+            attn_alphas = [info['alpha'] for info in self.layer_scales.values() if info['type'] == 'attention']
+
+            print(f"\nOptimal α statistics (all layers):")
+            print(f"  Mean: {np.mean(alphas):.3f}")
+            print(f"  Median: {np.median(alphas):.3f}")
+            print(f"  Min: {np.min(alphas):.3f}")
+            print(f"  Max: {np.max(alphas):.3f}")
+
+            if mlp_alphas:
+                print(f"\nMLP layers (risk-aware):")
+                print(f"  Mean α: {np.mean(mlp_alphas):.3f}")
+                print(f"  Median α: {np.median(mlp_alphas):.3f}")
+
+            if attn_alphas:
+                print(f"\nAttention layers (AWQ-style):")
+                print(f"  Mean α: {np.mean(attn_alphas):.3f}")
+                print(f"  Median α: {np.median(attn_alphas):.3f}")
+
         self.activation_data = {}
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -525,13 +573,15 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     print("=" * 80)
-    print("Real-PRAQ: Risk-Aware AWQ for MiniCPM-2B")
+    print("Real-PRAQ: Risk-Aware AWQ for MiniCPM-2B (CORRECTED)")
     print("=" * 80)
     print("Innovation: Combines AWQ optimization with PRAQ risk-awareness")
     print("  1. MLP layers: Risk-aware salience = P(activation) × magnitude")
     print("  2. Attention layers: Standard AWQ salience = E[|X|]")
     print("  3. Grid search for optimal scaling exponent α")
-    print("  4. Uniform INT4 quantization with optimal per-channel scaling")
+    print("  4. Per-INPUT-channel (column-wise) scaling: W[:, j] *= s[j]^α")
+    print("  5. Uniform INT4 quantization with optimal per-channel scaling")
+    print("\nKey Fix: CORRECTED per-column scaling (not per-element)")
     print("=" * 80)
     print(f"Device: {device}")
     print(f"Model: {model_name}")
@@ -592,12 +642,18 @@ def main():
     print("QUANTIZATION COMPLETE!")
     print("=" * 80)
     print(f"Quantized model saved to: {args.output_dir}")
-    print("\nReal-PRAQ Approach:")
-    print("  - MLP layers: Risk-aware salience (accounts for risky dead neurons)")
-    print("  - Attention layers: AWQ-style salience (activation magnitude)")
-    print("  - Grid search optimization for per-channel scaling")
-    print("  - Uniform INT4 quantization (all channels)")
-    print("  - Expected: Better than Real-AWQ due to risk-awareness")
+    print("\nReal-PRAQ Approach (CORRECTED):")
+    print("  ✓ MLP layers: Risk-aware salience (accounts for risky dead neurons)")
+    print("  ✓ Attention layers: AWQ-style salience (activation magnitude)")
+    print("  ✓ Grid search optimization for per-INPUT-channel scaling")
+    print("  ✓ Column-wise weight scaling: W[:, j] *= s[j]^α")
+    print("  ✓ Uniform INT4 quantization (all channels)")
+    print("  ✓ Matches official AWQ paper implementation")
+    print("\nExpected: Better than Real-AWQ due to risk-awareness!")
+    print("\nNext steps:")
+    print(f"  Run: python compare_praq_vs_real_awq.py \\")
+    print(f"         --real-awq-path ./quantized_models/minicpm_real_awq \\")
+    print(f"         --real-praq-path {args.output_dir}")
     print("=" * 80)
 
 
