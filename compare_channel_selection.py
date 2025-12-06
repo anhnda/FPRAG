@@ -94,27 +94,23 @@ class ChannelSelectionAnalyzer:
 
     @torch.no_grad()
     def compute_awq_importance(self, name, module):
-        """Compute AWQ importance: E[|XW^T + b|]"""
+        """Compute AWQ importance: E[|X|] · |W| (salient weight magnitude)"""
         if name not in self.activation_data or len(self.activation_data[name]) == 0:
             return torch.ones(module.out_features)
 
         X_list = self.activation_data[name]
         X = torch.cat([x.reshape(-1, x.shape[-1]) for x in X_list], dim=0)
 
-        batch_size = 1024
-        n_samples = X.shape[0]
-        W = module.weight.data
-        b = module.bias.data if module.bias is not None else torch.zeros(module.out_features, device=self.device)
+        # Compute activation salience: E[|X|] per input feature
+        activation_salience = X.abs().mean(dim=0)  # Shape: [in_features]
 
-        importance_sum = torch.zeros(module.out_features, device=self.device)
+        # Get weight matrix
+        W = module.weight.data  # [out_features, in_features]
 
-        for i in range(0, n_samples, batch_size):
-            batch_X = X[i:i+batch_size].to(self.device)
-            Z = torch.matmul(batch_X, W.t()) + b
-            importance_sum += Z.abs().sum(dim=0)
-            del batch_X, Z
+        # AWQ importance: E[|X|] · |W| per output channel
+        importance = torch.matmul(W.abs().cpu(), activation_salience.cpu())
 
-        return (importance_sum / n_samples).cpu()
+        return importance
 
     @torch.no_grad()
     def compute_praq_importance(self, name, module):

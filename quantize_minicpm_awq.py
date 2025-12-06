@@ -66,8 +66,13 @@ class AWQQuantizer:
         """
         Compute AWQ importance scores.
 
-        AWQ Metric: E[|Z|] where Z = XW^T + b (pre-activation output)
-        This matches the original AWQ paper.
+        AWQ Metric: E[|X|] · |W| (salient weight magnitude)
+        This is the correct AWQ formula from the original paper.
+
+        For each output channel c:
+            importance[c] = sum_i( E[|X[:, i]|] * |W[c, i]| )
+
+        This measures how much each output channel is affected by salient activations.
 
         Args:
             name: Layer name
@@ -83,30 +88,20 @@ class AWQQuantizer:
         X_list = self.activation_data[name]
         X = torch.cat([x.reshape(-1, x.shape[-1]) for x in X_list], dim=0)
 
-        # Process in batches if data is too large (avoid OOM)
-        batch_size = 1024
+        # Compute activation salience: E[|X|] per input feature
+        # Shape: [in_features]
         n_samples = X.shape[0]
-        W = module.weight.data  # [out_features, in_features]
-        b = module.bias.data if module.bias is not None else torch.zeros(module.out_features, device=self.device)
+        activation_salience = X.abs().mean(dim=0)  # E[|X|] for each input feature
 
-        importance_sum = torch.zeros(module.out_features, device=self.device)
+        # Get weight matrix: [out_features, in_features]
+        W = module.weight.data
 
-        for i in range(0, n_samples, batch_size):
-            batch_X = X[i:i+batch_size].to(self.device)
+        # AWQ importance: For each output channel, compute E[|X|] · |W|
+        # importance[c] = sum_i( salience[i] * |W[c, i]| )
+        # Shape: [out_features]
+        importance = torch.matmul(W.abs().cpu(), activation_salience.cpu())
 
-            # Compute pre-activation values: Z = XW^T + b
-            Z = torch.matmul(batch_X, W.t()) + b
-
-            # Accumulate statistics
-            importance_sum += Z.abs().sum(dim=0)
-
-            # Free memory
-            del batch_X, Z
-
-        # AWQ importance: E[|Z|] (original AWQ paper)
-        importance = importance_sum / n_samples
-
-        return importance.cpu()
+        return importance
 
     @torch.no_grad()
     def quantize_layer(self, module, importance_scores, keep_ratio=0.5):
@@ -295,8 +290,9 @@ def main():
     print("=" * 80)
     print("AWQ (Activation-aware Weight Quantization) for MiniCPM-2B")
     print("=" * 80)
-    print("Method: Simple activation magnitude importance")
-    print("  Importance = E[|XW^T + b|] per output channel")
+    print("Method: Salient weight magnitude importance")
+    print("  Importance = E[|X|] · |W| per output channel")
+    print("  (Protects weights with high magnitude on salient activations)")
     print("=" * 80)
     print(f"Device: {device}")
     print(f"Model: {model_name}")
@@ -359,8 +355,8 @@ def main():
     print(f"Quantized model saved to: {output_dir}")
     print("\nQuantization approach:")
     print("  - Method: AWQ (Activation-aware Weight Quantization)")
-    print("  - Importance: E[|XW^T + b|] - mean absolute activation")
-    print("  - All linear layers quantized with same strategy")
+    print("  - Importance: E[|X|] · |W| - salient weight magnitude")
+    print("  - Protects channels with high weights on salient activations")
     print(f"  - Keep ratio: {keep_ratio} ({int(keep_ratio*100)}% in FP16, {int((1-keep_ratio)*100)}% in INT4)")
 
     # Calculate average bits per weight

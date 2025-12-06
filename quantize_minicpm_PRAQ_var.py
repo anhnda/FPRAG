@@ -247,7 +247,9 @@ class VariancePenalizedRPRAQQuantizer:
     def compute_importance_scores_attention(self, name, module):
         """
         Compute importance scores for attention layers using AWQ-style approach.
-        For attention layers (Q/K/V/O projections), use activation magnitude.
+        For attention layers (Q/K/V/O projections), use salient weight magnitude.
+
+        AWQ Metric: E[|X|] · |W| (salient weight magnitude)
 
         Args:
             name: Layer name
@@ -263,30 +265,16 @@ class VariancePenalizedRPRAQQuantizer:
         X_list = self.activation_data[name]
         X = torch.cat([x.reshape(-1, x.shape[-1]) for x in X_list], dim=0)
 
-        # Process in batches to avoid OOM
-        batch_size = 1024
-        n_samples = X.shape[0]
+        # Compute activation salience: E[|X|] per input feature
+        activation_salience = X.abs().mean(dim=0)  # Shape: [in_features]
+
+        # Get weight matrix
         W = module.weight.data  # [out_features, in_features]
-        b = module.bias.data if module.bias is not None else torch.zeros(module.out_features, device=self.device)
 
-        importance_sum = torch.zeros(module.out_features, device=self.device)
+        # AWQ importance: E[|X|] · |W| per output channel
+        importance = torch.matmul(W.abs().cpu(), activation_salience.cpu())
 
-        for i in range(0, n_samples, batch_size):
-            batch_X = X[i:i+batch_size].to(self.device)
-
-            # Compute pre-activation values: Z = XW^T + b
-            Z = torch.matmul(batch_X, W.t()) + b
-
-            # Accumulate statistics
-            importance_sum += Z.abs().sum(dim=0)
-
-            # Free memory
-            del batch_X, Z
-
-        # AWQ-style importance: simply use output magnitude
-        importance = importance_sum / n_samples
-
-        return importance.cpu()
+        return importance
 
     @torch.no_grad()
     def compute_importance_scores(self, name, module):
