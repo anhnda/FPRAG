@@ -279,13 +279,9 @@ class RobustPRAQQuantizerFast:
             W_scaled = W * scales.unsqueeze(0)
             W_quant = self.quantize_weight(W_scaled)
 
-            # Use single noise sample for speed (instead of averaging)
-            if self.noise_std > 0:
-                x_std = X_search.std()
-                noise = torch.randn_like(X_search) * (self.noise_std * 0.5 * x_std)
-                X_eval = X_search + noise
-            else:
-                X_eval = X_search
+            # FIX: Don't use noise in grid search - it corrupts alpha selection!
+            # Only use clean data for reconstruction error measurement
+            X_eval = X_search  # No noise in grid search
 
             X_compensated = X_eval / scales.unsqueeze(0)
 
@@ -408,8 +404,8 @@ def main():
     parser = argparse.ArgumentParser(description="Robust-PRAQ quantization (GPU-optimized)")
     parser.add_argument("--n-calib", type=int, default=150)
     parser.add_argument("--n-grid", type=int, default=20)
-    parser.add_argument("--noise-std", type=float, default=0.01)
-    parser.add_argument("--n-noise-samples", type=int, default=3)
+    parser.add_argument("--noise-std", type=float, default=0.005)  # Reduced from 0.01
+    parser.add_argument("--n-noise-samples", type=int, default=2)  # Reduced from 3
     parser.add_argument("--output-dir", type=str, default="./quantized_models/minicpm_robust_praq")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
