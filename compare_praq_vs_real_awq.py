@@ -279,33 +279,84 @@ def analyze_comparison(results_dict):
             print(f"\n🏆 BEST QUANTIZED MODEL: {best['name']}")
             print(f"   Perplexity degradation: {best['delta_pct']:+.2f}%")
 
-    # Compare PRAQ vs Real AWQ directly
-    if 'PRAQ' in results_dict and 'Real-AWQ' in results_dict:
-        if results_dict['PRAQ'] and results_dict['Real-AWQ']:
-            praq_ppl = results_dict['PRAQ']['perplexity']
-            awq_ppl = results_dict['Real-AWQ']['perplexity']
+    # Compare all approaches
+    print(f"\n{'='*80}")
+    print("METHOD COMPARISON")
+    print(f"{'='*80}")
 
-            print(f"\n{'='*80}")
-            print("PRAQ vs Real-AWQ")
-            print(f"{'='*80}")
+    # Extract perplexities for key methods
+    methods = {}
+    if 'Real-AWQ' in results_dict and results_dict['Real-AWQ']:
+        methods['Real-AWQ'] = results_dict['Real-AWQ']['perplexity']
+    if 'Real-PRAQ' in results_dict and results_dict['Real-PRAQ']:
+        methods['Real-PRAQ'] = results_dict['Real-PRAQ']['perplexity']
+    if 'PRAQ' in results_dict and results_dict['PRAQ']:
+        methods['PRAQ (Mixed)'] = results_dict['PRAQ']['perplexity']
 
-            if praq_ppl < awq_ppl:
-                improvement = ((awq_ppl - praq_ppl) / awq_ppl) * 100
-                print(f"✅ PRAQ WINS!")
-                print(f"   PRAQ achieves {improvement:.2f}% lower perplexity than Real-AWQ")
-                print(f"   PRAQ: {praq_ppl:.4f} vs Real-AWQ: {awq_ppl:.4f}")
-            elif awq_ppl < praq_ppl:
-                improvement = ((praq_ppl - awq_ppl) / praq_ppl) * 100
-                print(f"✅ Real-AWQ WINS!")
-                print(f"   Real-AWQ achieves {improvement:.2f}% lower perplexity than PRAQ")
-                print(f"   Real-AWQ: {awq_ppl:.4f} vs PRAQ: {praq_ppl:.4f}")
+    if len(methods) >= 2:
+        # Find best method
+        best_method = min(methods, key=methods.get)
+        best_ppl = methods[best_method]
+
+        print(f"\n🏆 OVERALL WINNER: {best_method}")
+        print(f"   Perplexity: {best_ppl:.4f}\n")
+
+        # Compare approaches
+        print("Pairwise Comparisons:")
+
+        # Real-AWQ vs Real-PRAQ (fair comparison: both uniform INT4)
+        if 'Real-AWQ' in methods and 'Real-PRAQ' in methods:
+            awq_ppl = methods['Real-AWQ']
+            real_praq_ppl = methods['Real-PRAQ']
+            delta = ((real_praq_ppl - awq_ppl) / awq_ppl) * 100
+
+            print(f"\n  Real-AWQ vs Real-PRAQ (uniform INT4 comparison):")
+            if real_praq_ppl < awq_ppl:
+                print(f"    ✅ Real-PRAQ wins by {abs(delta):.2f}%")
+                print(f"    → Risk-aware scaling beats activation-only scaling")
+            elif awq_ppl < real_praq_ppl:
+                print(f"    ❌ Real-AWQ wins by {abs(delta):.2f}%")
+                print(f"    → Simple activation salience beats risk-awareness")
             else:
-                print(f"🤝 TIE!")
-                print(f"   Both achieve similar perplexity: {praq_ppl:.4f}")
+                print(f"    🤝 Tie")
 
-            print(f"\nKey Insight:")
-            print(f"  - Real-AWQ: Uniform INT4 quantization + per-channel scaling")
-            print(f"  - PRAQ: Mixed-precision (FP16 + INT4) with risk-aware selection")
+        # PRAQ (Mixed) vs Real-PRAQ (mixed vs uniform comparison)
+        if 'PRAQ (Mixed)' in methods and 'Real-PRAQ' in methods:
+            mixed_ppl = methods['PRAQ (Mixed)']
+            real_praq_ppl = methods['Real-PRAQ']
+            delta = ((real_praq_ppl - mixed_ppl) / mixed_ppl) * 100
+
+            print(f"\n  PRAQ (Mixed) vs Real-PRAQ (mixed vs uniform):")
+            if real_praq_ppl < mixed_ppl:
+                print(f"    ✅ Real-PRAQ wins by {abs(delta):.2f}%")
+                print(f"    → Uniform INT4 + scaling beats mixed-precision")
+            elif mixed_ppl < real_praq_ppl:
+                print(f"    ❌ PRAQ (Mixed) wins by {abs(delta):.2f}%")
+                print(f"    → Mixed-precision beats uniform quantization")
+            else:
+                print(f"    🤝 Tie")
+
+        # Real-AWQ vs PRAQ (Mixed) (different paradigms)
+        if 'Real-AWQ' in methods and 'PRAQ (Mixed)' in methods:
+            awq_ppl = methods['Real-AWQ']
+            mixed_ppl = methods['PRAQ (Mixed)']
+            delta = ((mixed_ppl - awq_ppl) / awq_ppl) * 100
+
+            print(f"\n  Real-AWQ vs PRAQ (Mixed) (paradigm comparison):")
+            if mixed_ppl < awq_ppl:
+                print(f"    ✅ PRAQ (Mixed) wins by {abs(delta):.2f}%")
+            elif awq_ppl < mixed_ppl:
+                print(f"    ❌ Real-AWQ wins by {abs(delta):.2f}%")
+            else:
+                print(f"    🤝 Tie")
+
+        print(f"\n{'='*80}")
+        print("KEY INSIGHTS")
+        print(f"{'='*80}")
+        print("Method Characteristics:")
+        print("  - Real-AWQ: Uniform INT4 + activation salience scaling")
+        print("  - Real-PRAQ: Uniform INT4 + risk-aware salience scaling")
+        print("  - PRAQ (Mixed): Mixed-precision (20% FP16, 80% INT4) + risk-aware selection")
 
 
 def visualize_results(results_dict, output_dir="./visualizations/praq_vs_real_awq"):
@@ -397,7 +448,13 @@ def main():
         "--praq-path",
         type=str,
         default="./quantized_models/minicpm_praq_hybrid",
-        help="Path to PRAQ quantized model"
+        help="Path to PRAQ quantized model (mixed-precision)"
+    )
+    parser.add_argument(
+        "--real-praq-path",
+        type=str,
+        default="./quantized_models/minicpm_real_praq",
+        help="Path to Real-PRAQ quantized model (uniform INT4 + risk-aware scaling)"
     )
     parser.add_argument(
         "--include-baselines",
@@ -454,10 +511,18 @@ def main():
         device=device
     )
 
-    # Evaluate PRAQ
+    # Evaluate PRAQ (mixed-precision)
     results['PRAQ'] = evaluate_model(
         args.praq_path,
-        "PRAQ",
+        "PRAQ (Mixed)",
+        eval_texts,
+        device=device
+    )
+
+    # Evaluate Real-PRAQ (uniform INT4 + risk-aware scaling)
+    results['Real-PRAQ'] = evaluate_model(
+        args.real_praq_path,
+        "Real-PRAQ",
         eval_texts,
         device=device
     )
