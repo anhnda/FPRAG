@@ -428,7 +428,7 @@ def main():
     parser.add_argument(
         "--n-calib",
         type=int,
-        default=500,
+        default=150,
         help="Number of calibration samples"
     )
     parser.add_argument(

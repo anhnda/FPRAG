@@ -406,7 +406,7 @@ def load_wikitext2(split="train", n_samples=None):
 
 def main():
     parser = argparse.ArgumentParser(description="Robust-PRAQ quantization (GPU-optimized)")
-    parser.add_argument("--n-calib", type=int, default=500)
+    parser.add_argument("--n-calib", type=int, default=150)
     parser.add_argument("--n-grid", type=int, default=20)
     parser.add_argument("--noise-std", type=float, default=0.01)
     parser.add_argument("--n-noise-samples", type=int, default=3)
