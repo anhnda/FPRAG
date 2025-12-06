@@ -86,6 +86,7 @@ class RealPRAQQuantizer:
             def hook(module, input, output):
                 if name not in self.activation_data:
                     self.activation_data[name] = []
+                # Store input activations on CPU to save GPU memory
                 if isinstance(input, tuple):
                     inp = input[0].detach().cpu()
                 else:

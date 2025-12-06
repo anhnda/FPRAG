@@ -69,11 +69,11 @@ class RealAWQQuantizer:
             def hook(module, input, output):
                 if name not in self.activation_data:
                     self.activation_data[name] = []
-                # Store input activations
+                # Store input activations on CPU to save GPU memory
                 if isinstance(input, tuple):
-                    inp = input[0].detach()
+                    inp = input[0].detach().cpu()
                 else:
-                    inp = input.detach()
+                    inp = input.detach().cpu()
                 self.activation_data[name].append(inp)
             return hook
 
