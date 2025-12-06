@@ -266,12 +266,11 @@ class RealAWQQuantizer:
         Steps:
         1. Grid search for best per-input-channel scales
         2. Scale weight columns: W[:, j] *= scales[j]
-        3. Quantize all scaled weights to INT4
-        4. Store scales for later analysis
+        3. Quantize scaled weights to INT4
+        4. Divide by scales to restore original magnitude: W_final = Q(W*s) / s
 
-        Note: In a real deployment, you'd absorb inverse scales into the
-        previous layer's output or apply them at runtime. For evaluation,
-        we just measure the quantized model quality.
+        This gives us: W_final @ X ≈ Q(W*s)/s @ X ≈ W @ X
+        The scaling-and-dividing protects important channels during quantization.
 
         Args:
             name: Layer name
@@ -288,8 +287,12 @@ class RealAWQQuantizer:
         # Quantize scaled weights to INT4
         W_quant = self.quantize_weight(W_scaled)
 
-        # Update module weights with quantized scaled weights
-        module.weight.data = W_quant
+        # CRITICAL: Divide by scales to restore original magnitude
+        # This ensures: Q(W*s)/s @ X ≈ W @ X at inference
+        W_final = W_quant / best_scales.unsqueeze(0)
+
+        # Update module weights with scaled-quantized-descaled weights
+        module.weight.data = W_final
 
         # Store scales and metadata for later analysis
         self.layer_scales[name] = {
