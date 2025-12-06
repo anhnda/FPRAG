@@ -226,11 +226,22 @@ class RealPRAQQuantizer:
         if name not in self.activation_data or len(self.activation_data[name]) == 0:
             return None
 
+        # Process activations in chunks to avoid OOM
         X_list = self.activation_data[name]
-        X = torch.cat([x.reshape(-1, x.shape[-1]) for x in X_list], dim=0)
 
-        # Activation salience
-        salience = X.abs().mean(dim=0)
+        # Get total number of samples and features
+        total_samples = sum(x.reshape(-1, x.shape[-1]).shape[0] for x in X_list)
+        in_features = X_list[0].shape[-1]
+
+        # Accumulate salience on CPU
+        salience_sum = torch.zeros(in_features)
+
+        for x in X_list:
+            x_flat = x.reshape(-1, x.shape[-1])
+            salience_sum += x_flat.abs().sum(dim=0)
+
+        # Compute mean
+        salience = salience_sum / total_samples
         return salience
 
     @torch.no_grad()
@@ -253,39 +264,45 @@ class RealPRAQQuantizer:
     @torch.no_grad()
     def search_best_scale(self, name, module):
         """
-        Grid search for optimal per-channel scaling factor.
+        Grid search for optimal per-input-channel scaling factor.
 
         Real-PRAQ Algorithm:
         1. Compute risk-aware salience: s_risk = P(activation) × magnitude
         2. For α in [0, 0.05, 0.1, ..., 0.95, 1.0]:
-           - Compute scales: s = (s_risk)^α
-           - Scale weights: W_scaled = W * s
-           - Quantize: Q(W_scaled)
-           - Measure reconstruction error
-        3. Return α that minimizes error
+           a. Compute scales: s[j] = (s_risk[j])^α for each input channel j
+           b. Scale weight COLUMNS: W[:, j] *= s[j]
+           c. Quantize: W_q = Quantize(W_scaled)
+           d. Compute compensated output: Y_q = W_q @ (X / s)
+           e. Measure error: ||Y_q - Y_orig||²
+        3. Return α and scales that minimize error
 
         Args:
             name: Layer name
             module: Linear layer module
 
         Returns:
-            best_scales: Optimal per-channel scales
+            best_scales: Optimal per-input-channel scales (shape: [in_features])
+            best_alpha: Best alpha value
+            best_error: Minimum reconstruction error
         """
         # Get salience (risk-aware for MLP, AWQ-style for attention)
         salience = self.get_salience(name, module)
 
         if salience is None:
-            return torch.ones(module.out_features)
+            in_features = module.weight.shape[1]
+            return torch.ones(in_features).to(self.device), 0.0, 0.0
 
         # Check for invalid salience values
         if torch.isnan(salience).any() or torch.isinf(salience).any():
             print(f"    WARNING: Invalid salience values detected, using uniform scaling")
-            return torch.ones(module.out_features)
+            in_features = module.weight.shape[1]
+            return torch.ones(in_features).to(self.device), 0.0, 0.0
 
         # Check if salience is all zeros or very small
         if salience.max() < 1e-10:
             print(f"    WARNING: Salience values too small, using uniform scaling")
-            return torch.ones(module.out_features)
+            in_features = module.weight.shape[1]
+            return torch.ones(in_features).to(self.device), 0.0, 0.0
 
         # Normalize salience to prevent numerical issues
         # Scale to [0.1, 10] range to avoid extreme values
@@ -298,71 +315,80 @@ class RealPRAQQuantizer:
 
         # Get activations for reconstruction error measurement
         X_list = self.activation_data[name]
-        X = torch.cat([x.reshape(-1, x.shape[-1]) for x in X_list], dim=0)
+
+        # Concatenate on CPU first, then sample
+        X_cpu = torch.cat([x.reshape(-1, x.shape[-1]) for x in X_list], dim=0)
 
         # Limit samples for efficiency
-        max_samples = min(2048, X.shape[0])
-        if X.shape[0] > max_samples:
-            indices = torch.randperm(X.shape[0])[:max_samples]
-            X_search = X[indices]
+        max_samples = min(2048, X_cpu.shape[0])
+        if X_cpu.shape[0] > max_samples:
+            indices = torch.randperm(X_cpu.shape[0])[:max_samples]
+            X_search = X_cpu[indices].to(self.device)
         else:
-            X_search = X
+            X_search = X_cpu.to(self.device)
 
-        W = module.weight.data
+        # Free CPU memory
+        del X_cpu
+
+        W = module.weight.data  # [out_features, in_features]
         b = module.bias.data if module.bias is not None else None
 
-        # Compute original output
-        X_search_gpu = X_search.to(self.device)
+        # Compute original output (FP16 baseline)
         if b is not None:
-            original_out = torch.matmul(X_search_gpu, W.t()) + b
+            Y_orig = torch.matmul(X_search, W.t()) + b
         else:
-            original_out = torch.matmul(X_search_gpu, W.t())
+            Y_orig = torch.matmul(X_search, W.t())
 
         best_error = float('inf')
         best_alpha = 0.0
-        best_scales = torch.ones(W.shape[0], device=self.device)
+        best_scales = torch.ones(W.shape[1], device=self.device)
+
+        # Move salience to device
+        salience = salience.to(self.device)
 
         # Grid search over α
         for grid_idx in range(self.n_grid + 1):
             alpha = grid_idx / self.n_grid
 
-            # Compute scales: s = (salience)^α
-            scales_per_input = salience.pow(alpha).clamp(min=1e-4)
+            # Compute per-input-channel scales: s[j] = (salience[j])^α
+            # Shape: [in_features]
+            scales = salience.pow(alpha).clamp(min=1e-5)
 
-            # Broadcast to weight shape
-            scales = scales_per_input.unsqueeze(0).expand(W.shape[0], -1).to(self.device)
-
-            # Scale weights
-            W_scaled = W * scales
+            # Scale weight COLUMNS: W_scaled[:, j] = W[:, j] * scales[j]
+            # Broadcasting: scales shape [in_features] → W shape [out_features, in_features]
+            W_scaled = W * scales.unsqueeze(0)  # scales broadcast across output channels
 
             # Quantize scaled weights
             W_quant = self.quantize_weight(W_scaled)
 
-            # Compute output: Q(W*s) * (s^-1 * X)
-            X_scaled = X_search_gpu / scales_per_input.to(self.device)
+            # Compute output with quantized scaled weights and compensated input
+            # Y_q = W_q @ (X / s)
+            # Compensate input: X_compensated = X / scales
+            X_compensated = X_search / scales.unsqueeze(0)  # scales broadcast across batch
 
             if b is not None:
-                quant_out = torch.matmul(X_scaled, W_quant.t()) + b
+                Y_quant = torch.matmul(X_compensated, W_quant.t()) + b
             else:
-                quant_out = torch.matmul(X_scaled, W_quant.t())
+                Y_quant = torch.matmul(X_compensated, W_quant.t())
 
             # Compute reconstruction error
-            error = (original_out - quant_out).pow(2).mean().item()
+            error = (Y_orig - Y_quant).pow(2).mean().item()
 
             if error < best_error:
                 best_error = error
                 best_alpha = alpha
-                best_scales = scales_per_input.clone()
+                best_scales = scales.clone()
 
         # Clean up
-        del X_search_gpu, original_out
-        if 'quant_out' in locals():
-            del quant_out
+        del X_search, Y_orig
+        if 'Y_quant' in locals():
+            del Y_quant
+        torch.cuda.empty_cache()
 
         layer_type = self.layer_types.get(name, 'mlp')
         print(f"    [{layer_type}] best_alpha={best_alpha:.3f}, error={best_error:.6f}")
 
-        return best_scales
+        return best_scales, best_alpha, best_error
 
     @torch.no_grad()
     def quantize_weight(self, W):
@@ -378,21 +404,23 @@ class RealPRAQQuantizer:
     def quantize_layer(self, name, module):
         """Apply Real-PRAQ quantization to a layer."""
         # Search for optimal scales
-        best_scales = self.search_best_scale(name, module)
+        best_scales, best_alpha, best_error = self.search_best_scale(name, module)
 
-        W = module.weight.data
+        W = module.weight.data  # [out_features, in_features]
 
-        # Broadcast scales to weight shape
-        scales = best_scales.unsqueeze(0).expand(W.shape[0], -1).to(W.device)
+        # Scale weight COLUMNS by per-input-channel scales
+        W_scaled = W * best_scales.unsqueeze(0)
 
-        # Scale weights
-        W_scaled = W * scales
-
-        # Quantize scaled weights
+        # Quantize scaled weights to INT4
         W_quant = self.quantize_weight(W_scaled)
 
-        # Update module weights
+        # Update module weights with quantized scaled weights
         module.weight.data = W_quant
+
+        # Clean up
+        del W_scaled, W_quant
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def calibrate(self, calibration_data, n_samples=500):
         """Run calibration to collect activations."""
@@ -426,19 +454,28 @@ class RealPRAQQuantizer:
         quantized_count = 0
         skipped_count = 0
 
-        for name, module in tqdm(list(self.model.named_modules()), desc="Quantizing"):
-            if isinstance(module, nn.Linear):
-                try:
-                    self.quantize_layer(name, module)
-                    quantized_count += 1
+        layer_names = [(name, module) for name, module in self.model.named_modules()
+                       if isinstance(module, nn.Linear)]
 
-                    if quantized_count % 50 == 0 and torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+        for name, module in tqdm(layer_names, desc="Quantizing layers"):
+            try:
+                self.quantize_layer(name, module)
+                quantized_count += 1
 
-                except Exception as e:
-                    print(f"\n⚠️  Error quantizing layer {name}: {e}")
-                    skipped_count += 1
-                    continue
+                # Clear activation data for this layer to save memory
+                if name in self.activation_data:
+                    del self.activation_data[name]
+
+                # Clear GPU cache periodically
+                if quantized_count % 10 == 0 and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+            except Exception as e:
+                print(f"\n⚠️  Error quantizing layer {name}: {e}")
+                import traceback
+                traceback.print_exc()
+                skipped_count += 1
+                continue
 
         print(f"\n✅ Quantization complete!")
         print(f"   Total linear layers quantized: {quantized_count}")

@@ -100,13 +100,22 @@ class RealAWQQuantizer:
         if name not in self.activation_data or len(self.activation_data[name]) == 0:
             return None
 
-        # Concatenate all activation samples
+        # Process activations in chunks to avoid OOM
         X_list = self.activation_data[name]
-        X = torch.cat([x.reshape(-1, x.shape[-1]) for x in X_list], dim=0)
 
-        # Compute mean absolute activation per input feature
-        # Shape: [in_features]
-        salience = X.abs().mean(dim=0)
+        # Get total number of samples and features
+        total_samples = sum(x.reshape(-1, x.shape[-1]).shape[0] for x in X_list)
+        in_features = X_list[0].shape[-1]
+
+        # Accumulate salience on CPU
+        salience_sum = torch.zeros(in_features)
+
+        for x in X_list:
+            x_flat = x.reshape(-1, x.shape[-1])
+            salience_sum += x_flat.abs().sum(dim=0)
+
+        # Compute mean
+        salience = salience_sum / total_samples
 
         return salience
 
@@ -172,15 +181,20 @@ class RealAWQQuantizer:
 
         # Get activations for reconstruction error measurement
         X_list = self.activation_data[name]
-        X = torch.cat([x.reshape(-1, x.shape[-1]) for x in X_list], dim=0)
+
+        # Concatenate on CPU first, then sample
+        X_cpu = torch.cat([x.reshape(-1, x.shape[-1]) for x in X_list], dim=0)
 
         # Limit samples for efficiency (use subset for grid search)
-        max_samples = min(2048, X.shape[0])
-        if X.shape[0] > max_samples:
-            indices = torch.randperm(X.shape[0])[:max_samples]
-            X_search = X[indices].to(self.device)
+        max_samples = min(2048, X_cpu.shape[0])
+        if X_cpu.shape[0] > max_samples:
+            indices = torch.randperm(X_cpu.shape[0])[:max_samples]
+            X_search = X_cpu[indices].to(self.device)
         else:
-            X_search = X.to(self.device)
+            X_search = X_cpu.to(self.device)
+
+        # Free CPU memory
+        del X_cpu
 
         W = module.weight.data  # [out_features, in_features]
         b = module.bias.data if module.bias is not None else None
@@ -232,10 +246,15 @@ class RealAWQQuantizer:
                 best_scales = scales.clone()
 
         # Clean up
-        del X_search, Y_orig
+        del X_search, Y_orig, activation_salience
         if 'Y_quant' in locals():
             del Y_quant
-        torch.cuda.empty_cache()
+        if 'W_scaled' in locals():
+            del W_scaled
+        if 'W_quant' in locals():
+            del W_quant
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         return best_scales, best_alpha, best_error
 
@@ -347,8 +366,12 @@ class RealAWQQuantizer:
 
                 quantized_count += 1
 
+                # Clear activation data for this layer to save memory
+                if name in self.activation_data:
+                    del self.activation_data[name]
+
                 # Clear GPU cache periodically
-                if quantized_count % 50 == 0 and torch.cuda.is_available():
+                if quantized_count % 10 == 0 and torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
             except Exception as e:

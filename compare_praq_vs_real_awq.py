@@ -1,14 +1,18 @@
 """
-Compare PRAQ vs Real AWQ
+Compare PRAQ vs Real AWQ (CORRECTED IMPLEMENTATIONS)
 
 This script compares:
-1. Real AWQ (official algorithm): Uniform INT4 + per-channel scaling
-2. PRAQ (your method): Mixed-precision with risk-aware importance
-3. Optional: Magnitude-based mixed-precision baselines
+1. Real AWQ (CORRECTED): Uniform INT4 + per-INPUT-channel scaling (column-wise)
+2. Real-PRAQ (CORRECTED): Uniform INT4 + risk-aware per-INPUT-channel scaling
+3. PRAQ (Mixed): Mixed-precision (20% FP16, 80% INT4) with risk-aware selection
 
-Key Distinction:
-- Real AWQ: All weights in INT4, protected via scaling
-- PRAQ: Top-k weights in FP16, rest in INT4, selected by risk-awareness
+Key Distinctions:
+- Real AWQ: ALL weights INT4, column-wise scaling by activation salience
+- Real-PRAQ: ALL weights INT4, column-wise scaling by risk-aware salience
+- PRAQ (Mixed): Top-k weights in FP16, rest in INT4, risk-aware selection
+
+IMPORTANT: Now using corrected scaling approach (per-column, not per-element)
+This fixes the previous implementation bug that caused very high perplexity.
 """
 
 import torch
@@ -354,10 +358,16 @@ def analyze_comparison(results_dict):
         print(f"\n{'='*80}")
         print("KEY INSIGHTS")
         print(f"{'='*80}")
-        print("Method Characteristics:")
-        print("  - Real-AWQ: Uniform INT4 + activation salience scaling")
-        print("  - Real-PRAQ: Uniform INT4 + risk-aware salience scaling")
+        print("Method Characteristics (CORRECTED IMPLEMENTATIONS):")
+        print("  - Real-AWQ: Uniform INT4 + per-INPUT-channel (column-wise) scaling")
+        print("    → Scales: s[j] = E[|X[:, j]|]^α")
+        print("    → Operation: W[:, j] *= s[j] (column-wise)")
+        print("  - Real-PRAQ: Uniform INT4 + risk-aware per-INPUT-channel scaling")
+        print("    → Scales: s[j] = (P(activation) × magnitude)^α")
+        print("    → Operation: W[:, j] *= s[j] (column-wise)")
         print("  - PRAQ (Mixed): Mixed-precision (20% FP16, 80% INT4) + risk-aware selection")
+        print("    → Selects top-k channels by risk-aware importance")
+        print("\nKey Fix: Per-column scaling (not per-element) - matches AWQ paper!")
 
 
 def visualize_results(results_dict, output_dir="./visualizations/praq_vs_real_awq"):
