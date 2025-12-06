@@ -628,9 +628,6 @@ def main():
     print("  ✓ Uniform INT4 quantization (all channels)")
     print("\nExpected: BETTER than Real-AWQ (true PRAQ insight!)")
     print("\nNext steps:")
-    print(f"  Run: python compare_praq_vs_real_awq.py \\")
-    print(f"         --real-awq-path ./quantized_models/minicpm_real_awq \\")
-    print(f"         --real-praq-path {args.output_dir}")
     print("=" * 80)
 
 

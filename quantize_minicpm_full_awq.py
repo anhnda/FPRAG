@@ -548,8 +548,6 @@ def main():
     print("  ✓ Uniform INT4 quantization (ALL channels)")
     print("  ✓ No mixed-precision (all weights same bit-width)")
     print(f"  ✓ Grid points: {args.n_grid + 1}")
-    print("\nNext steps:")
-    print(f"  Run: python compare_praq_vs_real_awq.py --real-awq-path {output_dir}")
     print("=" * 80)
 
 
