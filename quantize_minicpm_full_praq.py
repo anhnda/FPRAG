@@ -1,5 +1,5 @@
 """
-Real-PRAQ Implementation (CORRECTED - AWQ Framework + POST-ACTIVATION Importance)
+Full-PRAQ Implementation (CORRECTED - AWQ Framework + POST-ACTIVATION Importance)
 
 This implements the TRUE PRAQ insight combined with AWQ's framework:
 - AWQ's optimization: Per-INPUT-channel scaling + grid search + uniform quantization
@@ -40,9 +40,9 @@ import random
 import numpy as np
 
 
-class RealPRAQQuantizer:
+class FullPRAQQuantizer:
     """
-    Real-PRAQ: AWQ-style quantization with POST-ACTIVATION importance (CORRECTED).
+    Full-PRAQ: AWQ-style quantization with POST-ACTIVATION importance (CORRECTED).
 
     Combines:
     - Real AWQ framework: Grid search + per-INPUT-channel (column-wise) scaling + uniform INT4
@@ -79,7 +79,7 @@ class RealPRAQQuantizer:
         mlp_count = sum(1 for t in self.layer_types.values() if t == 'mlp')
         attn_count = sum(1 for t in self.layer_types.values() if t == 'attention')
 
-        print(f"\n[Real-PRAQ Quantizer Initialized]")
+        print(f"\n[Full-PRAQ Quantizer Initialized]")
         print(f"  Target bits: {bits}")
         print(f"  Grid search points: {n_grid}")
         print(f"  MLP layers (risk-aware): {mlp_count}")
@@ -241,7 +241,7 @@ class RealPRAQQuantizer:
         """
         Grid search for optimal per-input-channel scaling factor.
 
-        Real-PRAQ Algorithm:
+        Full-PRAQ Algorithm:
         1. Compute risk-aware salience: s_risk = P(activation) × magnitude
         2. For α in [0, 0.05, 0.1, ..., 0.95, 1.0]:
            a. Compute scales: s[j] = (s_risk[j])^α for each input channel j
@@ -378,7 +378,7 @@ class RealPRAQQuantizer:
     @torch.no_grad()
     def quantize_layer(self, name, module):
         """
-        Apply Real-PRAQ quantization to a layer.
+        Apply Full-PRAQ quantization to a layer.
 
         Steps:
         1. Grid search for best per-input-channel scales (risk-aware for MLP)
@@ -445,9 +445,9 @@ class RealPRAQQuantizer:
         print("Calibration complete!")
 
     def quantize_model(self):
-        """Quantize all linear layers using Real-PRAQ."""
+        """Quantize all linear layers using Full-PRAQ."""
         print("\n" + "=" * 80)
-        print("Quantizing with Real-PRAQ (risk-aware + grid search + uniform INT4)")
+        print("Quantizing with Full-PRAQ (risk-aware + grid search + uniform INT4)")
         print("=" * 80)
 
         quantized_count = 0
@@ -520,7 +520,7 @@ def load_wikitext2(split="train", n_samples=None):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Real-PRAQ quantization for MiniCPM-2B",
+        description="Full-PRAQ quantization for MiniCPM-2B",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     parser.add_argument("--n-calib", type=int, default=500, help="Calibration samples")
@@ -528,7 +528,7 @@ def main():
     parser.add_argument("--beta", type=float, default=3.0, help="PRAQ beta parameter")
     parser.add_argument("--tau", type=float, default=-3.0, help="PRAQ tau parameter")
     parser.add_argument("--noise-factor", type=float, default=0.2, help="PRAQ noise factor")
-    parser.add_argument("--output-dir", type=str, default="./quantized_models/minicpm_real_praq",
+    parser.add_argument("--output-dir", type=str, default="./quantized_models/minicpm_full_praq",
                        help="Output directory")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     args = parser.parse_args()
@@ -545,7 +545,7 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     print("=" * 80)
-    print("Real-PRAQ: POST-ACTIVATION Importance for MiniCPM-2B (CORRECTED)")
+    print("Full-PRAQ: POST-ACTIVATION Importance for MiniCPM-2B (CORRECTED)")
     print("=" * 80)
     print("Approach: AWQ framework with PRAQ's post-activation insight")
     print("  1. MLP layers: Post-activation importance")
@@ -585,7 +585,7 @@ def main():
     calib_texts = load_wikitext2(split="train", n_samples=args.n_calib)
 
     # Initialize quantizer
-    quantizer = RealPRAQQuantizer(
+    quantizer = FullPRAQQuantizer(
         model=model,
         tokenizer=tokenizer,
         device=device,
@@ -617,7 +617,7 @@ def main():
     print("QUANTIZATION COMPLETE!")
     print("=" * 80)
     print(f"Quantized model saved to: {args.output_dir}")
-    print("\nReal-PRAQ Approach (CORRECTED - TRUE PRAQ INSIGHT):")
+    print("\nFull-PRAQ Approach (CORRECTED - TRUE PRAQ INSIGHT):")
     print("  ✓ MLP layers: POST-activation importance")
     print("    → Measures E[|SiLU(XW+b)|] not E[|X|]")
     print("    → Accounts for activation function effects!")

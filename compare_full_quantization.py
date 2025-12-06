@@ -1,11 +1,17 @@
 """
-Compare Variance-Penalized PRAQ vs AWQ
+Compare Full Quantization Methods vs Original FP16
 
-This script evaluates and compares the variance-penalized PRAQ quantization
-against the AWQ baseline to verify if variance penalization improves
-error propagation and perplexity.
+This script compares uniform INT4 quantization approaches:
+1. Original FP16 - Baseline (no quantization)
+2. Full AWQ - Uniform INT4 + activation-aware scaling
+3. Full PRAQ - Uniform INT4 + post-activation importance scaling
 
-Supports comparing multiple variance penalty values to find the optimal setting.
+All "Full" methods quantize ALL weights to INT4 (no mixed-precision).
+The difference is in how they determine importance for scaling.
+
+Key Questions:
+- How much quality is lost with uniform INT4?
+- Does PRAQ's post-activation insight help vs AWQ's pre-activation?
 """
 
 import torch
@@ -40,12 +46,7 @@ def load_wikitext2_validation(n_samples=2000, seed=42):
 
 @torch.no_grad()
 def evaluate_perplexity(model, tokenizer, texts, max_length=512, device="cuda"):
-    """
-    Evaluate perplexity on a list of text samples.
-
-    Returns:
-        Dictionary with evaluation metrics
-    """
+    """Evaluate perplexity on a list of text samples."""
     model.eval()
     total_loss = 0
     total_tokens = 0
@@ -71,7 +72,7 @@ def evaluate_perplexity(model, tokenizer, texts, max_length=512, device="cuda"):
             if input_ids.shape[1] < 2:
                 continue
 
-            # Forward pass (disable cache to avoid DynamicCache issues)
+            # Forward pass
             start_time = time.time()
             outputs = model(input_ids, labels=input_ids, use_cache=False)
             elapsed = time.time() - start_time
@@ -87,7 +88,6 @@ def evaluate_perplexity(model, tokenizer, texts, max_length=512, device="cuda"):
 
         except Exception as e:
             failed_samples += 1
-            # Only print first few errors to avoid spam
             if failed_samples <= 3:
                 print(f"\nError processing sample: {e}")
             continue
@@ -124,13 +124,14 @@ def get_model_size(model):
     return size_mb
 
 
-def evaluate_model(model_path, model_name, eval_texts, device="cuda"):
+def evaluate_model(model_path, model_name, eval_texts, device="cuda", is_huggingface=False):
     """Evaluate a single model and return results."""
     print(f"\n{'='*80}")
     print(f"Evaluating: {model_name}")
     print(f"{'='*80}")
 
-    if not os.path.exists(model_path):
+    # Check if it's a HuggingFace model or local path
+    if not is_huggingface and not os.path.exists(model_path):
         print(f"❌ Model not found at {model_path}")
         return None
 
@@ -185,110 +186,148 @@ def evaluate_model(model_path, model_name, eval_texts, device="cuda"):
 def create_comparison_table(results_dict):
     """Create a formatted comparison table."""
     print(f"\n{'='*80}")
-    print("COMPARISON TABLE")
+    print("COMPARISON TABLE - UNIFORM INT4 QUANTIZATION")
     print(f"{'='*80}\n")
 
     # Header
     models = list(results_dict.keys())
     header = f"{'Metric':<30}"
     for model_name in models:
-        header += f" {model_name:<18}"
+        header += f" {model_name:<20}"
     print(header)
-    print("-" * (30 + 20 * len(models)))
+    print("-" * (30 + 22 * len(models)))
 
     # Perplexity
     row = f"{'Perplexity':<30}"
     for model_name in models:
         if results_dict[model_name]:
-            row += f" {results_dict[model_name]['perplexity']:>18.4f}"
+            row += f" {results_dict[model_name]['perplexity']:>20.4f}"
         else:
-            row += f" {'N/A':>18}"
+            row += f" {'N/A':>20}"
     print(row)
 
     # Avg Loss
     row = f"{'Avg Loss':<30}"
     for model_name in models:
         if results_dict[model_name]:
-            row += f" {results_dict[model_name]['avg_loss']:>18.4f}"
+            row += f" {results_dict[model_name]['avg_loss']:>20.4f}"
         else:
-            row += f" {'N/A':>18}"
+            row += f" {'N/A':>20}"
     print(row)
 
     # Model Size
     row = f"{'Model Size (MB)':<30}"
     for model_name in models:
         if results_dict[model_name]:
-            row += f" {results_dict[model_name]['model_size_mb']:>18.2f}"
+            row += f" {results_dict[model_name]['model_size_mb']:>20.2f}"
         else:
-            row += f" {'N/A':>18}"
+            row += f" {'N/A':>20}"
     print(row)
 
     # Throughput
     row = f"{'Throughput (tok/s)':<30}"
     for model_name in models:
         if results_dict[model_name]:
-            row += f" {results_dict[model_name]['throughput_tokens_per_sec']:>18.2f}"
+            row += f" {results_dict[model_name]['throughput_tokens_per_sec']:>20.2f}"
         else:
-            row += f" {'N/A':>18}"
+            row += f" {'N/A':>20}"
     print(row)
 
-    print("-" * (30 + 20 * len(models)))
+    print("-" * (30 + 22 * len(models)))
 
 
-def analyze_improvements(results_dict, baseline="AWQ"):
-    """Analyze improvements relative to baseline."""
+def analyze_comparison(results_dict):
+    """Analyze the comparison results."""
     print(f"\n{'='*80}")
-    print(f"IMPROVEMENTS RELATIVE TO {baseline}")
+    print("ANALYSIS")
     print(f"{'='*80}\n")
 
-    if baseline not in results_dict or not results_dict[baseline]:
-        print(f"❌ Baseline model '{baseline}' not found or failed to evaluate")
+    # Find baseline (original FP16 model)
+    baseline = results_dict.get('Original')
+    if not baseline:
+        print("⚠️  No baseline (Original) model found for comparison")
         return
 
-    baseline_result = results_dict[baseline]
-    baseline_ppl = baseline_result['perplexity']
+    baseline_ppl = baseline['perplexity']
+    print(f"Baseline (FP16): Perplexity = {baseline_ppl:.4f}\n")
 
-    improvements = []
+    # Compare quantized models
+    quantized_models = []
+    for name, result in results_dict.items():
+        if name != 'Original' and result:
+            ppl = result['perplexity']
+            delta_ppl = ppl - baseline_ppl
+            delta_pct = (delta_ppl / baseline_ppl) * 100
+            quantized_models.append({
+                'name': name,
+                'perplexity': ppl,
+                'delta': delta_ppl,
+                'delta_pct': delta_pct
+            })
 
-    for model_name, result in results_dict.items():
-        if model_name == baseline or not result:
-            continue
+    # Sort by perplexity
+    quantized_models.sort(key=lambda x: x['perplexity'])
 
-        ppl = result['perplexity']
-        delta_ppl = ppl - baseline_ppl
-        delta_pct = (delta_ppl / baseline_ppl) * 100
-
-        improvements.append({
-            'model': model_name,
-            'perplexity': ppl,
-            'delta': delta_ppl,
-            'delta_pct': delta_pct
-        })
-
-    # Sort by perplexity (lower is better)
-    improvements.sort(key=lambda x: x['perplexity'])
-
-    print(f"Baseline: {baseline} (Perplexity = {baseline_ppl:.4f})\n")
-
-    for imp in improvements:
-        sign = "+" if imp['delta'] > 0 else ""
-        symbol = "❌" if imp['delta'] > 0 else "✅"
-        print(f"{symbol} {imp['model']:<20} Perplexity: {imp['perplexity']:.4f} "
-              f"({sign}{imp['delta']:.4f}, {sign}{imp['delta_pct']:.2f}%)")
-
-    # Find best model
-    if improvements:
-        best = improvements[0]
-        if best['delta'] < 0:
-            print(f"\n🏆 BEST: {best['model']}")
-            print(f"   Achieves {abs(best['delta_pct']):.2f}% lower perplexity than {baseline}")
-        elif best['delta'] > 0:
-            print(f"\n⚠️  All variants perform worse than {baseline}")
+    print("Quantized Model Performance (Uniform INT4):")
+    for model in quantized_models:
+        sign = "+" if model['delta'] > 0 else ""
+        if model['delta_pct'] < 5.0:
+            symbol = "✅"  # Excellent
+        elif model['delta_pct'] < 10.0:
+            symbol = "🟢"  # Good
+        elif model['delta_pct'] < 20.0:
+            symbol = "🟡"  # Acceptable
         else:
-            print(f"\n🤝 All variants achieve similar perplexity to {baseline}")
+            symbol = "❌"  # Poor
+
+        print(f"{symbol} {model['name']:<20} Perplexity: {model['perplexity']:>8.4f} "
+              f"(Δ={sign}{model['delta']:>6.4f}, {sign}{model['delta_pct']:>6.2f}%)")
+
+    # Winner
+    if quantized_models:
+        best = quantized_models[0]
+        print(f"\n🏆 BEST UNIFORM INT4 METHOD: {best['name']}")
+        print(f"   Perplexity degradation: {best['delta_pct']:+.2f}%")
+        print(f"   Quality retention: {100 - best['delta_pct']:.2f}%")
+
+    # Method comparison
+    print(f"\n{'='*80}")
+    print("METHOD COMPARISON")
+    print(f"{'='*80}")
+
+    full_awq_ppl = results_dict.get('Full-AWQ', {}).get('perplexity')
+    full_praq_ppl = results_dict.get('Full-PRAQ', {}).get('perplexity')
+
+    if full_awq_ppl and full_praq_ppl:
+        delta = ((full_praq_ppl - full_awq_ppl) / full_awq_ppl) * 100
+
+        print(f"\nFull-AWQ vs Full-PRAQ:")
+        print(f"  Full-AWQ:  {full_awq_ppl:.4f}")
+        print(f"  Full-PRAQ: {full_praq_ppl:.4f}")
+
+        if full_praq_ppl < full_awq_ppl:
+            print(f"\n  ✅ Full-PRAQ wins by {abs(delta):.2f}%")
+            print(f"  → Post-activation importance beats pre-activation!")
+        elif full_awq_ppl < full_praq_ppl:
+            print(f"\n  ❌ Full-AWQ wins by {abs(delta):.2f}%")
+            print(f"  → Simple activation salience is more robust")
+        else:
+            print(f"\n  🤝 Tie - Both perform equally")
+
+    print(f"\n{'='*80}")
+    print("KEY INSIGHTS")
+    print(f"{'='*80}")
+    print("Method Characteristics:")
+    print("  - Original:   FP16 baseline (no quantization)")
+    print("  - Full-AWQ:   Uniform INT4 + pre-activation salience E[|X|]")
+    print("  - Full-PRAQ:  Uniform INT4 + post-activation importance E[|SiLU(XW)|]")
+    print("\nKey Difference:")
+    print("  AWQ:  Protects channels with high input magnitude")
+    print("  PRAQ: Protects channels with high OUTPUT after activation")
+    print("        (accounts for activation function killing channels)")
 
 
-def visualize_results(results_dict, output_dir="./visualizations/praq_var_comparison"):
+def visualize_results(results_dict, output_dir="./visualizations/full_quantization"):
     """Create visualizations comparing the models."""
     os.makedirs(output_dir, exist_ok=True)
 
@@ -305,36 +344,47 @@ def visualize_results(results_dict, output_dir="./visualizations/praq_var_compar
     perplexities = [valid_results[m]['perplexity'] for m in models]
     sizes = [valid_results[m]['model_size_mb'] for m in models]
 
-    # Plot 1: Perplexity comparison
-    colors = ['#2ecc71' if 'AWQ' in m else '#e74c3c' if 'original' in m.lower() else '#3498db'
-              for m in models]
+    # Color scheme
+    colors = []
+    for m in models:
+        if 'PRAQ' in m:
+            colors.append('#e74c3c')  # Red for PRAQ
+        elif 'AWQ' in m:
+            colors.append('#2ecc71')  # Green for AWQ
+        else:
+            colors.append('#3498db')  # Blue for Original
 
+    # Plot 1: Perplexity comparison
     axes[0].bar(range(len(models)), perplexities, color=colors, alpha=0.8, edgecolor='black')
     axes[0].set_xticks(range(len(models)))
     axes[0].set_xticklabels(models, rotation=45, ha='right')
     axes[0].set_ylabel('Perplexity (lower is better)')
-    axes[0].set_title('Perplexity Comparison')
+    axes[0].set_title('Perplexity Comparison - Uniform INT4 Quantization')
     axes[0].grid(alpha=0.3, axis='y')
 
     # Add value labels on bars
     for i, (ppl, model) in enumerate(zip(perplexities, models)):
-        axes[0].text(i, ppl + 0.5, f'{ppl:.2f}', ha='center', va='bottom', fontsize=9)
+        axes[0].text(i, ppl + 0.5, f'{ppl:.2f}', ha='center', va='bottom', fontsize=10, fontweight='bold')
 
-    # Plot 2: Perplexity vs Model Size
-    axes[1].scatter(sizes, perplexities, s=200, alpha=0.7, c=colors, edgecolors='black', linewidths=2)
+    # Plot 2: Perplexity degradation from baseline
+    baseline_ppl = valid_results.get('Original', {}).get('perplexity')
+    if baseline_ppl:
+        degradations = [(valid_results[m]['perplexity'] - baseline_ppl) / baseline_ppl * 100
+                       for m in models]
+        axes[1].bar(range(len(models)), degradations, color=colors, alpha=0.8, edgecolor='black')
+        axes[1].set_xticks(range(len(models)))
+        axes[1].set_xticklabels(models, rotation=45, ha='right')
+        axes[1].set_ylabel('Perplexity Degradation (%)')
+        axes[1].set_title('Quality Loss from FP16 Baseline')
+        axes[1].axhline(0, color='black', linestyle='--', linewidth=1)
+        axes[1].grid(alpha=0.3, axis='y')
 
-    # Annotate points
-    for model, size, ppl in zip(models, sizes, perplexities):
-        axes[1].annotate(model, (size, ppl), xytext=(5, 5), textcoords='offset points',
-                        fontsize=8, alpha=0.8)
-
-    axes[1].set_xlabel('Model Size (MB)')
-    axes[1].set_ylabel('Perplexity (lower is better)')
-    axes[1].set_title('Perplexity vs Model Size')
-    axes[1].grid(alpha=0.3)
+        # Add value labels
+        for i, (deg, model) in enumerate(zip(degradations, models)):
+            axes[1].text(i, deg + 0.5, f'{deg:+.1f}%', ha='center', va='bottom', fontsize=10, fontweight='bold')
 
     plt.tight_layout()
-    save_path = os.path.join(output_dir, 'comparison.png')
+    save_path = os.path.join(output_dir, 'full_quantization_comparison.png')
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
     print(f"\n✓ Saved visualization: {save_path}")
@@ -342,28 +392,26 @@ def visualize_results(results_dict, output_dir="./visualizations/praq_var_compar
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Compare Variance-Penalized PRAQ vs AWQ",
+        description="Compare Full (Uniform INT4) Quantization Methods",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     parser.add_argument(
-        "--awq-path",
+        "--original-model",
         type=str,
-        default="./quantized_models/minicpm_awq_custom",
-        help="Path to AWQ quantized model"
+        default="openbmb/MiniCPM-2B-sft-bf16",
+        help="Original FP16 model (baseline)"
     )
     parser.add_argument(
-        "--praq-var-paths",
+        "--full-awq-path",
         type=str,
-        nargs='+',
-        default=["./quantized_models/minicpm_praq_var"],
-        help="Paths to variance-penalized PRAQ models (can specify multiple)"
+        default="./quantized_models/minicpm_full_awq",
+        help="Path to Full AWQ quantized model"
     )
     parser.add_argument(
-        "--praq-var-names",
+        "--full-praq-path",
         type=str,
-        nargs='+',
-        default=None,
-        help="Names for variance-penalized PRAQ models (optional, auto-generated if not provided)"
+        default="./quantized_models/minicpm_full_praq",
+        help="Path to Full PRAQ quantized model"
     )
     parser.add_argument(
         "--n-eval",
@@ -376,23 +424,20 @@ def main():
         action="store_true",
         help="Generate comparison visualizations"
     )
-    parser.add_argument(
-        "--output-dir",
-        type=str,
-        default="./visualizations/praq_var_comparison",
-        help="Output directory for visualizations"
-    )
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     print("="*80)
-    print("Variance-Penalized PRAQ vs AWQ Comparison")
+    print("FULL QUANTIZATION COMPARISON")
+    print("="*80)
+    print("Comparing uniform INT4 quantization methods:")
+    print("  1. Original (FP16) - Baseline")
+    print("  2. Full-AWQ - Pre-activation importance")
+    print("  3. Full-PRAQ - Post-activation importance")
     print("="*80)
     print(f"Device: {device}")
     print(f"Evaluation samples: {args.n_eval}")
-    print(f"AWQ model: {args.awq_path}")
-    print(f"PRAQ-Var models: {args.praq_var_paths}")
     print("="*80)
 
     # Load validation data
@@ -401,52 +446,43 @@ def main():
     # Results storage
     results = {}
 
-    # Evaluate AWQ baseline
-    results['AWQ'] = evaluate_model(
-        args.awq_path,
-        "AWQ (Baseline)",
+    # Evaluate original model (baseline)
+    results['Original'] = evaluate_model(
+        args.original_model,
+        "Original (FP16)",
+        eval_texts,
+        device=device,
+        is_huggingface=True
+    )
+
+    # Evaluate Full AWQ
+    results['Full-AWQ'] = evaluate_model(
+        args.full_awq_path,
+        "Full-AWQ",
         eval_texts,
         device=device
     )
 
-    # Evaluate variance-penalized PRAQ models
-    for i, praq_path in enumerate(args.praq_var_paths):
-        # Generate name
-        if args.praq_var_names and i < len(args.praq_var_names):
-            model_name = args.praq_var_names[i]
-        else:
-            # Try to extract variance penalty from path
-            if 'p0' in praq_path or 'var' in praq_path:
-                # Extract penalty value from path if possible
-                import re
-                match = re.search(r'p(\d+\.?\d*)', praq_path)
-                if match:
-                    penalty = match.group(1)
-                    model_name = f"PRAQ-Var (p={penalty})"
-                else:
-                    model_name = f"PRAQ-Var-{i+1}"
-            else:
-                model_name = f"PRAQ-Var-{i+1}"
-
-        results[model_name] = evaluate_model(
-            praq_path,
-            model_name,
-            eval_texts,
-            device=device
-        )
+    # Evaluate Full PRAQ
+    results['Full-PRAQ'] = evaluate_model(
+        args.full_praq_path,
+        "Full-PRAQ",
+        eval_texts,
+        device=device
+    )
 
     # Create comparison table
     create_comparison_table(results)
 
-    # Analyze improvements
-    analyze_improvements(results, baseline="AWQ")
+    # Analyze results
+    analyze_comparison(results)
 
     # Visualize if requested
     if args.visualize:
         print(f"\n{'='*80}")
         print("GENERATING VISUALIZATIONS")
         print(f"{'='*80}")
-        visualize_results(results, output_dir=args.output_dir)
+        visualize_results(results)
 
     print(f"\n{'='*80}")
     print("EVALUATION COMPLETE!")

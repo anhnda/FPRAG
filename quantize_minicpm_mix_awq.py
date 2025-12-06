@@ -9,7 +9,7 @@ import random
 import numpy as np
 
 
-class AWQQuantizer:
+class MixAWQQuantizer:
     """
     AWQ (Activation-aware Weight Quantization) implementation.
 
@@ -261,7 +261,7 @@ def main():
     parser.add_argument(
         "--output-dir",
         type=str,
-        default="./quantized_models/minicpm_awq_custom",
+        default="./quantized_models/minicpm_mix_awq",
         help="Output directory for quantized model"
     )
     parser.add_argument(

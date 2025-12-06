@@ -1,5 +1,5 @@
 """
-Real AWQ Implementation (Corrected - Based on Official Algorithm)
+Full AWQ Implementation (Corrected - Based on Official Algorithm)
 
 This implements the actual AWQ algorithm from the paper:
 AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration
@@ -31,9 +31,9 @@ import random
 import numpy as np
 
 
-class RealAWQQuantizer:
+class FullAWQQuantizer:
     """
-    Real AWQ (Activation-aware Weight Quantization) implementation.
+    Full AWQ (Activation-aware Weight Quantization) implementation.
 
     Based on the official AWQ paper:
     - Per-channel (input channel) scaling based on activation salience
@@ -57,7 +57,7 @@ class RealAWQQuantizer:
         # Storage for scales (for potential runtime use or analysis)
         self.layer_scales = {}
 
-        print(f"\n[Real AWQ Quantizer Initialized]")
+        print(f"\n[Full AWQ Quantizer Initialized]")
         print(f"  Target bits: {bits}")
         print(f"  Grid search points: {n_grid}")
         print(f"  Group size: {group_size}")
@@ -339,7 +339,7 @@ class RealAWQQuantizer:
         Quantize all linear layers in the model using real AWQ.
         """
         print("\n" + "=" * 80)
-        print("Quantizing with Real AWQ Algorithm")
+        print("Quantizing with Full AWQ Algorithm")
         print("=" * 80)
         print("Method:")
         print("  1. Compute per-input-channel salience: s[j] = E[|X[:, j]|]")
@@ -422,7 +422,7 @@ def load_wikitext2(split="train", n_samples=None):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Real AWQ quantization for MiniCPM-2B (Corrected Implementation)",
+        description="Full AWQ quantization for MiniCPM-2B (Corrected Implementation)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     parser.add_argument(
@@ -440,7 +440,7 @@ def main():
     parser.add_argument(
         "--output-dir",
         type=str,
-        default="./quantized_models/minicpm_real_awq",
+        default="./quantized_models/minicpm_full_awq",
         help="Output directory for quantized model"
     )
     parser.add_argument(
@@ -466,7 +466,7 @@ def main():
     output_dir = args.output_dir
 
     print("=" * 80)
-    print("Real AWQ (Activation-aware Weight Quantization) - CORRECTED")
+    print("Full AWQ (Activation-aware Weight Quantization) - CORRECTED")
     print("=" * 80)
     print("Algorithm:")
     print("  1. Per-input-channel salience: s[j] = E[|X[:, j]|]")
@@ -506,8 +506,8 @@ def main():
     # Load calibration data
     calib_texts = load_wikitext2(split="train", n_samples=n_calib_samples)
 
-    # Initialize Real AWQ quantizer
-    quantizer = RealAWQQuantizer(
+    # Initialize Full AWQ quantizer
+    quantizer = FullAWQQuantizer(
         model=model,
         tokenizer=tokenizer,
         device=device,
@@ -541,7 +541,7 @@ def main():
     print("=" * 80)
     print(f"Quantized model saved to: {output_dir}")
     print("\nApproach:")
-    print("  ✓ Real AWQ algorithm (from official paper)")
+    print("  ✓ Full AWQ algorithm (from official paper)")
     print("  ✓ Per-input-channel scaling based on activation salience")
     print("  ✓ Grid search for optimal scaling exponent α")
     print("  ✓ Column-wise weight scaling (CORRECTED)")

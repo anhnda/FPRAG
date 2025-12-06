@@ -9,9 +9,9 @@ import random
 import numpy as np
 
 
-class FastRPRAQQuantizer:
+class MixPRAQQuantizer:
     """
-    Fast Risk-aware Post-activation Quantization (Fast-R-PRAQ) for Transformer Models.
+    Fast Risk-aware Post-activation Quantization (Mix-PRAQ) for Transformer Models.
 
     - For MLP layers: Use risk-aware pre-activation importance with quantization noise estimation
       * Accounts for "risky dead neurons" that may resurrect after quantization
@@ -131,7 +131,7 @@ class FastRPRAQQuantizer:
     @torch.no_grad()
     def compute_importance_scores_mlp(self, name, module):
         """
-        Compute importance scores for MLP layers using FastRPRAQ algorithm.
+        Compute importance scores for MLP layers using MixPRAQ algorithm.
         Uses risk-aware pre-activation statistics with quantization noise estimation.
 
         Args:
@@ -403,7 +403,7 @@ def load_wikitext2(split="train", n_samples=None):
 def main():
     # Parse command-line arguments
     parser = argparse.ArgumentParser(
-        description="FastRPRAQ quantization for MiniCPM-2B",
+        description="MixPRAQ quantization for MiniCPM-2B",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     parser.add_argument(
@@ -439,7 +439,7 @@ def main():
     parser.add_argument(
         "--output-dir",
         type=str,
-        default="./quantized_models/minicpm_praq_hybrid",
+        default="./quantized_models/minicpm_mix_praq_hybrid",
         help="Output directory for quantized model"
     )
     parser.add_argument(
@@ -466,7 +466,7 @@ def main():
     output_dir = args.output_dir
 
     print("=" * 80)
-    print("Fast Risk-aware Post-activation Quantization (Fast-R-PRAQ) for MiniCPM-2B")
+    print("Fast Risk-aware Post-activation Quantization (Mix-PRAQ) for MiniCPM-2B")
     print("=" * 80)
     print("Strategy:")
     print("  - MLP layers: Risk-aware importance with quantization noise estimation")
@@ -495,7 +495,7 @@ def main():
     calib_texts = load_wikitext2(split="train", n_samples=n_calib_samples)
 
     # Initialize quantizer
-    quantizer = FastRPRAQQuantizer(
+    quantizer = MixPRAQQuantizer(
         model=model,
         tokenizer=tokenizer,
         device=device,
@@ -523,7 +523,7 @@ def main():
     print("=" * 80)
     print(f"Quantized model saved to: {output_dir}")
     print("\nQuantization approach:")
-    print("  - MLP layers: Risk-aware importance (Fast-R-PRAQ)")
+    print("  - MLP layers: Risk-aware importance (Mix-PRAQ)")
     print("    * Accounts for risky dead neurons with quantization noise estimation")
     print("  - Attention layers: AWQ-style magnitude based importance")
     print(f"  - Parameters: beta={quantizer.beta}, tau={quantizer.tau}, noise_factor={quantizer.noise_factor}")
