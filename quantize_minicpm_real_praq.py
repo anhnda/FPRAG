@@ -1,30 +1,32 @@
 """
-Real-PRAQ Implementation (CORRECTED - AWQ Framework + PRAQ Risk-Awareness)
+Real-PRAQ Implementation (CORRECTED - AWQ Framework + POST-ACTIVATION Importance)
 
-This combines the best of both approaches:
+This implements the TRUE PRAQ insight combined with AWQ's framework:
 - AWQ's optimization: Per-INPUT-channel scaling + grid search + uniform quantization
-- PRAQ's intelligence: Risk-aware importance accounting for risky dead neurons
+- PRAQ's insight: Measure importance using POST-ACTIVATION outputs, not pre-activation
 
 Key Algorithm:
 1. Compute per-input-channel salience:
-   - MLP layers: s[j] = P(activation) × magnitude (risk-aware)
-   - Attention layers: s[j] = E[|X[:, j]|] (standard AWQ)
+   - MLP layers (PRAQ):
+     a. Compute Y = activation(X @ W^T + b) - POST-activation output
+     b. Measure output importance: importance_out[k] = E[|Y[:, k]|]
+     c. Backprop to inputs: importance_in[j] = Σ_k(importance_out[k] × |W[k,j]|)
+   - Attention layers (AWQ): s[j] = E[|X[:, j]|] (standard pre-activation)
 2. Grid search for optimal α ∈ [0, 1]
 3. Scale weight COLUMNS: W[:, j] *= s[j]^α (per input channel)
 4. Quantize scaled weights to INT4 uniformly
-5. At runtime: compensate with inverse scales on activations
+5. Divide by scales: W_final = Q(W*s) / s (restore original magnitude)
 
-Key Innovation vs Real AWQ:
-Instead of scaling by (E[|X|])^α, we scale by:
-    (P(activation) × magnitude)^α  for MLP layers
+PRAQ Key Insight:
+- AWQ: Uses E[|X|] - doesn't account for activation function
+- PRAQ: Uses E[|activation(XW)|] - accounts for channels killed by ReLU/SiLU
+- Example: A channel with large negative pre-activation has:
+  * AWQ: High importance (large |X|)
+  * PRAQ: Zero importance (killed by ReLU)
 
-where P(activation) accounts for:
-- Pre-activation mean and variance
-- Quantization noise impact (from weight magnitude)
-- Probability of neuron resurrection after quantization
+This is the CORRECT interpretation of PRAQ for AWQ-style scaling!
 
 IMPORTANT: Uses CORRECTED per-column scaling (not per-element)
-This matches the official AWQ paper and fixes the high perplexity issue.
 """
 
 import torch
@@ -40,15 +42,16 @@ import numpy as np
 
 class RealPRAQQuantizer:
     """
-    Real-PRAQ: AWQ-style quantization with risk-aware importance (CORRECTED).
+    Real-PRAQ: AWQ-style quantization with POST-ACTIVATION importance (CORRECTED).
 
     Combines:
     - Real AWQ framework: Grid search + per-INPUT-channel (column-wise) scaling + uniform INT4
-    - PRAQ risk-awareness: P(activation) × magnitude importance scoring for MLP layers
+    - PRAQ insight: Measure importance using POST-activation outputs for MLP layers
 
-    Key Correction:
-    - Uses proper column-wise scaling: W[:, j] *= s[j] (not per-element)
-    - Matches official AWQ paper implementation
+    Key Features:
+    - Proper column-wise scaling: W[:, j] *= s[j] (not per-element)
+    - Post-activation importance: Accounts for activation function effects
+    - AWQ measures |X|, PRAQ measures |activation(XW)| → more accurate!
     """
 
     def __init__(self, model, tokenizer, device="cuda", beta=3.0, tau=-3.0,
@@ -125,12 +128,15 @@ class RealPRAQQuantizer:
     @torch.no_grad()
     def get_risk_aware_salience_mlp(self, name, module):
         """
-        Compute PRAQ risk-aware salience for MLP layers.
+        Compute PRAQ salience for MLP layers using POST-ACTIVATION importance.
 
-        For each input feature, computes:
-            salience[i] = P(activation) × magnitude
+        Key PRAQ Insight: Measure importance based on OUTPUT after activation,
+        not input before activation. This accounts for channels killed by ReLU/SiLU.
 
-        where P(activation) accounts for quantization noise risk.
+        For each input channel j:
+            1. Compute post-activation output: Y = activation(X @ W^T + b)
+            2. Measure output magnitude per channel
+            3. Backprop importance to input channels via weights
 
         Returns:
             Tensor of shape [in_features]
@@ -138,100 +144,51 @@ class RealPRAQQuantizer:
         if name not in self.activation_data or len(self.activation_data[name]) == 0:
             return None
 
+        # Detect activation function (common in MLP: SiLU, ReLU, GELU)
+        # For MiniCPM, MLPs typically use SiLU
+        activation_fn = torch.nn.functional.silu  # SiLU activation
+
         X_list = self.activation_data[name]
-        X = torch.cat([x.reshape(-1, x.shape[-1]) for x in X_list], dim=0)
-
-        # Limit samples for efficiency
-        max_samples = min(4096, X.shape[0])
-        if X.shape[0] > max_samples:
-            indices = torch.randperm(X.shape[0])[:max_samples]
-            X = X[indices]
-
-        n_samples = X.shape[0]
         W = module.weight.data  # [out_features, in_features]
-        b = module.bias.data if module.bias is not None else torch.zeros(module.out_features, device=self.device)
+        b = module.bias.data if module.bias is not None else None
 
-        # Process in batches
-        batch_size = 1024
         in_features = W.shape[1]
+        out_features = W.shape[0]
 
-        # Accumulators for per-INPUT-feature statistics
-        # We need to track how each input feature contributes across all output channels
-        input_salience = torch.zeros(in_features)
+        # Accumulate post-activation importance on CPU
+        output_importance_sum = torch.zeros(out_features)
+        total_samples = 0
 
-        # For each input feature, compute aggregated risk-aware importance
-        for input_idx in range(in_features):
-            # Get weight column for this input feature across all output channels
-            w_col = W[:, input_idx]  # [out_features]
+        # Process in batches to avoid OOM
+        for x_batch in X_list:
+            x_flat = x_batch.reshape(-1, x_batch.shape[-1])  # [batch, in_features]
+            batch_size = x_flat.shape[0]
 
-            # Get activation values for this input feature
-            x_col = X[:, input_idx]  # [n_samples]
+            # Compute pre-activation on GPU
+            x_gpu = x_flat.to(self.device)
+            z = torch.matmul(x_gpu, W.t())  # [batch, out_features]
+            if b is not None:
+                z = z + b
 
-            # Compute statistics for this input feature's contribution
-            # across all output channels
-            z_sum = 0.0
-            z_sq_sum = 0.0
-            z_abs_sum = 0.0
+            # Apply activation function (PRAQ KEY STEP!)
+            y = activation_fn(z)  # [batch, out_features]
 
-            for i in range(0, n_samples, batch_size):
-                batch_x = x_col[i:i+batch_size].to(self.device)
+            # Measure post-activation output magnitude
+            output_importance_sum += y.abs().sum(dim=0).cpu()
+            total_samples += batch_size
 
-                # Pre-activation contribution from this input across all outputs
-                # z = x_i * W[:,i] (broadcasting)
-                z = batch_x.unsqueeze(1) * w_col.unsqueeze(0)  # [batch, out_features]
+            del x_gpu, z, y
 
-                z_sum += z.sum(dim=0).sum().item()
-                z_sq_sum += (z ** 2).sum(dim=0).sum().item()
-                z_abs_sum += z.abs().sum(dim=0).sum().item()
+        # Average post-activation output magnitude per output channel
+        output_importance = output_importance_sum / total_samples  # [out_features]
 
-                del batch_x, z
+        # Backprop importance to input channels via weight magnitudes
+        # importance_in[j] = sum_k(output_importance[k] * |W[k, j]|)
+        # This tells us: how much does input channel j contribute to important outputs?
+        W_abs = W.abs().cpu()  # [out_features, in_features]
+        input_importance = torch.matmul(output_importance, W_abs)  # [in_features]
 
-            # Compute aggregated statistics for this input feature
-            total_samples = n_samples * module.out_features
-
-            # Add numerical stability checks
-            if total_samples == 0:
-                input_salience[input_idx] = 0.0
-                continue
-
-            z_mean = z_sum / total_samples
-            z_variance = (z_sq_sum / total_samples) - (z_mean ** 2)
-            z_variance = max(0, z_variance)  # Ensure non-negative
-            z_std = np.sqrt(z_variance) + 1e-8
-            z_upper = z_mean + 3 * z_std
-
-            # Estimate quantization noise impact
-            x_mag = x_col.abs().mean().item()
-            w_mag = w_col.abs().mean().item()
-            estimated_noise = x_mag * w_mag * self.noise_factor
-
-            # Risk-adjusted upper bound
-            z_risk_upper = z_upper + estimated_noise
-
-            # Probability of activation (clip to avoid numerical issues)
-            logit = self.beta * (z_risk_upper - self.tau)
-            logit = np.clip(logit, -20, 20)  # Prevent overflow in sigmoid
-            prob_active = 1.0 / (1.0 + np.exp(-logit))
-
-            # Magnitude (use absolute value sum normalized)
-            magnitude = z_abs_sum / total_samples + z_std
-
-            # Check for NaN/Inf and set to safe values
-            if np.isnan(prob_active) or np.isinf(prob_active):
-                prob_active = 0.0
-            if np.isnan(magnitude) or np.isinf(magnitude):
-                magnitude = 0.0
-
-            # Risk-aware salience for this input feature
-            input_salience[input_idx] = prob_active * magnitude
-
-        # Debug: Print statistics
-        valid_salience = input_salience[input_salience > 0]
-        if len(valid_salience) > 0:
-            print(f"      Salience stats: min={input_salience.min():.6f}, max={input_salience.max():.6f}, "
-                  f"mean={input_salience.mean():.6f}, nonzero={len(valid_salience)}/{len(input_salience)}")
-
-        return input_salience
+        return input_importance
 
     @torch.no_grad()
     def get_activation_salience_awq(self, name):
@@ -588,15 +545,18 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     print("=" * 80)
-    print("Real-PRAQ: Risk-Aware AWQ for MiniCPM-2B (CORRECTED)")
+    print("Real-PRAQ: POST-ACTIVATION Importance for MiniCPM-2B (CORRECTED)")
     print("=" * 80)
-    print("Innovation: Combines AWQ optimization with PRAQ risk-awareness")
-    print("  1. MLP layers: Risk-aware salience = P(activation) × magnitude")
-    print("  2. Attention layers: Standard AWQ salience = E[|X|]")
+    print("Approach: AWQ framework with PRAQ's post-activation insight")
+    print("  1. MLP layers: Post-activation importance")
+    print("     - Compute Y = SiLU(X @ W^T + b)")
+    print("     - Measure importance[out] = E[|Y|]")
+    print("     - Backprop to inputs via weights")
+    print("  2. Attention layers: Standard AWQ (pre-activation)")
     print("  3. Grid search for optimal scaling exponent α")
-    print("  4. Per-INPUT-channel (column-wise) scaling: W[:, j] *= s[j]^α")
-    print("  5. Uniform INT4 quantization with optimal per-channel scaling")
-    print("\nKey Fix: CORRECTED per-column scaling (not per-element)")
+    print("  4. Per-INPUT-channel scaling: W[:, j] *= s[j]^α")
+    print("  5. Descaling: W_final = Q(W*s) / s")
+    print("\nKey: Post-activation accounts for channels killed by activation fn!")
     print("=" * 80)
     print(f"Device: {device}")
     print(f"Model: {model_name}")
@@ -657,14 +617,16 @@ def main():
     print("QUANTIZATION COMPLETE!")
     print("=" * 80)
     print(f"Quantized model saved to: {args.output_dir}")
-    print("\nReal-PRAQ Approach (CORRECTED):")
-    print("  ✓ MLP layers: Risk-aware salience (accounts for risky dead neurons)")
-    print("  ✓ Attention layers: AWQ-style salience (activation magnitude)")
+    print("\nReal-PRAQ Approach (CORRECTED - TRUE PRAQ INSIGHT):")
+    print("  ✓ MLP layers: POST-activation importance")
+    print("    → Measures E[|SiLU(XW+b)|] not E[|X|]")
+    print("    → Accounts for activation function effects!")
+    print("  ✓ Attention layers: Standard AWQ (pre-activation)")
     print("  ✓ Grid search optimization for per-INPUT-channel scaling")
     print("  ✓ Column-wise weight scaling: W[:, j] *= s[j]^α")
+    print("  ✓ Descaling after quantization: W_final = Q(W*s) / s")
     print("  ✓ Uniform INT4 quantization (all channels)")
-    print("  ✓ Matches official AWQ paper implementation")
-    print("\nExpected: Better than Real-AWQ due to risk-awareness!")
+    print("\nExpected: BETTER than Real-AWQ (true PRAQ insight!)")
     print("\nNext steps:")
     print(f"  Run: python compare_praq_vs_real_awq.py \\")
     print(f"         --real-awq-path ./quantized_models/minicpm_real_awq \\")
