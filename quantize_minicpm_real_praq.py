@@ -180,12 +180,12 @@ class RealPRAQQuantizer:
             del x_gpu, z, y
 
         # Average post-activation output magnitude per output channel
-        output_importance = output_importance_sum / total_samples  # [out_features]
+        output_importance = output_importance_sum / total_samples  # [out_features], float32
 
         # Backprop importance to input channels via weight magnitudes
         # importance_in[j] = sum_k(output_importance[k] * |W[k, j]|)
         # This tells us: how much does input channel j contribute to important outputs?
-        W_abs = W.abs().cpu()  # [out_features, in_features]
+        W_abs = W.abs().cpu().float()  # [out_features, in_features], convert to float32
         input_importance = torch.matmul(output_importance, W_abs)  # [in_features]
 
         return input_importance
