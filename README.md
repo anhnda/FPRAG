@@ -4,7 +4,7 @@ This is a research project comparing **Fast-R-PRAQ** (Fast Risk-aware Post-activ
 
 ## Project Overview
 
-This repository implements and evaluates two quantization strategies for the MiniCPM-2B model:
+This repository implements and evaluates three quantization strategies for the MiniCPM-2B model:
 
 ### 1. FullAWQ (Activation-aware Weight Quantization)
 
@@ -38,6 +38,32 @@ This repository implements and evaluates two quantization strategies for the Min
   6. At inference: compensate with inverse scales
 
 - **Philosophy:** A channel with large negative pre-activation may appear inactive but can be "resurrected" by quantization noise. PRAQ measures actual post-activation output to identify truly important channels.
+
+### 3. Robust-PRAQ (Noise-Augmented PRAQ)
+
+**Key Idea:** Enhance PRAQ stability with Gaussian noise augmentation for robust importance estimates
+
+- **Innovation over FullPRAQ:**
+  1. **Noise Augmentation**: Add Gaussian noise to inputs during importance computation
+  2. **Multi-sample Averaging**: Average importance scores over multiple noise realizations
+  3. **Robust Grid Search**: Evaluate reconstruction error with noisy inputs
+  4. **Better Generalization**: Less overfitting to small calibration sets
+
+- **Algorithm:**
+  1. For each layer, compute importance with noise: `X_noisy = X + ε`, where `ε ~ N(0, σ²)`
+  2. Average importance over `n` noise samples for stability
+  3. Grid search with noisy inputs for better generalization
+  4. Same quantization framework as FullPRAQ
+
+- **When to Use:**
+  - Limited calibration data (e.g., < 500 samples)
+  - Need robust importance estimates
+  - Calibration set may not be representative
+  - Want better generalization to unseen data
+
+- **Configuration:**
+  - `noise_std`: Noise standard deviation (default: 0.01, relative to input std)
+  - `n_noise_samples`: Number of noise samples to average (default: 3)
 
 ### The "Risky Dead Neuron" Problem
 
@@ -81,7 +107,9 @@ Standard quantization methods (like AWQ) can fail when encountering channels wit
 
 - **`quantize_minicpm_full_awq.py`** - FullAWQ implementation (pre-activation importance)
 - **`quantize_minicpm_full_praq.py`** - FullPRAQ implementation (post-activation importance)
-- **`compare_full_quantization.py`** - Evaluation framework comparing both methods
+- **`quantize_minicpm_robust_praq.py`** - Robust-PRAQ implementation (PRAQ + noise augmentation)
+- **`compare_full_quantization.py`** - Compare FullAWQ vs FullPRAQ
+- **`compare_robust_praq.py`** - Compare Robust-PRAQ vs FullPRAQ vs Original
 
 ### Analysis & Visualization
 
@@ -170,6 +198,42 @@ python compare_full_quantization.py --n-eval 2000
 - (Optional) Creates visualization plots
 
 **Expected time:** 15-30 minutes on a modern GPU
+
+### Step 3 (Optional): Robust-PRAQ with Noise Augmentation
+
+For improved robustness with limited calibration data:
+
+```bash
+# Quantize with Robust-PRAQ (noise-augmented importance)
+python quantize_minicpm_robust_praq.py
+
+# With custom noise parameters
+python quantize_minicpm_robust_praq.py --noise-std 0.01 --n-noise-samples 3
+
+# Compare Robust-PRAQ vs Full-PRAQ
+python compare_robust_praq.py --visualize
+```
+
+**Noise Augmentation Benefits:**
+- More stable importance estimates with small calibration sets
+- Reduces overfitting to specific calibration samples
+- Better generalization to unseen data
+- Particularly useful when calibration budget is limited (< 500 samples)
+
+**What happens:**
+- Same as FullPRAQ, but with noise augmentation:
+  - Adds Gaussian noise to inputs during importance computation
+  - Averages over multiple noise samples (default: 3)
+  - Evaluates reconstruction error with noisy inputs
+- Saves to `./quantized_models/minicpm_robust_praq`
+
+**Expected time:** 40-70 minutes per method (slightly slower due to noise sampling)
+
+**When to use Robust-PRAQ:**
+- ✅ Limited calibration data (< 500 samples)
+- ✅ Calibration set may not be representative
+- ✅ Need maximum robustness
+- ❌ Large calibration sets (> 1000 samples) - FullPRAQ is sufficient
 
 ## Understanding the Results
 
@@ -273,6 +337,29 @@ Located in `quantize_minicpm_full_praq.py`:
 --noise-factor 0.2   # Estimated INT4 quantization noise ratio (20%)
 ```
 
+### Robust-PRAQ Parameters
+
+Located in `quantize_minicpm_robust_praq.py` (includes all PRAQ parameters plus):
+
+```python
+--noise-std 0.01          # Gaussian noise std (relative to input std)
+                          # Typical range: 0.005 - 0.05
+                          # Higher = more regularization, lower = closer to FullPRAQ
+
+--n-noise-samples 3       # Number of noise samples to average
+                          # Typical range: 2 - 5
+                          # Higher = more stable but slower
+```
+
+**Noise Parameter Guidelines:**
+
+| Calibration Size | Recommended noise_std | Recommended n_noise_samples |
+|------------------|----------------------|----------------------------|
+| < 200 samples    | 0.02 - 0.03          | 4 - 5                      |
+| 200-500 samples  | 0.01 - 0.02          | 3 - 4                      |
+| 500-1000 samples | 0.005 - 0.01         | 2 - 3                      |
+| > 1000 samples   | Use FullPRAQ         | N/A                        |
+
 ### Evaluation Parameters
 
 Located in `compare_full_quantization.py`:
@@ -302,7 +389,11 @@ Located in `compare_full_quantization.py`:
 │   ├── config.json
 │   ├── model.safetensors  # Weights (FP16 storage, INT4 precision)
 │   └── tokenizer files
-└── minicpm_full_praq/     # FullPRAQ quantized model
+├── minicpm_full_praq/     # FullPRAQ quantized model
+│   ├── config.json
+│   ├── model.safetensors
+│   └── tokenizer files
+└── minicpm_robust_praq/   # Robust-PRAQ quantized model
     ├── config.json
     ├── model.safetensors
     └── tokenizer files
@@ -312,7 +403,9 @@ Located in `compare_full_quantization.py`:
 ```
 ./visualizations/
 ├── full_quantization/
-│   └── full_quantization_comparison.png  # Perplexity comparison
+│   └── full_quantization_comparison.png  # AWQ vs PRAQ comparison
+├── robust_praq/
+│   └── robust_praq_comparison.png        # Robust-PRAQ vs PRAQ comparison
 ├── preactivation_analysis/
 │   ├── layer_0_analysis.png
 │   ├── layer_1_analysis.png
@@ -370,6 +463,17 @@ Use the analysis tools to empirically test:
 - **FullPRAQ:** Uniform INT4 with post-activation importance
 - **Hybrid PRAQ:** Mixed-precision with risk-aware channel selection
 - **This project:** Focuses on FullPRAQ for fair comparison with FullAWQ
+
+### Robust-PRAQ vs FullPRAQ
+
+- **FullPRAQ:** Standard post-activation importance computation
+- **Robust-PRAQ:** Noise-augmented importance with multi-sample averaging
+- **Key Difference:** Robust-PRAQ adds Gaussian noise during importance estimation
+- **Tradeoff:** Robust-PRAQ is slightly slower but more stable with limited calibration data
+- **Use Case:** Robust-PRAQ is particularly beneficial when:
+  - Calibration budget is tight (< 500 samples)
+  - Calibration set may not be representative of deployment distribution
+  - Maximum robustness is required
 
 ## Citation
 
