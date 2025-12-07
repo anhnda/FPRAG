@@ -39,6 +39,10 @@ class SaliencyGradientAnalyzer:
         print(f"Loading {n_samples} calibration samples from WikiText-2...")
         dataset = load_dataset('wikitext', 'wikitext-2-raw-v1', split='train')
 
+        # Set pad token if not already set
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
         texts = []
         for example in dataset:
             if example['text'].strip():
@@ -390,7 +394,7 @@ def main():
     print(f"Loading model: {model_name}")
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         device_map='auto' if device == 'cuda' else None,
         trust_remote_code=True
     )
