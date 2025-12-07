@@ -217,32 +217,58 @@ class SymmetricAsymmetricValidator:
         return self.results
 
     def generate_comparison_table(self):
-        """Generate formatted comparison tables for symmetric vs asymmetric."""
-        print("\n" + "="*80)
-        print("COMPREHENSIVE RESULTS")
-        print("="*80)
+        """Generate unified comparison table showing all methods on all datasets."""
+        print("\n" + "="*100)
+        print("COMPREHENSIVE RESULTS: Perplexity Across All Datasets")
+        print("="*100)
 
-        all_results = []
+        # Prepare data structure
+        methods = ['GW-AWQ (Sym)', 'GW-AWQ (Asym)', 'GWH-PRAQ (Sym)', 'GWH-PRAQ (Asym)']
+        datasets = ['WikiText-2', 'C4', 'AG News']
 
-        # Compare GW-AWQ
-        print("\n" + "="*40)
-        print("GW-AWQ: Symmetric vs Asymmetric")
-        print("="*40)
-        print(f"\n{'Dataset':<15} {'Symmetric':<15} {'Asymmetric':<15} {'Delta':<12} {'Winner':<10}")
-        print("-" * 80)
+        # Print unified table header
+        print(f"\n{'Method':<20}", end='')
+        for dataset in datasets:
+            print(f"{dataset:>15}", end='')
+        print(f"{'Average':>15}")
+        print("-" * 100)
 
+        # Collect results for analysis
         awq_results = []
-        for dataset_name in ['WikiText-2', 'C4', 'AG News']:
+        praq_results = []
+
+        # Print each method's results
+        for method in methods:
+            print(f"{method:<20}", end='')
+            perplexities = []
+
+            for dataset in datasets:
+                if dataset in self.results and method in self.results[dataset]:
+                    ppl = self.results[dataset][method]['perplexity']
+                    perplexities.append(ppl)
+                    print(f"{ppl:>15.4f}", end='')
+                else:
+                    print(f"{'N/A':>15}", end='')
+
+            # Calculate and print average
+            if perplexities:
+                avg_ppl = np.mean(perplexities)
+                print(f"{avg_ppl:>15.4f}")
+            else:
+                print(f"{'N/A':>15}")
+
+        print("="*100)
+
+        # Prepare detailed comparison data for analysis
+        for dataset_name in datasets:
             if dataset_name in self.results:
+                # GW-AWQ comparison
                 if 'GW-AWQ (Sym)' in self.results[dataset_name] and 'GW-AWQ (Asym)' in self.results[dataset_name]:
                     sym_ppl = self.results[dataset_name]['GW-AWQ (Sym)']['perplexity']
                     asym_ppl = self.results[dataset_name]['GW-AWQ (Asym)']['perplexity']
                     delta = asym_ppl - sym_ppl
                     delta_pct = (delta / sym_ppl) * 100
-
                     winner = "Sym" if delta > 0.05 else ("Asym" if delta < -0.05 else "Tie")
-
-                    print(f"{dataset_name:<15} {sym_ppl:<15.4f} {asym_ppl:<15.4f} {delta_pct:>+11.3f}%  {winner:<10}")
 
                     awq_results.append({
                         'dataset': dataset_name,
@@ -254,25 +280,13 @@ class SymmetricAsymmetricValidator:
                         'winner': winner
                     })
 
-        # Compare GWH-PRAQ
-        print("\n" + "="*40)
-        print("GWH-PRAQ: Symmetric vs Asymmetric")
-        print("="*40)
-        print(f"\n{'Dataset':<15} {'Symmetric':<15} {'Asymmetric':<15} {'Delta':<12} {'Winner':<10}")
-        print("-" * 80)
-
-        praq_results = []
-        for dataset_name in ['WikiText-2', 'C4', 'AG News']:
-            if dataset_name in self.results:
+                # GWH-PRAQ comparison
                 if 'GWH-PRAQ (Sym)' in self.results[dataset_name] and 'GWH-PRAQ (Asym)' in self.results[dataset_name]:
                     sym_ppl = self.results[dataset_name]['GWH-PRAQ (Sym)']['perplexity']
                     asym_ppl = self.results[dataset_name]['GWH-PRAQ (Asym)']['perplexity']
                     delta = asym_ppl - sym_ppl
                     delta_pct = (delta / sym_ppl) * 100
-
                     winner = "Sym" if delta > 0.05 else ("Asym" if delta < -0.05 else "Tie")
-
-                    print(f"{dataset_name:<15} {sym_ppl:<15.4f} {asym_ppl:<15.4f} {delta_pct:>+11.3f}%  {winner:<10}")
 
                     praq_results.append({
                         'dataset': dataset_name,
@@ -283,6 +297,41 @@ class SymmetricAsymmetricValidator:
                         'delta_pct': delta_pct,
                         'winner': winner
                     })
+
+        # Print delta summary
+        print("\nDelta Analysis (Asymmetric - Symmetric):")
+        print("-" * 100)
+        print(f"{'Method':<20}", end='')
+        for dataset in datasets:
+            print(f"{dataset:>15}", end='')
+        print(f"{'Avg Delta':>15}")
+        print("-" * 100)
+
+        # GW-AWQ deltas
+        if awq_results:
+            print(f"{'GW-AWQ':<20}", end='')
+            for dataset in datasets:
+                result = next((r for r in awq_results if r['dataset'] == dataset), None)
+                if result:
+                    print(f"{result['delta_pct']:>+14.3f}%", end='')
+                else:
+                    print(f"{'N/A':>15}", end='')
+            avg_delta = np.mean([r['delta_pct'] for r in awq_results])
+            print(f"{avg_delta:>+14.3f}%")
+
+        # GWH-PRAQ deltas
+        if praq_results:
+            print(f"{'GWH-PRAQ':<20}", end='')
+            for dataset in datasets:
+                result = next((r for r in praq_results if r['dataset'] == dataset), None)
+                if result:
+                    print(f"{result['delta_pct']:>+14.3f}%", end='')
+                else:
+                    print(f"{'N/A':>15}", end='')
+            avg_delta = np.mean([r['delta_pct'] for r in praq_results])
+            print(f"{avg_delta:>+14.3f}%")
+
+        print("="*100)
 
         all_results = {
             'awq': awq_results,
