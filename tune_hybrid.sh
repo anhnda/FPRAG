@@ -11,7 +11,7 @@ echo "=========================================="
 echo ""
 echo "1. Testing BALANCED configuration (β=0.5, τ=2.0)..."
 python gwh_praq_v2.py \
-    --n-calib 150 \
+    --n-calib 128 \
     --blend-beta 0.5 \
     --temp-tau 2.0 \
     --output-dir ./quantized_models/minicpm_gwh_v2_balanced
@@ -20,7 +20,7 @@ python gwh_praq_v2.py \
 echo ""
 echo "2. Testing AWQ-LEANING configuration (β=0.3, τ=2.5)..."
 python gwh_praq_v2.py \
-    --n-calib 150 \
+    --n-calib 128 \
     --blend-beta 0.3 \
     --temp-tau 2.5 \
     --output-dir ./quantized_models/minicpm_gwh_v2_awq_lean
@@ -29,7 +29,7 @@ python gwh_praq_v2.py \
 echo ""
 echo "3. Testing PRAQ-LEANING configuration (β=0.7, τ=1.5)..."
 python gwh_praq_v2.py \
-    --n-calib 150 \
+    --n-calib 128 \
     --blend-beta 0.7 \
     --temp-tau 1.5 \
     --output-dir ./quantized_models/minicpm_gwh_v2_praq_lean
@@ -38,7 +38,7 @@ python gwh_praq_v2.py \
 echo ""
 echo "4. Testing CONSERVATIVE configuration (β=0.4, τ=3.0)..."
 python gwh_praq_v2.py \
-    --n-calib 150 \
+    --n-calib 128 \
     --blend-beta 0.4 \
     --temp-tau 3.0 \
     --output-dir ./quantized_models/minicpm_gwh_v2_conservative
