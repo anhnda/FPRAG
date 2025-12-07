@@ -114,30 +114,17 @@ class ModelEvaluator:
             max_length: Maximum sequence length
 
         Returns:
-            throughput: Tokens per second
+            throughput: Tokens per second (or None if failed)
         """
         print(f"\nMeasuring throughput on {n_samples} samples...")
 
         total_tokens = 0
         total_time = 0.0
+        failed_count = 0
 
-        # Warmup
-        for text in texts[:5]:
-            inputs = self.tokenizer(
-                text,
-                return_tensors="pt",
-                truncation=True,
-                max_length=max_length
-            )
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
-            _ = self.model(**inputs)
-
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-
-        # Benchmark
-        for text in tqdm(texts[:n_samples], desc="Throughput"):
-            try:
+        try:
+            # Warmup
+            for text in texts[:5]:
                 inputs = self.tokenizer(
                     text,
                     return_tensors="pt",
@@ -145,27 +132,55 @@ class ModelEvaluator:
                     max_length=max_length
                 )
                 inputs = {k: v.to(self.device) for k, v in inputs.items()}
+                _ = self.model(**inputs, use_cache=False)
 
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                start_time = time.time()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
 
-                _ = self.model(**inputs)
+            # Benchmark
+            for text in tqdm(texts[:n_samples], desc="Throughput"):
+                try:
+                    inputs = self.tokenizer(
+                        text,
+                        return_tensors="pt",
+                        truncation=True,
+                        max_length=max_length
+                    )
+                    inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                end_time = time.time()
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    start_time = time.time()
 
-                total_time += (end_time - start_time)
-                total_tokens += inputs['input_ids'].shape[1]
+                    # Use use_cache=False to avoid cache compatibility issues
+                    _ = self.model(**inputs, use_cache=False)
 
-            except Exception:
-                continue
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    end_time = time.time()
 
-        throughput = total_tokens / total_time if total_time > 0 else 0.0
-        print(f"Throughput: {throughput:.2f} tokens/second")
+                    total_time += (end_time - start_time)
+                    total_tokens += inputs['input_ids'].shape[1]
 
-        return throughput
+                except Exception as e:
+                    failed_count += 1
+                    if failed_count > n_samples // 2:
+                        # Too many failures, abort throughput measurement
+                        print(f"\n⚠️  Throughput measurement failed (too many errors)")
+                        return None
+                    continue
+
+            if total_time > 0 and total_tokens > 0:
+                throughput = total_tokens / total_time
+                print(f"Throughput: {throughput:.2f} tokens/second")
+                return throughput
+            else:
+                print(f"⚠️  Throughput measurement failed (no successful samples)")
+                return None
+
+        except Exception as e:
+            print(f"⚠️  Throughput measurement failed: {e}")
+            return None
 
     def get_model_size_mb(self):
         """Get model size in MB."""
@@ -237,8 +252,10 @@ def evaluate_model(model_path, model_name, device, eval_texts, benchmark_texts):
         # Compute perplexity
         perplexity = evaluator.compute_perplexity(eval_texts, max_samples=2000)
 
-        # Measure throughput
+        # Measure throughput (may fail due to compatibility issues)
         throughput = evaluator.measure_throughput(benchmark_texts, n_samples=50)
+        if throughput is None:
+            print("⚠️  Skipping throughput measurement for this model")
 
         # Get memory usage
         memory_usage = evaluator.get_memory_usage_mb()
@@ -249,7 +266,7 @@ def evaluate_model(model_path, model_name, device, eval_texts, benchmark_texts):
             'path': model_path,
             'perplexity': perplexity,
             'model_size_mb': model_size,
-            'throughput_tokens_per_sec': throughput,
+            'throughput_tokens_per_sec': throughput if throughput is not None else 0.0,
             'memory_usage_mb': memory_usage
         }
 
@@ -388,8 +405,9 @@ def print_comparison_table(results):
 
     # Rows
     for r in results:
+        throughput_str = f"{r['throughput_tokens_per_sec']:>12.1f} tok/s" if r['throughput_tokens_per_sec'] > 0 else "         N/A"
         print(f"{r['name']:<25} {r['perplexity']:>12.2f} {r['model_size_mb']:>12.2f} "
-              f"{r['throughput_tokens_per_sec']:>12.1f} tok/s {r['memory_usage_mb']:>12.2f}")
+              f"{throughput_str:>15} {r['memory_usage_mb']:>12.2f}")
 
     print("=" * 100)
 
@@ -399,11 +417,18 @@ def print_comparison_table(results):
 
     # Find best performers
     best_perplexity = min(results, key=lambda x: x['perplexity'])
-    best_throughput = max(results, key=lambda x: x['throughput_tokens_per_sec'])
     smallest_size = min(results, key=lambda x: x['model_size_mb'])
 
     print(f"✓ Best Perplexity: {best_perplexity['name']} ({best_perplexity['perplexity']:.2f})")
-    print(f"✓ Best Throughput: {best_throughput['name']} ({best_throughput['throughput_tokens_per_sec']:.1f} tok/s)")
+
+    # Only show throughput if any model has valid throughput
+    valid_throughputs = [r for r in results if r['throughput_tokens_per_sec'] > 0]
+    if valid_throughputs:
+        best_throughput = max(valid_throughputs, key=lambda x: x['throughput_tokens_per_sec'])
+        print(f"✓ Best Throughput: {best_throughput['name']} ({best_throughput['throughput_tokens_per_sec']:.1f} tok/s)")
+    else:
+        print(f"✓ Best Throughput: N/A (measurement failed for all models)")
+
     print(f"✓ Smallest Size: {smallest_size['name']} ({smallest_size['model_size_mb']:.2f} MB)")
 
     # Compare symmetric vs asymmetric
