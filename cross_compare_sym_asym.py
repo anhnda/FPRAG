@@ -56,8 +56,10 @@ class SymmetricAsymmetricValidator:
         random.seed(self.seed)
 
         dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="validation")
+        # Match final_cross_validation.py: keep longer texts (> 100 chars)
         texts = [item['text'] for item in dataset if len(item['text'].strip()) > 100]
 
+        # Use random sampling with seed for reproducibility
         random.seed(self.seed)
         if n_samples < len(texts):
             texts = random.sample(texts, n_samples)
@@ -77,9 +79,11 @@ class SymmetricAsymmetricValidator:
             if len(texts) >= n_samples:
                 break
             text = item['text']
+            # Match final_cross_validation.py: keep longer texts (> 100 chars)
             if len(text.strip()) > 100:
                 texts.append(text)
 
+        # Shuffle with seed for reproducibility
         random.seed(self.seed)
         random.shuffle(texts)
 
@@ -92,8 +96,10 @@ class SymmetricAsymmetricValidator:
         random.seed(self.seed)
 
         dataset = load_dataset("ag_news", split="test")
+        # Match final_cross_validation.py: keep longer texts (> 100 chars)
         texts = [item['text'] for item in dataset if len(item['text'].strip()) > 100]
 
+        # Use random sampling with seed for reproducibility
         random.seed(self.seed)
         if n_samples < len(texts):
             texts = random.sample(texts, n_samples)
