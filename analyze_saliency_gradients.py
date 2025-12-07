@@ -108,7 +108,8 @@ class SaliencyGradientAnalyzer:
         self.model.eval()
         with torch.no_grad():
             for input_ids in tqdm(calibration_data, desc="Forward passes"):
-                self.model(input_ids)
+                # Disable cache to avoid compatibility issues
+                self.model(input_ids, use_cache=False)
 
         # Remove hooks
         hook1.remove()
