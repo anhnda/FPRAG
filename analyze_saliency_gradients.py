@@ -117,13 +117,13 @@ class SaliencyGradientAnalyzer:
 
         # Concatenate all collected data
         X = torch.cat(input_activations, dim=0)  # (total_tokens, in_features)
-        X = X.view(-1, X.shape[-1])  # Flatten batch and sequence dimensions
+        X = X.view(-1, X.shape[-1]).float()  # Flatten batch and sequence dimensions, convert to float32
 
         pre_act = torch.cat(pre_activations, dim=0)  # (total_tokens, out_features)
-        pre_act = pre_act.view(-1, pre_act.shape[-1])
+        pre_act = pre_act.view(-1, pre_act.shape[-1]).float()
 
         post_act = torch.cat(post_activations, dim=0)  # (total_tokens, out_features)
-        post_act = post_act.view(-1, post_act.shape[-1])
+        post_act = post_act.view(-1, post_act.shape[-1]).float()
 
         print(f"Collected {X.shape[0]} tokens")
         print(f"Input shape: {X.shape}, Pre-activation shape: {pre_act.shape}")
