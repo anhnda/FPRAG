@@ -432,7 +432,7 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description="Compare E[X²] vs ||X||²||W||² salience methods")
     parser.add_argument("--n-calib", type=int, default=128, help="Calibration samples")
-    parser.add_argument("--n-eval", type=int, default=100, help="Evaluation samples for perplexity")
+    parser.add_argument("--n-eval", type=int, default=2000, help="Evaluation samples for perplexity")
     parser.add_argument("--n-grid", type=int, default=20, help="Grid search points")
     parser.add_argument("--group-size", type=int, default=128, help="Group size for quantization")
     parser.add_argument("--output-dir", type=str, default="./visualizations/l2_vs_xw", help="Output directory")
