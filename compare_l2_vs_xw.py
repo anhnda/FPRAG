@@ -19,12 +19,17 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
 from tqdm import tqdm
 import matplotlib.pyplot as plt
-import seaborn as sns
 import numpy as np
 import pandas as pd
 import os
 from scipy.stats import spearmanr, pearsonr
-import copy
+
+try:
+    import seaborn as sns
+    sns.set_style("whitegrid")
+except ImportError:
+    print("Warning: seaborn not installed, using default matplotlib style")
+    sns = None
 
 # Import both quantizers
 import sys
@@ -55,13 +60,21 @@ def compute_perplexity(model, tokenizer, texts, device, max_samples=100):
             inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
             inputs = {k: v.to(device) for k, v in inputs.items()}
 
-            outputs = model(**inputs, labels=inputs["input_ids"])
+            # Skip if input is too short
+            if inputs["input_ids"].shape[1] < 2:
+                continue
+
+            outputs = model(**inputs, labels=inputs["input_ids"], use_cache=False)
             loss = outputs.loss
+
+            # Check for valid loss
+            if torch.isnan(loss) or torch.isinf(loss):
+                continue
 
             total_loss += loss.item() * inputs["input_ids"].shape[1]
             total_tokens += inputs["input_ids"].shape[1]
 
-        except Exception as e:
+        except Exception:
             continue
 
     if total_tokens == 0:
@@ -74,12 +87,11 @@ def compute_perplexity(model, tokenizer, texts, device, max_samples=100):
 
 
 @torch.no_grad()
-def compare_layer_importance(layer_name, module, X_data, method='l2'):
+def compare_layer_importance(module, X_data, method='l2'):
     """
     Compute channel importance for a single layer using specified method.
 
     Args:
-        layer_name: Name of the layer
         module: Linear module
         X_data: List of activation tensors
         method: 'l2' for E[X²] or 'xw' for ||X||²||W||²
@@ -129,14 +141,14 @@ def analyze_importance_correlation(model, tokenizer, calib_data, device, n_sampl
     hooks = []
 
     def get_hook(name):
-        def hook(module, input, output):
+        def hook(module, inp, output):
             if name not in activation_data:
                 activation_data[name] = []
-            if isinstance(input, tuple):
-                inp = input[0].detach().cpu()
+            if isinstance(inp, tuple):
+                inp_data = inp[0].detach().cpu()
             else:
-                inp = input.detach().cpu()
-            activation_data[name].append(inp)
+                inp_data = inp.detach().cpu()
+            activation_data[name].append(inp_data)
         return hook
 
     for name, module in model.named_modules():
@@ -147,7 +159,7 @@ def analyze_importance_correlation(model, tokenizer, calib_data, device, n_sampl
     # Collect activations
     model.eval()
     print(f"\nCollecting activations from {n_samples} samples...")
-    for i, text in enumerate(tqdm(calib_data[:n_samples], desc="Calibration")):
+    for text in tqdm(calib_data[:n_samples], desc="Calibration"):
         try:
             inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
             inputs = {k: v.to(device) for k, v in inputs.items()}
@@ -178,8 +190,8 @@ def analyze_importance_correlation(model, tokenizer, calib_data, device, n_sampl
             continue
 
         # Compute both importance scores
-        importance_l2 = compare_layer_importance(name, module, activation_data[name], method='l2')
-        importance_xw = compare_layer_importance(name, module, activation_data[name], method='xw')
+        importance_l2 = compare_layer_importance(module, activation_data[name], method='l2')
+        importance_xw = compare_layer_importance(module, activation_data[name], method='xw')
 
         if importance_l2 is None or importance_xw is None:
             continue
@@ -189,8 +201,8 @@ def analyze_importance_correlation(model, tokenizer, calib_data, device, n_sampl
         imp_xw_cpu = importance_xw.cpu().numpy()
 
         # Compute correlations
-        spearman_corr, spearman_pval = spearmanr(imp_l2_cpu, imp_xw_cpu)
-        pearson_corr, pearson_pval = pearsonr(imp_l2_cpu, imp_xw_cpu)
+        spearman_corr, _ = spearmanr(imp_l2_cpu, imp_xw_cpu)
+        pearson_corr, _ = pearsonr(imp_l2_cpu, imp_xw_cpu)
 
         # Compute rank differences
         rank_l2 = np.argsort(np.argsort(-imp_l2_cpu))  # Descending rank
@@ -340,11 +352,12 @@ def plot_comparison(results, output_dir="./visualizations/l2_vs_xw"):
     os.makedirs(output_dir, exist_ok=True)
 
     # Set style
-    sns.set_style("whitegrid")
+    if sns is not None:
+        sns.set_style("whitegrid")
     plt.rcParams['figure.figsize'] = (12, 8)
 
     # 1. Alpha distribution comparison
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    _, axes = plt.subplots(2, 2, figsize=(14, 10))
 
     # Alpha histograms
     axes[0, 0].hist(results['l2']['alphas'], bins=20, alpha=0.6, label='E[X²]', color='blue', edgecolor='black')
