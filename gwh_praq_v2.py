@@ -523,9 +523,9 @@ def main():
                        help="Grid search points")
     parser.add_argument("--group-size", type=int, default=128,
                        help="Group size for quantization")
-    parser.add_argument("--blend-beta", type=float, default=0.5,
+    parser.add_argument("--blend-beta", type=float, default=0.7,
                        help="Blending factor (0=AWQ, 1=PRAQ, 0.5=balanced)")
-    parser.add_argument("--temp-tau", type=float, default=2.0,
+    parser.add_argument("--temp-tau", type=float, default=1.5,
                        help="Temperature for error weighting (higher=softer)")
     parser.add_argument("--output-dir", type=str, default="./quantized_models/minicpm_gwh_praq_v2",
                        help="Output directory")
