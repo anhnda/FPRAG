@@ -1,26 +1,34 @@
 """
-Group-Wise AWQ Implementation with ASYMMETRIC Quantization + ||X||²||W||² Salience
+Group-Wise AWQ Implementation with ASYMMETRIC Quantization + L2×Gradient Salience
 
 Key Difference from gw_awq_asym_l2.py:
-- gw_awq_asym_l2.py: Uses E[X²] (L2 norm) for activation salience only
-- awq_l2_xw.py: Uses ||X||²||W||² (combined activation and weight energy) for channel salience
+- gw_awq_asym_l2.py: Uses E[X²] (L2 norm) for ALL layers
+- gw_awq_asym_l2_grad.py: HYBRID approach
+  * MLP layers (with SiLU): E[X² * |∇SiLU|] (gradient-weighted)
+  * Other layers (no SiLU): E[X²] (standard L2 fallback)
 
-Why ||X||²||W||² is Better:
-- Quantization MSE ∝ E[(δW × X)²]
-- Since δW ∝ ||W||, we have MSE ∝ ||W||² × E[X²]
-- ||X||² captures total activation energy per channel
-- ||W||² captures total weight energy per channel
-- Their product identifies channels that are both high-activation AND high-weight
+Why Hybrid L2×Gradient is Better:
+- For MLP with SiLU: Combines input magnitude with gradient sensitivity
+- E[X² * |∇Y/∇X|] captures both: "how large?" and "how sensitive?"
+- For attention/other layers: Standard L2 (no activation to compute gradient)
+- SiLU gradient: ∇SiLU(z) = sigmoid(z) + z·sigmoid(z)·(1-sigmoid(z))
+- No backward pass needed! Gradient computed analytically from reconstructed Z = W^T·X + b
+- No SiLU hooks needed! We only hook linear layer inputs, then reconstruct everything
 
 Algorithm:
-1. Compute per-input-channel salience: s[j] = ||X[:, j]||² × ||W[:, j]||²
-   - ||X[:, j]||² = sum of X[:, j]² over all calibration samples
-   - ||W[:, j]||² = sum of W[:, j]² over all output features
-2. Grid search for optimal α ∈ [0, 1]
-3. Scale weight COLUMNS: W[:, j] *= s[j]^α
-4. Quantize with GROUP-WISE ASYMMETRIC scales
-   - Per group: scale = (max - min) / 15, zero_point = round(-min / scale)
-5. Divide by input scales: W_final = Q(W*s) / s
+1. Hook linear layers to capture inputs X (no SiLU hooks needed!)
+2. Detect if layer has SiLU activation following it (mapping only)
+3. FOR MLP LAYERS (with SiLU):
+   a. Reconstruct pre-activation from captured data: Z = W^T·X + b
+   b. Compute SiLU gradient analytically: ∇SiLU(Z) = sigmoid(Z) + Z·sigmoid(Z)·(1-sigmoid(Z))
+   c. Compute input gradient: ∇Y/∇X = ∇SiLU(Z) @ W
+   d. Compute per-channel salience: s[j] = E[X[:, j]² * |∇Y/∇X[:, j]|]
+4. FOR OTHER LAYERS (no SiLU):
+   a. Compute per-channel salience: s[j] = E[X[:, j]²]
+5. Grid search for optimal α ∈ [0, 1]
+6. Scale weight COLUMNS: W[:, j] *= s[j]^α
+7. Quantize with GROUP-WISE ASYMMETRIC scales [0, 15]
+8. Divide by input scales: W_final = Q(W*s) / s
 """
 
 import torch
@@ -34,16 +42,18 @@ import random
 import numpy as np
 
 
-class GroupWiseAWQAsymmetricL2XW:
+class GroupWiseAWQAsymmetricL2GradQuantizer:
     """
-    Group-Wise AWQ with Asymmetric Quantization and ||X||²||W||² Salience.
+    Group-Wise AWQ with Asymmetric Quantization and HYBRID L2×Gradient Salience.
 
     Key Features:
-    - Per-input-channel scaling based on ||X[:, j]||² × ||W[:, j]||²
-    - Combines activation energy and weight energy
+    - HYBRID salience scoring:
+      * MLP layers (with SiLU): E[X² * |∇Y/∇X|] (gradient-weighted)
+      * Other layers (no SiLU): E[X²] (standard L2)
+    - Analytical SiLU gradient (no backward pass)
     - Grid search for optimal scaling exponent α
     - GROUP-WISE ASYMMETRIC INT4 quantization [0, 15]
-    - Better MSE alignment through joint X-W energy metric
+    - Better sensitivity-aware importance scoring where applicable
     """
 
     def __init__(self, model, tokenizer, device="cuda", bits=4, n_grid=20, group_size=128):
@@ -55,33 +65,76 @@ class GroupWiseAWQAsymmetricL2XW:
         self.group_size = group_size
 
         # Storage for activations
-        self.activation_data = {}
+        self.activation_data = {}  # Linear layer inputs (X)
+        self.linear_to_silu = {}  # Map linear layer names to their SiLU successors
         self.hooks = []
         self.layer_scales = {}
 
-        print(f"\n[Group-Wise AWQ ASYMMETRIC ||X||²||W||² Quantizer Initialized]")
+        print(f"\n[Group-Wise AWQ ASYMMETRIC HYBRID L2×Gradient Quantizer Initialized]")
         print(f"  Target bits: {bits}")
         print(f"  Grid search points: {n_grid}")
         print(f"  Group size: {group_size}")
         print(f"  Quantization: GROUP-WISE ASYMMETRIC [0, 15]")
-        print(f"  Salience metric: ||X||²||W||² - Joint activation-weight energy")
+        print(f"  Salience metric (HYBRID):")
+        print(f"    - MLP layers (with SiLU): E[X² * |∇SiLU|] (gradient-weighted)")
+        print(f"    - Other layers (no SiLU): E[X²] (standard L2)")
 
-    def register_hooks(self):
-        """Register forward hooks to capture activations."""
-        def get_hook(name):
-            def hook(module, input, output):
-                if name not in self.activation_data:
-                    self.activation_data[name] = []
-                if isinstance(input, tuple):
-                    inp = input[0].detach().cpu()
-                else:
-                    inp = input.detach().cpu()
-                self.activation_data[name].append(inp)
-            return hook
+    def _find_silu_layers(self):
+        """
+        Build mapping from linear layers to their subsequent SiLU activations.
+        Common patterns:
+        - model.layers.X.mlp.gate_proj → model.layers.X.mlp.act_fn (SiLU)
+        - model.layers.X.mlp.up_proj → model.layers.X.mlp.act_fn (SiLU)
+        """
+        linear_layers = {}
+        silu_layers = {}
 
         for name, module in self.model.named_modules():
             if isinstance(module, nn.Linear):
-                handle = module.register_forward_hook(get_hook(name))
+                linear_layers[name] = module
+            elif isinstance(module, nn.SiLU) or (hasattr(module, '__class__') and 'SiLU' in module.__class__.__name__):
+                silu_layers[name] = module
+
+        # Match linear layers to SiLU by shared prefix
+        for linear_name in linear_layers:
+            # Get parent path (e.g., "model.layers.0.mlp" from "model.layers.0.mlp.gate_proj")
+            parts = linear_name.split('.')
+            for i in range(len(parts), 0, -1):
+                parent_path = '.'.join(parts[:i])
+                # Look for SiLU in same parent
+                for silu_name in silu_layers:
+                    if silu_name.startswith(parent_path):
+                        self.linear_to_silu[linear_name] = silu_name
+                        break
+                if linear_name in self.linear_to_silu:
+                    break
+
+        print(f"\n[Layer Mapping]")
+        print(f"  Found {len(linear_layers)} linear layers")
+        print(f"  Found {len(silu_layers)} SiLU layers")
+        print(f"  Mapped {len(self.linear_to_silu)} linear→SiLU connections")
+
+    def register_hooks(self):
+        """Register forward hooks to capture linear layer inputs."""
+        # First, find SiLU layers for mapping (don't need to hook them)
+        self._find_silu_layers()
+
+        # Hook for linear layer inputs only
+        def get_linear_hook(name):
+            def hook(_module, input, _output):
+                if name not in self.activation_data:
+                    self.activation_data[name] = []
+                if isinstance(input, tuple):
+                    inp = input[0].detach()
+                else:
+                    inp = input.detach()
+                self.activation_data[name].append(inp)
+            return hook
+
+        # Register hooks only for linear layers
+        for name, module in self.model.named_modules():
+            if isinstance(module, nn.Linear):
+                handle = module.register_forward_hook(get_linear_hook(name))
                 self.hooks.append(handle)
 
     def remove_hooks(self):
@@ -91,43 +144,119 @@ class GroupWiseAWQAsymmetricL2XW:
         self.hooks = []
 
     @torch.no_grad()
-    def get_activation_weight_salience(self, name, W):
+    def compute_silu_gradient(self, z):
         """
-        Compute per-input-channel salience using ||X[:, j]||² × ||W[:, j]||²
+        Compute SiLU gradient analytically.
 
-        Key Innovation:
-        - Combines activation energy (||X||²) and weight energy (||W||²)
-        - Identifies channels that are both high-activation AND high-weight
-        - Better MSE predictor: MSE ∝ ||W||² × E[X²] ∝ ||W||² × ||X||²
+        SiLU(z) = z * sigmoid(z)
+        d(SiLU)/dz = sigmoid(z) + z * sigmoid(z) * (1 - sigmoid(z))
+                   = sigmoid(z) * (1 + z * (1 - sigmoid(z)))
+
+        Args:
+            z: Pre-activation values [batch, features]
+
+        Returns:
+            grad_silu: Gradient d(SiLU)/dz [batch, features]
+        """
+        sigmoid_z = torch.sigmoid(z)
+        grad_silu = sigmoid_z * (1 + z * (1 - sigmoid_z))
+        return grad_silu
+
+    @torch.no_grad()
+    def get_activation_salience_l2(self, name):
+        """
+        FALLBACK: Compute per-input-channel activation salience using standard L2 norm: E[X[:, j]²]
+
+        Used for layers WITHOUT SiLU activation (e.g., attention layers).
 
         Args:
             name: Layer name
-            W: Weight tensor [out_features, in_features]
 
         Returns:
-            Tensor of shape [in_features] containing ||X[:, j]||² × ||W[:, j]||²
+            Tensor of shape [in_features]
         """
         if name not in self.activation_data or len(self.activation_data[name]) == 0:
             return None
 
         X_list = self.activation_data[name]
+        total_samples = sum(x.reshape(-1, x.shape[-1]).shape[0] for x in X_list)
         in_features = X_list[0].shape[-1]
 
-        # Compute ||X[:, j]||² for each input channel j
-        X_l2_squared = torch.zeros(in_features)
+        # Accumulate L2 salience on CPU
+        salience_sum = torch.zeros(in_features)
 
         for x in X_list:
-            x_flat = x.reshape(-1, x.shape[-1])  # [batch*seq, in_features]
-            # Sum of squares across all samples for each channel
-            X_l2_squared += x_flat.pow(2).sum(dim=0)
+            x_flat = x.reshape(-1, x.shape[-1])
+            # Standard L2: E[X²]
+            salience_sum += x_flat.pow(2).sum(dim=0).cpu()
 
-        # Compute ||W[:, j]||² for each input channel j
-        # W is [out_features, in_features], so W[:, j] is all weights for input channel j
-        W_l2_squared = W.pow(2).sum(dim=0)  # [in_features]
+        salience = salience_sum / total_samples
+        return salience
 
-        # Combine: ||X[:, j]||² × ||W[:, j]||²
-        salience = X_l2_squared.to(W.device) * W_l2_squared
+    @torch.no_grad()
+    def get_activation_salience_l2_grad(self, name, module):
+        """
+        Compute per-input-channel activation salience using L2×Gradient:
+        s[j] = E[X[:, j]² * |∇Y/∇X[:, j]|]
 
+        Steps:
+        1. Get linear layer inputs X
+        2. Reconstruct pre-activation Z = W^T·X + b
+        3. Compute SiLU gradient: ∇SiLU(Z)
+        4. Compute input gradient: ∇Y/∇X = ∇SiLU(Z) @ W
+        5. Compute L2×Grad salience: E[X² * |∇Y/∇X|]
+
+        Args:
+            name: Layer name
+            module: Linear module
+
+        Returns:
+            Tensor of shape [in_features]
+        """
+        if name not in self.activation_data or len(self.activation_data[name]) == 0:
+            return None
+
+        W = module.weight.data  # [out_features, in_features]
+        b = module.bias.data if module.bias is not None else None
+
+        X_list = self.activation_data[name]
+        in_features = X_list[0].shape[-1]
+
+        # Accumulate salience on CPU
+        salience_sum = torch.zeros(in_features)
+        total_samples = 0
+
+        for x in X_list:
+            x_flat = x.reshape(-1, x.shape[-1])  # [N, in_features]
+            batch_size = x_flat.shape[0]
+
+            # Move to device for computation
+            x_device = x_flat.to(self.device)
+
+            # Compute pre-activation: Z = X @ W^T + b
+            if b is not None:
+                z = torch.matmul(x_device, W.t()) + b  # [N, out_features]
+            else:
+                z = torch.matmul(x_device, W.t())
+
+            # Compute SiLU gradient analytically
+            grad_silu = self.compute_silu_gradient(z)  # [N, out_features]
+
+            # Compute input gradient: ∇Y/∇X = ∇SiLU @ W
+            # grad_input[i, j] = sum_k (grad_silu[i, k] * W[k, j])
+            grad_input = torch.matmul(grad_silu, W)  # [N, in_features]
+
+            # Compute L2×Gradient salience per channel
+            # s[j] = sum_i (X[i, j]² * |grad_input[i, j]|)
+            x2 = x_device.pow(2)  # [N, in_features]
+            grad_abs = grad_input.abs()  # [N, in_features]
+            channel_salience = (x2 * grad_abs).sum(dim=0).cpu()  # [in_features]
+
+            salience_sum += channel_salience
+            total_samples += batch_size
+
+        # Average over all samples
+        salience = salience_sum / total_samples
         return salience
 
     @torch.no_grad()
@@ -184,11 +313,14 @@ class GroupWiseAWQAsymmetricL2XW:
     @torch.no_grad()
     def search_best_scale(self, name, module):
         """
-        Grid search for optimal per-input-channel scaling factor using ||X||²||W||² salience.
+        Grid search for optimal per-input-channel scaling factor using HYBRID salience.
 
-        Algorithm:
+        HYBRID Algorithm:
+        - IF layer has SiLU (MLP): Use L2×Gradient salience s[j] = E[X[:, j]² * |∇Y/∇X[:, j]|]
+        - ELSE (no SiLU): Use L2 salience s[j] = E[X[:, j]²]
+
         1. For α in [0, 0.05, 0.1, ..., 0.95, 1.0]:
-           a. Compute scales: s[j] = (||X[:, j]||² × ||W[:, j]||²)^α for each input channel j
+           a. Compute scales: s[j] = salience[j]^α (using appropriate salience metric)
            b. Scale weight COLUMNS: W_scaled[:, j] = W[:, j] * s[j]
            c. Quantize with GROUP-WISE ASYMMETRIC scales [0, 15]
            d. Compute compensated output: Y_q = W_q @ (X / s)
@@ -202,11 +334,19 @@ class GroupWiseAWQAsymmetricL2XW:
             in_features = module.weight.shape[1]
             return torch.ones(in_features).to(self.device), 0.0, 0.0
 
-        W = module.weight.data
+        # HYBRID: Choose salience metric based on layer type
+        has_silu = name in self.linear_to_silu
 
-        # Get ||X||²||W||² activation-weight salience
-        activation_weight_salience = self.get_activation_weight_salience(name, W)
-        if activation_weight_salience is None:
+        if has_silu:
+            # MLP layer with SiLU: Use L2×Gradient salience
+            activation_salience = self.get_activation_salience_l2_grad(name, module)
+            salience_type = "L2×Grad"
+        else:
+            # Other layer (attention, etc.): Use standard L2 salience
+            activation_salience = self.get_activation_salience_l2(name)
+            salience_type = "L2"
+
+        if activation_salience is None:
             in_features = module.weight.shape[1]
             return torch.ones(in_features).to(self.device), 0.0, 0.0
 
@@ -223,6 +363,7 @@ class GroupWiseAWQAsymmetricL2XW:
 
         del X_cpu
 
+        W = module.weight.data
         b = module.bias.data if module.bias is not None else None
 
         # Compute original output
@@ -235,14 +376,14 @@ class GroupWiseAWQAsymmetricL2XW:
         best_alpha = 0.0
         best_scales = torch.ones(W.shape[1], device=self.device)
 
-        activation_weight_salience = activation_weight_salience.to(self.device)
+        activation_salience = activation_salience.to(self.device)
 
         # Grid search over α
         for grid_idx in range(self.n_grid + 1):
             alpha = grid_idx / self.n_grid
 
-            # Compute per-input-channel scales from ||X||²||W||² salience
-            scales = activation_weight_salience.pow(alpha).clamp(min=1e-5)
+            # Compute per-input-channel scales from salience (L2×Grad or L2)
+            scales = activation_salience.pow(alpha).clamp(min=1e-5)
 
             # Scale weight COLUMNS
             W_scaled = W * scales.unsqueeze(0)
@@ -271,20 +412,20 @@ class GroupWiseAWQAsymmetricL2XW:
             del Y_quant
         torch.cuda.empty_cache()
 
-        return best_scales, best_alpha, best_error
+        return best_scales, best_alpha, best_error, salience_type
 
     @torch.no_grad()
     def quantize_layer(self, name, module):
         """
-        Apply Group-Wise AWQ with Asymmetric Quantization and ||X||²||W||² Salience.
+        Apply Group-Wise AWQ with Asymmetric Quantization and HYBRID Salience.
 
         Steps:
-        1. Grid search for best per-input-channel scales (||X||²||W||²-based)
+        1. Grid search for best per-input-channel scales (HYBRID: L2×Grad or L2)
         2. Scale weight columns: W[:, j] *= scales[j]
         3. Quantize with GROUP-WISE ASYMMETRIC scales [0, 15]
         4. Divide by scales: W_final = Q(W*s) / s
         """
-        best_scales, best_alpha, best_error = self.search_best_scale(name, module)
+        best_scales, best_alpha, best_error, salience_type = self.search_best_scale(name, module)
 
         W = module.weight.data
 
@@ -304,7 +445,8 @@ class GroupWiseAWQAsymmetricL2XW:
         self.layer_scales[name] = {
             'scales': best_scales.cpu(),
             'alpha': best_alpha,
-            'error': best_error
+            'error': best_error,
+            'salience_type': salience_type
         }
 
     def calibrate(self, calibration_data, n_samples=500):
@@ -325,7 +467,7 @@ class GroupWiseAWQAsymmetricL2XW:
 
                 successful += 1
 
-            except Exception as e:
+            except Exception:
                 if i % 100 == 0 and i > 0:
                     print(f"\nNote: Some samples skipped due to errors")
                 continue
@@ -334,21 +476,28 @@ class GroupWiseAWQAsymmetricL2XW:
         print(f"Calibration complete! Successfully processed {successful}/{n_samples} samples")
 
     def quantize_model(self):
-        """Quantize all linear layers using Group-Wise AWQ with ||X||²||W||² Salience."""
+        """Quantize all linear layers using Group-Wise AWQ with HYBRID Salience."""
         print("\n" + "=" * 80)
-        print("Quantizing with Group-Wise AWQ ASYMMETRIC + ||X||²||W||² Salience")
+        print("Quantizing with Group-Wise AWQ ASYMMETRIC + HYBRID Salience")
         print("=" * 80)
-        print("Method:")
-        print("  1. Compute per-input-channel ||X||²||W||² salience:")
-        print("     s[j] = ||X[:, j]||² × ||W[:, j]||²")
-        print("     → Combines activation energy and weight energy")
-        print("  2. Grid search for optimal α ∈ [0, 1]")
-        print("  3. Scale weight columns: W[:, j] *= s[j]^α")
-        print(f"  4. GROUP-WISE ASYMMETRIC INT4 quantization [0, 15] (group_size={self.group_size})")
+        print("HYBRID Method:")
+        print("  1. Capture inputs X at linear layers (no SiLU hooks!)")
+        print("  2. Detect layer type (MLP with SiLU vs. other)")
+        print("  3. FOR MLP LAYERS (with SiLU):")
+        print("     a. Reconstruct pre-activation: Z = W^T·X + b")
+        print("     b. Compute SiLU gradient analytically: ∇SiLU(Z)")
+        print("     c. Compute input gradient: ∇Y/∇X = ∇SiLU @ W")
+        print("     d. Compute L2×Grad salience: s[j] = E[X[:, j]² * |∇Y/∇X[:, j]|]")
+        print("        → Combines magnitude (X²) with sensitivity (|∇|)")
+        print("  4. FOR OTHER LAYERS (no SiLU):")
+        print("     a. Compute L2 salience: s[j] = E[X[:, j]²]")
+        print("  5. Grid search for optimal α ∈ [0, 1]")
+        print("  6. Scale weight columns: W[:, j] *= s[j]^α")
+        print(f"  7. GROUP-WISE ASYMMETRIC INT4 quantization [0, 15] (group_size={self.group_size})")
         print("     - Per group: scale = (max - min) / 15")
         print("     - Per group: zero_point = round(-min / scale)")
-        print("  5. Divide by input scales: W_final = Q(W*s) / s")
-        print("\nKey Innovation: Joint X-W energy metric for better MSE prediction")
+        print("  8. Divide by input scales: W_final = Q(W*s) / s")
+        print("\nKey Improvement: Efficient hybrid → no SiLU hooks, reconstruct Z from X+W")
         print("=" * 80)
 
         quantized_count = 0
@@ -365,7 +514,7 @@ class GroupWiseAWQAsymmetricL2XW:
                     if name in self.layer_scales:
                         info = self.layer_scales[name]
                         print(f"\n  Layer {name}:")
-                        print(f"    α={info['alpha']:.3f}, error={info['error']:.6f}")
+                        print(f"    Method: {info['salience_type']}, α={info['alpha']:.3f}, error={info['error']:.6f}")
 
                 quantized_count += 1
 
@@ -389,6 +538,15 @@ class GroupWiseAWQAsymmetricL2XW:
             print(f"   ⚠️  Skipped {skipped_count} layers due to errors")
 
         if self.layer_scales:
+            # Salience type statistics
+            salience_types = [info['salience_type'] for info in self.layer_scales.values()]
+            l2grad_count = salience_types.count('L2×Grad')
+            l2_count = salience_types.count('L2')
+            print(f"\n📊 Salience Method Distribution:")
+            print(f"  L2×Grad (MLP with SiLU): {l2grad_count} layers")
+            print(f"  L2 (other layers): {l2_count} layers")
+
+            # Alpha statistics
             alphas = [info['alpha'] for info in self.layer_scales.values()]
             print(f"\nOptimal α statistics:")
             print(f"  Mean: {np.mean(alphas):.3f}")
@@ -413,13 +571,13 @@ def load_wikitext2(split="train", n_samples=None):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Group-Wise AWQ with ASYMMETRIC quantization and ||X||²||W||² Salience for MiniCPM-2B",
+        description="Group-Wise AWQ with ASYMMETRIC quantization and HYBRID Salience (L2×Grad for MLP, L2 for others) for MiniCPM-2B",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     parser.add_argument("--n-calib", type=int, default=128, help="Calibration samples")
     parser.add_argument("--n-grid", type=int, default=20, help="Grid search points")
     parser.add_argument("--group-size", type=int, default=128, help="Group size for quantization")
-    parser.add_argument("--output-dir", type=str, default="./quantized_models/minicpm_awq_l2_xw",
+    parser.add_argument("--output-dir", type=str, default="./quantized_models/minicpm_gw_awq_asym_l2_grad",
                        help="Output directory")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     args = parser.parse_args()
@@ -435,19 +593,25 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     print("=" * 80)
-    print("Group-Wise AWQ with ASYMMETRIC Quantization + ||X||²||W||² Salience")
+    print("Group-Wise AWQ with ASYMMETRIC Quantization + HYBRID Salience")
     print("=" * 80)
-    print("Algorithm:")
-    print("  1. Per-input-channel ||X||²||W||² salience:")
-    print("     s[j] = ||X[:, j]||² × ||W[:, j]||²")
-    print("     → Combines activation energy and weight energy")
-    print("  2. Grid search optimal α ∈ [0, 1]")
-    print("  3. Column-wise weight scaling: W[:, j] *= s[j]^α")
-    print(f"  4. GROUP-WISE ASYMMETRIC INT4 quantization [0, 15] (group_size={args.group_size})")
+    print("HYBRID Algorithm:")
+    print("  1. Hook linear layers only (no SiLU hooks needed!)")
+    print("  2. Detect layer type (MLP with SiLU vs. other)")
+    print("  3. FOR MLP LAYERS (with SiLU):")
+    print("     → Reconstruct Z = W^T·X + b from captured data")
+    print("     → L2×Gradient salience: s[j] = E[X[:, j]² * |∇Y/∇X[:, j]|]")
+    print("     → Combines input magnitude with output sensitivity")
+    print("     → SiLU gradient computed analytically (no backward!)")
+    print("  4. FOR OTHER LAYERS (attention, etc.):")
+    print("     → L2 salience: s[j] = E[X[:, j]²]")
+    print("  5. Grid search optimal α ∈ [0, 1]")
+    print("  6. Column-wise weight scaling: W[:, j] *= s[j]^α")
+    print(f"  7. GROUP-WISE ASYMMETRIC INT4 quantization [0, 15] (group_size={args.group_size})")
     print("     - scale = (max - min) / 15 per group")
     print("     - zero_point = round(-min / scale) per group")
-    print("  5. Descaling: W_final = Q(W*s) / s")
-    print("\nKey Innovation: Joint X-W energy better predicts MSE")
+    print("  8. Descaling: W_final = Q(W*s) / s")
+    print("\nKey Improvement: Efficient hybrid → reconstruct Z, no extra hooks")
     print("=" * 80)
     print(f"Device: {device}")
     print(f"Model: {model_name}")
@@ -477,7 +641,7 @@ def main():
     calib_texts = load_wikitext2(split="train", n_samples=args.n_calib)
 
     # Initialize quantizer
-    quantizer = GroupWiseAWQAsymmetricL2XW(
+    quantizer = GroupWiseAWQAsymmetricL2GradQuantizer(
         model=model,
         tokenizer=tokenizer,
         device=device,
@@ -507,12 +671,15 @@ def main():
     print("QUANTIZATION COMPLETE!")
     print("=" * 80)
     print(f"Quantized model saved to: {args.output_dir}")
-    print("\nGroup-Wise AWQ ASYMMETRIC + ||X||²||W||² Approach:")
-    print("  ✓ ||X||²||W||² salience (joint X-W energy)")
+    print("\nGroup-Wise AWQ ASYMMETRIC + HYBRID Salience Approach:")
+    print("  ✓ HYBRID salience scoring:")
+    print("    - MLP layers (with SiLU): E[X² * |∇SiLU|]")
+    print("    - Other layers: E[X²]")
+    print("  ✓ Analytical SiLU gradient (no backward)")
     print("  ✓ Grid search for optimal α")
     print("  ✓ Column-wise weight scaling")
     print(f"  ✓ GROUP-WISE ASYMMETRIC quantization [0, 15]")
-    print("  ✓ Better MSE prediction through joint metric")
+    print("  ✓ Sensitivity-aware for MLP, standard L2 for others")
     print("=" * 80)
 
 
