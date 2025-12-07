@@ -77,9 +77,15 @@ class ModelEvaluator:
                 if inputs['input_ids'].shape[1] < 2:
                     continue
 
-                # Forward pass
-                outputs = self.model(**inputs, labels=inputs['input_ids'])
+                # Forward pass (use_cache=False to avoid compatibility issues)
+                outputs = self.model(**inputs, labels=inputs['input_ids'], use_cache=False)
                 loss = outputs.loss
+
+                # Check for invalid loss
+                if torch.isnan(loss) or torch.isinf(loss):
+                    if i % 500 == 0:
+                        print(f"\nWarning: Sample {i} produced invalid loss (NaN/Inf)")
+                    continue
 
                 # Accumulate loss
                 n_tokens = inputs['input_ids'].shape[1]
@@ -89,14 +95,23 @@ class ModelEvaluator:
 
             except Exception as e:
                 if i % 500 == 0 and i > 0:
-                    print(f"\nWarning: Some samples failed")
+                    print(f"\nWarning: Sample {i} failed with error: {str(e)[:100]}")
                 continue
 
         if total_tokens == 0:
+            print("❌ ERROR: No tokens were successfully evaluated!")
+            print("   All samples failed during perplexity computation.")
             return float('inf')
 
         avg_loss = total_loss / total_tokens
         perplexity = np.exp(avg_loss)
+
+        # Check if perplexity is invalid
+        if np.isinf(perplexity) or np.isnan(perplexity):
+            print(f"❌ ERROR: Invalid perplexity computed!")
+            print(f"   avg_loss: {avg_loss:.4f}, perplexity: {perplexity}")
+            print(f"   This usually means the quantized model is broken.")
+            return float('inf')
 
         print(f"Evaluated {successful_samples} samples, {total_tokens} tokens")
         print(f"Average loss: {avg_loss:.4f}, Perplexity: {perplexity:.2f}")
