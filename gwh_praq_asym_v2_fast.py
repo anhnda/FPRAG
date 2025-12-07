@@ -4,7 +4,7 @@ Hybrid Group-Wise PRAQ with FAST Adaptive Asymmetric Quantization (V2-Fast)
 Optimizations over V2:
 1. Vectorized operations (no nested loops)
 2. Cached skewness computation (once per layer, not per grid point)
-3. Optimized grid search (25 points instead of 40)
+3. Optimized grid search (20 points instead of 40)
 4. Torch-native skewness (no scipy dependency)
 5. Parallel group processing
 
@@ -29,16 +29,16 @@ class FastHybridPRAQAsymmetricQuantizer:
     Key optimizations:
     - Vectorized skewness computation
     - Cached distribution analysis
-    - Optimized grid search (25 points)
+    - Optimized grid search (20 points)
     - No nested loops in quantization
     """
 
-    def __init__(self, model, tokenizer, device="cuda", bits=4, n_grid=25, group_size=128):
+    def __init__(self, model, tokenizer, device="cuda", bits=4, n_grid=20, group_size=128):
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
         self.bits = bits
-        self.n_grid = n_grid  # Optimized: 25 instead of 40
+        self.n_grid = n_grid  # Optimized: 20 instead of 40
         self.group_size = group_size
 
         # Storage
@@ -236,7 +236,7 @@ class FastHybridPRAQAsymmetricQuantizer:
         best_alpha = 0.0
         best_scales = torch.ones(W.shape[1], device=self.device)
 
-        # Grid search (optimized: 25 points)
+        # Grid search (optimized: 20 points)
         for grid_idx in range(self.n_grid + 1):
             alpha = grid_idx / self.n_grid
 
@@ -346,7 +346,7 @@ def load_wikitext2(split="train", n_samples=None):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--n-calib", type=int, default=128)
-    parser.add_argument("--n-grid", type=int, default=25)
+    parser.add_argument("--n-grid", type=int, default=20)
     parser.add_argument("--group-size", type=int, default=128)
     parser.add_argument("--output-dir", type=str, default="./quantized_models/minicpm_gwh_praq_asym_v2")
     parser.add_argument("--seed", type=int, default=42)
