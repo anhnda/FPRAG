@@ -330,24 +330,31 @@ def create_comparison_visualizations(results, output_dir):
     print(f"Saved: {output_dir}/perplexity_comparison.png")
     plt.close()
 
-    # 2. Throughput comparison
-    plt.figure(figsize=(10, 6))
-    bars = plt.bar(range(len(names)), throughputs, color=colors, alpha=0.8, edgecolor='black')
-    plt.xlabel('Quantization Method', fontsize=12, fontweight='bold')
-    plt.ylabel('Throughput (tokens/sec, higher is better)', fontsize=12, fontweight='bold')
-    plt.title('Throughput Comparison: Symmetric vs Asymmetric', fontsize=14, fontweight='bold')
-    plt.xticks(range(len(names)), names, rotation=15, ha='right')
-    plt.grid(axis='y', alpha=0.3)
+    # 2. Throughput comparison (only if we have valid throughput data)
+    if any(t > 0 for t in throughputs):
+        plt.figure(figsize=(10, 6))
+        bars = plt.bar(range(len(names)), throughputs, color=colors, alpha=0.8, edgecolor='black')
+        plt.xlabel('Quantization Method', fontsize=12, fontweight='bold')
+        plt.ylabel('Throughput (tokens/sec, higher is better)', fontsize=12, fontweight='bold')
+        plt.title('Throughput Comparison: Symmetric vs Asymmetric', fontsize=14, fontweight='bold')
+        plt.xticks(range(len(names)), names, rotation=15, ha='right')
+        plt.grid(axis='y', alpha=0.3)
 
-    # Add value labels
-    for i, (bar, val) in enumerate(zip(bars, throughputs)):
-        plt.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 5,
-                f'{val:.1f}', ha='center', va='bottom', fontweight='bold')
+        # Add value labels
+        for i, (bar, val) in enumerate(zip(bars, throughputs)):
+            if val > 0:
+                plt.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 5,
+                        f'{val:.1f}', ha='center', va='bottom', fontweight='bold')
+            else:
+                plt.text(bar.get_x() + bar.get_width()/2, 5,
+                        'N/A', ha='center', va='bottom', fontweight='bold')
 
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'throughput_comparison.png'), dpi=300)
-    print(f"Saved: {output_dir}/throughput_comparison.png")
-    plt.close()
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, 'throughput_comparison.png'), dpi=300)
+        print(f"Saved: {output_dir}/throughput_comparison.png")
+        plt.close()
+    else:
+        print(f"Skipped throughput comparison plot (no valid data)")
 
     # 3. Multi-metric comparison (normalized)
     fig, axes = plt.subplots(1, 3, figsize=(16, 5))
@@ -359,11 +366,22 @@ def create_comparison_visualizations(results, output_dir):
     ]
 
     for ax, (title, values, lower_is_better) in zip(axes, metrics):
+        # Skip throughput if all values are 0
+        if title.startswith('Throughput') and all(v == 0 for v in values):
+            ax.text(0.5, 0.5, 'N/A\n(Measurement Failed)',
+                   ha='center', va='center', fontsize=12, fontweight='bold',
+                   transform=ax.transAxes)
+            ax.set_title(title, fontsize=12, fontweight='bold')
+            ax.set_xticks(range(len(names)))
+            ax.set_xticklabels(names, rotation=15, ha='right', fontsize=9)
+            continue
+
         # Normalize values
         if lower_is_better:
-            normalized = [min(values) / v for v in values]  # Lower is better
+            normalized = [min(values) / v if v > 0 else 0 for v in values]  # Lower is better
         else:
-            normalized = [v / max(values) for v in values]  # Higher is better
+            max_val = max(values) if max(values) > 0 else 1
+            normalized = [v / max_val if v > 0 else 0 for v in values]  # Higher is better
 
         bars = ax.bar(range(len(names)), normalized, color=colors, alpha=0.8, edgecolor='black')
         ax.set_ylim([0, 1.1])
@@ -375,8 +393,12 @@ def create_comparison_visualizations(results, output_dir):
 
         # Add value labels
         for bar, val, orig_val in zip(bars, normalized, values):
-            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.02,
-                   f'{val:.3f}\n({orig_val:.1f})', ha='center', va='bottom', fontsize=8)
+            if orig_val > 0:
+                ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.02,
+                       f'{val:.3f}\n({orig_val:.1f})', ha='center', va='bottom', fontsize=8)
+            else:
+                ax.text(bar.get_x() + bar.get_width()/2, 0.05,
+                       'N/A', ha='center', va='bottom', fontsize=8)
 
     # Add legend
     from matplotlib.patches import Patch
@@ -443,17 +465,23 @@ def print_comparison_table(results):
 
     if awq_sym and awq_asym:
         ppl_diff = ((awq_asym['perplexity'] - awq_sym['perplexity']) / awq_sym['perplexity']) * 100
-        thr_diff = ((awq_asym['throughput_tokens_per_sec'] - awq_sym['throughput_tokens_per_sec']) / awq_sym['throughput_tokens_per_sec']) * 100
         print(f"GW-AWQ: Asymmetric vs Symmetric")
         print(f"  Perplexity: {ppl_diff:+.2f}% ({'better' if ppl_diff < 0 else 'worse'})")
-        print(f"  Throughput: {thr_diff:+.2f}% ({'better' if thr_diff > 0 else 'worse'})")
+        if awq_sym['throughput_tokens_per_sec'] > 0 and awq_asym['throughput_tokens_per_sec'] > 0:
+            thr_diff = ((awq_asym['throughput_tokens_per_sec'] - awq_sym['throughput_tokens_per_sec']) / awq_sym['throughput_tokens_per_sec']) * 100
+            print(f"  Throughput: {thr_diff:+.2f}% ({'better' if thr_diff > 0 else 'worse'})")
+        else:
+            print(f"  Throughput: N/A (measurement failed)")
 
     if praq_sym and praq_asym:
         ppl_diff = ((praq_asym['perplexity'] - praq_sym['perplexity']) / praq_sym['perplexity']) * 100
-        thr_diff = ((praq_asym['throughput_tokens_per_sec'] - praq_sym['throughput_tokens_per_sec']) / praq_sym['throughput_tokens_per_sec']) * 100
         print(f"\nGWH-PRAQ: Asymmetric vs Symmetric")
         print(f"  Perplexity: {ppl_diff:+.2f}% ({'better' if ppl_diff < 0 else 'worse'})")
-        print(f"  Throughput: {thr_diff:+.2f}% ({'better' if thr_diff > 0 else 'worse'})")
+        if praq_sym['throughput_tokens_per_sec'] > 0 and praq_asym['throughput_tokens_per_sec'] > 0:
+            thr_diff = ((praq_asym['throughput_tokens_per_sec'] - praq_sym['throughput_tokens_per_sec']) / praq_sym['throughput_tokens_per_sec']) * 100
+            print(f"  Throughput: {thr_diff:+.2f}% ({'better' if thr_diff > 0 else 'worse'})")
+        else:
+            print(f"  Throughput: N/A (measurement failed)")
 
     print("=" * 100)
 
