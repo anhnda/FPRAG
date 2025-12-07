@@ -25,47 +25,103 @@ import random
 import os
 
 
-def load_pile_validation(n_samples=2000, seed=42):
+def load_third_dataset(n_samples=2000, seed=42):
     """
-    Load The Pile validation set.
+    Load third validation dataset for cross-testing.
 
-    The Pile is a diverse dataset containing:
-    - Books3, PubMed, ArXiv, GitHub, StackExchange
-    - OpenWebText, Wikipedia, YouTube, etc.
-    - 22 different high-quality data sources
+    Tries in order:
+    1. OpenWebText (GPT-2 training data subset)
+    2. AG News (news articles)
+    3. C4 train subset (different from C4 validation)
     """
-    print(f"Loading The Pile validation dataset...")
+    print(f"Loading third dataset for validation...")
     random.seed(seed)
     np.random.seed(seed)
 
+    # Try 1: OpenWebText
     try:
-        # The Pile validation set
-        dataset = load_dataset("monology/pile-uncopyrighted", split="validation", streaming=True)
+        print("Attempting to load OpenWebText...")
+        dataset = load_dataset("Skylion007/openwebtext", split="train", streaming=True)
 
         texts = []
-        print(f"Collecting {n_samples} samples from The Pile validation (seed={seed})...")
+        print(f"Collecting {n_samples} samples from OpenWebText (seed={seed})...")
 
-        for i, item in enumerate(tqdm(dataset, desc="Loading Pile", total=n_samples)):
+        # Skip first portion, use middle for validation-like data
+        skip_count = 50000
+        sample_count = 0
+
+        for i, item in enumerate(tqdm(dataset, desc="Loading OpenWebText")):
+            if i < skip_count:
+                if i % 10000 == 0:
+                    print(f"  Skipping to validation portion... {i}/{skip_count}")
+                continue
+
+            if sample_count >= n_samples:
+                break
+
+            text = item['text']
+            if len(text.strip()) > 100:
+                texts.append(text)
+                sample_count += 1
+
+        if len(texts) >= n_samples * 0.9:  # At least 90% of target
+            print(f"✅ Loaded {len(texts)} samples from OpenWebText")
+            random.seed(seed)
+            random.shuffle(texts)
+            return texts[:n_samples], "OpenWebText"
+
+    except Exception as e:
+        print(f"❌ Error loading OpenWebText: {e}")
+
+    # Try 2: AG News
+    try:
+        print("\nAttempting to load AG News...")
+        dataset = load_dataset("ag_news", split="test")
+
+        texts = []
+        print(f"Collecting samples from AG News...")
+
+        for item in tqdm(dataset, desc="Loading AG News"):
+            text = item['text']
+            if len(text.strip()) > 100:
+                texts.append(text)
+
+        if len(texts) >= n_samples * 0.5:
+            print(f"✅ Loaded {len(texts)} samples from AG News")
+            random.seed(seed)
+            random.shuffle(texts)
+            return texts[:n_samples], "AG News"
+
+    except Exception as e:
+        print(f"❌ Error loading AG News: {e}")
+
+    # Try 3: C4 train (different from C4 validation we used earlier)
+    try:
+        print("\nAttempting to load C4 train subset...")
+        dataset = load_dataset("allenai/c4", "en", split="train", streaming=True)
+
+        texts = []
+        print(f"Collecting {n_samples} samples from C4 train...")
+
+        for i, item in enumerate(tqdm(dataset, desc="Loading C4 train", total=n_samples)):
             if len(texts) >= n_samples:
                 break
 
             text = item['text']
-            # Filter out very short texts
             if len(text.strip()) > 100:
                 texts.append(text)
 
-        print(f"Loaded {len(texts)} samples from The Pile")
-
-        # Shuffle with fixed seed
-        random.seed(seed)
-        random.shuffle(texts)
-
-        return texts[:n_samples]
+        if len(texts) >= n_samples * 0.9:
+            print(f"✅ Loaded {len(texts)} samples from C4 train")
+            random.seed(seed)
+            random.shuffle(texts)
+            return texts[:n_samples], "C4 train subset"
 
     except Exception as e:
-        print(f"Error loading The Pile: {e}")
-        print("\nFalling back to alternative dataset: BookCorpus")
-        return load_bookcorpus_validation(n_samples, seed)
+        print(f"❌ Error loading C4 train: {e}")
+
+    print("\n❌ All dataset loading attempts failed")
+    return None, None
 
 
 def load_bookcorpus_validation(n_samples=2000, seed=42):
@@ -207,21 +263,25 @@ def main():
     seed = 42
 
     print("="*80)
-    print("CROSS-DATASET TEST: V1 GWH-PRAQ vs GW-AWQ on The Pile")
+    print("CROSS-DATASET TEST: V1 GWH-PRAQ vs GW-AWQ")
     print("="*80)
     print(f"Device: {device}")
-    print(f"Dataset: The Pile validation (diverse, 22 sources)")
+    print(f"Target: Third dataset for cross-validation")
     print(f"Samples: {n_samples}")
     print(f"Seed: {seed}")
     print("="*80)
 
-    # Load The Pile validation
+    # Load third dataset
     print("\nLoading evaluation data...")
-    eval_texts = load_pile_validation(n_samples=n_samples, seed=seed)
+    eval_texts, dataset_name = load_third_dataset(n_samples=n_samples, seed=seed)
 
-    if eval_texts is None:
+    if eval_texts is None or dataset_name is None:
         print("❌ Failed to load dataset. Exiting.")
         return
+
+    print(f"\n✅ Using dataset: {dataset_name}")
+    print(f"✅ Loaded {len(eval_texts)} samples")
+    print("="*80)
 
     # Model paths
     v1_path = "./quantized_models/minicpm_gwh_praq"
@@ -246,7 +306,7 @@ def main():
 
     # Analysis
     print("\n" + "="*80)
-    print("RESULTS - The Pile Validation")
+    print(f"RESULTS - {dataset_name}")
     print("="*80)
 
     if results['V1-GWH-PRAQ'] and results['GW-AWQ']:
@@ -264,21 +324,21 @@ def main():
         print(f"{'Delta (V1 - AWQ)':<30} {delta:+.4f} ({delta_pct:+.3f}%)")
 
         print("\n" + "="*80)
-        print("ANALYSIS - The Pile")
+        print(f"ANALYSIS - {dataset_name}")
         print("="*80)
 
         if abs(delta_pct) < 0.05:
             print(f"\n🤝 TIED (< 0.05% difference)")
-            print(f"   Both methods perform equally on The Pile")
-            winner_pile = "Tie"
+            print(f"   Both methods perform equally on {dataset_name}")
+            winner_third = "Tie"
         elif delta < 0:
             print(f"\n✅ V1 GWH-PRAQ WINS by {abs(delta_pct):.3f}%!")
-            print(f"   V1 beats AWQ on The Pile (diverse data)")
-            winner_pile = "V1"
+            print(f"   V1 beats AWQ on {dataset_name}")
+            winner_third = "V1"
         else:
             print(f"\n❌ GW-AWQ WINS by {delta_pct:.3f}%")
-            print(f"   Pure AWQ better on The Pile")
-            winner_pile = "AWQ"
+            print(f"   Pure AWQ better on {dataset_name}")
+            winner_third = "AWQ"
 
         # Compare with previous results
         print("\n" + "="*80)
@@ -298,7 +358,7 @@ def main():
         print("-" * 90)
         print(f"{'WikiText-2':<20} {wt2_v1:<15.4f} {wt2_awq:<15.4f} {wt2_delta_pct:>+14.3f}%  {'V1':<15}")
         print(f"{'C4':<20} {c4_v1:<15.4f} {c4_awq:<15.4f} {c4_delta_pct:>+14.3f}%  {'V1':<15}")
-        print(f"{'The Pile':<20} {v1_ppl:<15.4f} {awq_ppl:<15.4f} {delta_pct:>+14.3f}%  {winner_pile:<15}")
+        print(f"{dataset_name:<20} {v1_ppl:<15.4f} {awq_ppl:<15.4f} {delta_pct:>+14.3f}%  {winner_third:<15}")
 
         print("\n" + "="*80)
         print("CONSISTENCY ANALYSIS")
@@ -394,10 +454,21 @@ def main():
         print("  - Style: Diverse, noisy")
         print("  - Domain: Mixed (blogs, forums, news, etc.)")
 
-        print("\nThe Pile:")
-        print("  - Source: 22 high-quality datasets")
-        print("  - Style: Academic, technical, creative")
-        print("  - Domain: Books, papers, code, conversations")
+        print(f"\n{dataset_name}:")
+        if "OpenWebText" in dataset_name:
+            print("  - Source: Reddit outbound links (GPT-2 training)")
+            print("  - Style: Web content, articles, discussions")
+            print("  - Domain: General web, higher quality than raw crawl")
+        elif "AG News" in dataset_name:
+            print("  - Source: News articles")
+            print("  - Style: Journalistic, factual")
+            print("  - Domain: World, sports, business, sci/tech news")
+        elif "C4 train" in dataset_name:
+            print("  - Source: Web crawl (training subset)")
+            print("  - Style: Diverse, noisy")
+            print("  - Domain: Different portion of web than C4 validation")
+        else:
+            print("  - Different data distribution from WikiText-2 and C4")
 
         print("\nConclusion:")
         print("  Testing on 3 diverse datasets provides robust validation")
