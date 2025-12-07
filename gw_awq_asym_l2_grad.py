@@ -25,7 +25,9 @@ Algorithm:
    d. Compute per-channel salience: s[j] = E[X[:, j]² * |∇Y/∇X[:, j]|]
 4. FOR OTHER LAYERS (no SiLU):
    a. Compute per-channel salience: s[j] = E[X[:, j]²]
-5. Grid search for optimal α ∈ [0, 1]
+5. Grid search for optimal α ∈ [0, 1] with GRADIENT-WEIGHTED MSE:
+   a. For MLP: Error = E[(Y_q - Y_orig)² * |∇SiLU(Y_orig)|]
+   b. For others: Error = E[(Y_q - Y_orig)²]
 6. Scale weight COLUMNS: W[:, j] *= s[j]^α
 7. Quantize with GROUP-WISE ASYMMETRIC scales [0, 15]
 8. Divide by input scales: W_final = Q(W*s) / s
@@ -324,11 +326,15 @@ class GroupWiseAWQAsymmetricL2GradQuantizer:
            b. Scale weight COLUMNS: W_scaled[:, j] = W[:, j] * s[j]
            c. Quantize with GROUP-WISE ASYMMETRIC scales [0, 15]
            d. Compute compensated output: Y_q = W_q @ (X / s)
-           e. Measure error: ||Y_q - Y_orig||²
+           e. Measure error:
+              - MLP (SiLU): Gradient-weighted MSE = E[(Y_q - Y_orig)² * |∇SiLU(Y_orig)|]
+              - Other:      Standard MSE = E[(Y_q - Y_orig)²]
         2. Return α and scales that minimize error
 
+        Key Innovation: Gradient-weighted MSE penalizes errors on high-sensitivity outputs more!
+
         Returns:
-            best_scales, best_alpha, best_error
+            best_scales, best_alpha, best_error, salience_type
         """
         if name not in self.activation_data or len(self.activation_data[name]) == 0:
             in_features = module.weight.shape[1]
@@ -378,6 +384,14 @@ class GroupWiseAWQAsymmetricL2GradQuantizer:
 
         activation_salience = activation_salience.to(self.device)
 
+        # Compute gradient weights for MLP layers (if applicable)
+        if has_silu:
+            # Compute SiLU gradient from original output for weighting
+            grad_silu_orig = self.compute_silu_gradient(Y_orig)  # [N, out_features]
+            grad_weight = grad_silu_orig.abs()  # Use absolute gradient as weight
+        else:
+            grad_weight = None
+
         # Grid search over α
         for grid_idx in range(self.n_grid + 1):
             alpha = grid_idx / self.n_grid
@@ -399,8 +413,16 @@ class GroupWiseAWQAsymmetricL2GradQuantizer:
             else:
                 Y_quant = torch.matmul(X_compensated, W_quant.t())
 
-            # Compute reconstruction error (MSE)
-            error = (Y_orig - Y_quant).pow(2).mean().item()
+            # Compute reconstruction error
+            if has_silu:
+                # GRADIENT-WEIGHTED MSE for MLP layers
+                # Weight errors by gradient magnitude - high-gradient outputs penalized more
+                squared_error = (Y_orig - Y_quant).pow(2)  # [N, out_features]
+                weighted_error = squared_error * grad_weight  # Element-wise weighting
+                error = weighted_error.mean().item()
+            else:
+                # STANDARD MSE for other layers
+                error = (Y_orig - Y_quant).pow(2).mean().item()
 
             if error < best_error:
                 best_error = error
@@ -410,6 +432,8 @@ class GroupWiseAWQAsymmetricL2GradQuantizer:
         del X_search, Y_orig
         if 'Y_quant' in locals():
             del Y_quant
+        if 'grad_weight' in locals() and grad_weight is not None:
+            del grad_weight
         torch.cuda.empty_cache()
 
         return best_scales, best_alpha, best_error, salience_type
@@ -491,13 +515,15 @@ class GroupWiseAWQAsymmetricL2GradQuantizer:
         print("        → Combines magnitude (X²) with sensitivity (|∇|)")
         print("  4. FOR OTHER LAYERS (no SiLU):")
         print("     a. Compute L2 salience: s[j] = E[X[:, j]²]")
-        print("  5. Grid search for optimal α ∈ [0, 1]")
+        print("  5. Grid search for optimal α ∈ [0, 1] with GRADIENT-WEIGHTED MSE:")
+        print("     a. MLP layers: Error = E[(Y_q - Y)² * |∇SiLU(Y)|]")
+        print("     b. Other layers: Error = E[(Y_q - Y)²]")
         print("  6. Scale weight columns: W[:, j] *= s[j]^α")
         print(f"  7. GROUP-WISE ASYMMETRIC INT4 quantization [0, 15] (group_size={self.group_size})")
         print("     - Per group: scale = (max - min) / 15")
         print("     - Per group: zero_point = round(-min / scale)")
         print("  8. Divide by input scales: W_final = Q(W*s) / s")
-        print("\nKey Improvement: Efficient hybrid → no SiLU hooks, reconstruct Z from X+W")
+        print("\nKey Improvement: Gradient-weighted MSE → penalize errors on sensitive outputs")
         print("=" * 80)
 
         quantized_count = 0
