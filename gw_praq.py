@@ -513,7 +513,7 @@ def main():
         description="Group-Wise PRAQ quantization for MiniCPM-2B",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    parser.add_argument("--n-calib", type=int, default=150, help="Calibration samples")
+    parser.add_argument("--n-calib", type=int, default=128, help="Calibration samples")
     parser.add_argument("--n-grid", type=int, default=20, help="Grid search points")
     parser.add_argument("--beta", type=float, default=3.0, help="PRAQ beta parameter")
     parser.add_argument("--tau", type=float, default=-3.0, help="PRAQ tau parameter")

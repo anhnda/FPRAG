@@ -394,7 +394,7 @@ def main():
         description="Group-Wise AWQ quantization for MiniCPM-2B",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    parser.add_argument("--n-calib", type=int, default=150, help="Calibration samples")
+    parser.add_argument("--n-calib", type=int, default=128, help="Calibration samples")
     parser.add_argument("--n-grid", type=int, default=20, help="Grid search points")
     parser.add_argument("--group-size", type=int, default=128, help="Group size for quantization")
     parser.add_argument("--output-dir", type=str, default="./quantized_models/minicpm_gw_awq",
