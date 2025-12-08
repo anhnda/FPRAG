@@ -114,19 +114,19 @@ class GroupWiseAWQGradientSquaredQuantizer:
 
                 # If this layer is followed by SiLU and we need gradients
                 if compute_gradients and name in self.silu_followed_layers:
-                    # Keep input on GPU with gradient for backward pass
                     if name not in self.gradient_data:
                         self.gradient_data[name] = []
 
-                    # We'll compute gradients later during calibration
+                    # Store on CPU to save memory - we'll process on GPU in batches later
                     if isinstance(input, tuple):
-                        inp_grad = input[0].detach().requires_grad_(True)
+                        inp_cpu = input[0].detach().cpu()
                     else:
-                        inp_grad = input.detach().requires_grad_(True)
+                        inp_cpu = input.detach().cpu()
+
                     self.gradient_data[name].append({
-                        'input': inp_grad,
-                        'weight': module.weight.detach().clone(),
-                        'bias': module.bias.detach().clone() if module.bias is not None else None
+                        'input': inp_cpu,
+                        'weight': module.weight.detach().cpu().clone(),
+                        'bias': module.bias.detach().cpu().clone() if module.bias is not None else None
                     })
 
             return hook
@@ -191,43 +191,47 @@ class GroupWiseAWQGradientSquaredQuantizer:
         grad_list = self.gradient_data[name]
         in_features = grad_list[0]['weight'].shape[1]
 
-        # Accumulate squared gradients per input channel
-        grad_squared_sum = torch.zeros(in_features, device=self.device)
+        # Accumulate squared gradients per input channel ON CPU
+        grad_squared_sum = torch.zeros(in_features)
         total_samples = 0
 
         for data in tqdm(grad_list, desc=f"Computing gradients for {name}", leave=False):
-            X = data['input'].to(self.device)  # [batch, in_features]
-            W = data['weight'].to(self.device)  # [out_features, in_features]
-            b = data['bias'].to(self.device) if data['bias'] is not None else None
+            # Keep data on CPU, compute in small batches
+            X = data['input']  # Already on CPU: [batch, in_features]
+            W = data['weight']  # Already on CPU: [out_features, in_features]
+            b = data['bias'] if data['bias'] is not None else None
 
-            # Forward pass
-            Z = torch.matmul(X, W.t())
-            if b is not None:
-                Z = Z + b
+            # Process in small batches on GPU to avoid OOM
+            batch_size = min(32, X.shape[0])
+            for start_idx in range(0, X.shape[0], batch_size):
+                end_idx = min(start_idx + batch_size, X.shape[0])
+                X_batch = X[start_idx:end_idx].to(self.device)
 
-            # Apply SiLU activation
-            Y = Z * torch.sigmoid(Z)  # SiLU(z) = z * sigmoid(z)
+                # Forward pass
+                W_gpu = W.to(self.device)
+                Z = torch.matmul(X_batch, W_gpu.t())
+                if b is not None:
+                    Z = Z + b.to(self.device)
 
-            # For each output, compute gradient w.r.t. weights
-            # grad_W[i,j] = dY[i]/dW[i,j] = X[j] * d(SiLU(Z[i]))/dZ[i]
-            # d(SiLU(z))/dz = sigmoid(z) + z*sigmoid(z)*(1-sigmoid(z))
+                # Apply SiLU activation
+                sigmoid_Z = torch.sigmoid(Z)
+                d_silu = sigmoid_Z + Z * sigmoid_Z * (1 - sigmoid_Z)  # [batch, out_features]
 
-            sigmoid_Z = torch.sigmoid(Z)
-            d_silu = sigmoid_Z + Z * sigmoid_Z * (1 - sigmoid_Z)  # [batch, out_features]
+                # Gradient magnitude per input channel
+                # For each sample, compute contribution to each input channel
+                X_abs = X_batch.abs()  # [batch, in_features]
+                d_silu_sum = d_silu.abs().sum(dim=1, keepdim=True)  # [batch, 1]
 
-            # Gradient magnitude per input channel (sum over batch and output channels)
-            # |dY/dW[:, j]| ≈ |X[:, j] * d_silu|
-            # We want per-channel importance, so sum over samples and output dims
-            for i in range(X.shape[0]):  # For each sample in batch
-                x_sample = X[i:i+1, :]  # [1, in_features]
-                d_silu_sample = d_silu[i:i+1, :]  # [1, out_features]
+                # grad_per_input[j] = sum_i |x_i[j] * d_silu[i]|
+                grad_per_input = (X_abs * d_silu_sum).sum(dim=0)  # [in_features]
 
-                # Gradient contribution: outer product magnitude
-                # grad[k, j] = x[j] * d_silu[k]
-                # We want importance per input channel j: sum over output k
-                grad_per_input = (x_sample.abs() * d_silu_sample.abs().sum(dim=0, keepdim=True)).squeeze(0)
-                grad_squared_sum += grad_per_input.pow(2)
-                total_samples += 1
+                # Move to CPU and accumulate
+                grad_squared_sum += grad_per_input.pow(2).cpu()
+                total_samples += X_batch.shape[0]
+
+                # Clear GPU memory
+                del X_batch, W_gpu, Z, sigmoid_Z, d_silu, X_abs, d_silu_sum, grad_per_input
+                torch.cuda.empty_cache()
 
         # Average over samples
         grad_squared_avg = grad_squared_sum / max(total_samples, 1)
@@ -242,7 +246,7 @@ class GroupWiseAWQGradientSquaredQuantizer:
         # Saliency: E[1 + g²/max(g²)]
         salience = 1.0 + grad_norm_squared
 
-        return salience.cpu()
+        return salience
 
     def get_salience(self, name):
         """
@@ -254,7 +258,14 @@ class GroupWiseAWQGradientSquaredQuantizer:
         if name in self.silu_followed_layers:
             # Use gradient-based saliency
             print(f"  Computing G² saliency for SiLU-followed layer: {name}")
-            return self.compute_gradient_salience(name)
+            salience = self.compute_gradient_salience(name)
+
+            # Clear gradient data for this layer immediately after use
+            if name in self.gradient_data:
+                del self.gradient_data[name]
+                torch.cuda.empty_cache()
+
+            return salience
         else:
             # Use AWQ-style activation saliency
             return self.get_activation_salience_awq(name)
@@ -437,6 +448,10 @@ class GroupWiseAWQGradientSquaredQuantizer:
             'silu_followed': name in self.silu_followed_layers
         }
 
+        # Clear intermediate tensors
+        del W_scaled, W_quant, W_final
+        torch.cuda.empty_cache()
+
     def calibrate(self, calibration_data, n_samples=500):
         """Run calibration on the dataset to collect activations and gradients."""
         print(f"\nCalibrating with {min(n_samples, len(calibration_data))} samples...")
@@ -471,8 +486,8 @@ class GroupWiseAWQGradientSquaredQuantizer:
             self.register_hooks(compute_gradients=True)
 
             successful_grad = 0
-            # Use fewer samples for gradient computation (expensive)
-            n_grad_samples = min(128, n_samples)
+            # Use fewer samples for gradient computation (memory intensive)
+            n_grad_samples = min(64, n_samples)  # Reduced from 128 to save memory
             for i, text in enumerate(tqdm(calibration_data[:n_grad_samples], desc="Gradient calibration")):
                 try:
                     inputs = self.tokenizer(text, return_tensors="pt",
@@ -534,13 +549,13 @@ class GroupWiseAWQGradientSquaredQuantizer:
 
                 quantized_count += 1
 
-                # Clear activation and gradient data
+                # Clear activation data immediately after quantizing
                 if name in self.activation_data:
                     del self.activation_data[name]
-                if name in self.gradient_data:
-                    del self.gradient_data[name]
+                # gradient_data is already cleared in get_salience()
 
-                if quantized_count % 10 == 0 and torch.cuda.is_available():
+                # More frequent cache clearing
+                if quantized_count % 5 == 0 and torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
             except Exception as e:
@@ -621,6 +636,10 @@ def main():
     print("    3. Column-wise weight scaling: W[:, j] *= s[j]^α")
     print(f"    4. GROUP-WISE ASYMMETRIC INT4 quantization [0, 15] (group_size={args.group_size})")
     print("    5. Descaling: W_final = Q(W*s) / s")
+    print("\nMemory Optimization:")
+    print("  - Gradient computation done in CPU batches")
+    print("  - Aggressive memory clearing after each layer")
+    print("  - If OOM occurs, set: PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True")
     print("=" * 80)
     print(f"Device: {device}")
     print(f"Model: {model_name}")
