@@ -1,24 +1,24 @@
 """
-Group-Wise AWQ with KNEE-point L2 (KL2) Importance-Weighted Loss
+Group-Wise AWQ with KNEE-point L2 (KL2) Importance-Aware Zero-Point
 
 Key Innovation:
 - Uses Kneedle algorithm to identify truly important channels
-- Focuses MSE optimization only on high-salience channels
-- Prevents wasting capacity on unimportant channels
+- Adjusts zero_point in asymmetric quantization to minimize error on important weights
+- Prevents wasting precision on unimportant channels
 
 Algorithm:
 1. Compute per-channel L2 salience: s[j] = E[X[:, j]²]
 2. Sort salience values
 3. Apply Kneedle algorithm on first half to find knee point
 4. Create importance mask: important[j] = (salience[j] >= knee_threshold)
-5. Grid search for optimal α, but compute MSE ONLY on important channels
-6. This focuses quantization precision on truly critical weights
+5. Grid search for optimal α using standard MSE
+6. During quantization: adjust zero_point to minimize error on important weight columns
 
 Why This Works:
 - Kneedle finds the "elbow" where salience drops significantly
 - Channels above knee are high-impact, below knee are negligible
-- Optimizing for high-impact channels prevents overfitting to noise
-- Matches intuition: protect important channels, aggressive on others
+- Zero-point optimization focuses quantization range on important weights
+- Matches intuition: allocate quantization budget to critical weights
 """
 
 import torch
@@ -42,13 +42,13 @@ except ImportError:
 
 class GroupWiseAWQKneeL2Quantizer:
     """
-    Group-Wise AWQ with Knee-point L2 (KL2) Importance Weighting.
+    Group-Wise AWQ with Knee-point L2 (KL2) Importance-Aware Zero-Point.
 
     Key Features:
     - Kneedle algorithm to identify critical channels
-    - Importance-weighted MSE: focus on high-salience channels only
+    - Importance-aware zero_point: adjusts quantization range for important weights
     - GROUP-WISE ASYMMETRIC INT4 quantization [0, 15]
-    - Prevents optimization overfitting to unimportant channels
+    - Prevents wasting quantization budget on unimportant channels
     """
 
     def __init__(self, model, tokenizer, device="cuda", bits=4, n_grid=20, group_size=128):
@@ -70,8 +70,8 @@ class GroupWiseAWQKneeL2Quantizer:
         print(f"  Grid search points: {n_grid}")
         print(f"  Group size: {group_size}")
         print(f"  Quantization: GROUP-WISE ASYMMETRIC [0, 15]")
-        print(f"  Innovation: Kneedle-based importance masking")
-        print(f"  MSE computed ONLY on high-salience channels")
+        print(f"  Innovation: Kneedle-based importance identification")
+        print(f"  Zero-point adjusted to minimize error on important weights")
 
     def register_hooks(self):
         """Register forward hooks to capture activations."""
@@ -200,13 +200,74 @@ class GroupWiseAWQKneeL2Quantizer:
         return knee_threshold, important_mask, stats
 
     @torch.no_grad()
-    def quantize_weight_groupwise_asymmetric(self, W):
+    def _compute_importance_aware_zero_point(self, W_grouped, scale, importance_grouped):
         """
-        Group-wise ASYMMETRIC quantization.
+        Compute zero_point that minimizes MSE on important weight columns.
+
+        For each group, searches over z ∈ [0, 15] to find the zero_point that
+        minimizes quantization error on weight columns corresponding to important
+        input channels (where importance_grouped[g, j] = True).
+
+        Args:
+            W_grouped: [out_features, n_groups, group_size]
+            scale: [out_features, n_groups, 1]
+            importance_grouped: [n_groups, group_size] boolean mask
+
+        Returns:
+            zero_point: [out_features, n_groups, 1]
+        """
+        out_features, n_groups, group_size = W_grouped.shape
+
+        # Initialize with standard zero_point
+        W_min = W_grouped.min(dim=2, keepdim=True)[0]
+        zero_point = torch.round(-W_min / scale).clamp(0, 15)
+
+        # For each group, optimize zero_point based on important columns
+        for g in range(n_groups):
+            importance_mask_g = importance_grouped[g]  # [group_size]
+
+            # If no important columns in this group, use standard zero_point
+            if not importance_mask_g.any():
+                continue
+
+            W_group_g = W_grouped[:, g, :]  # [out_features, group_size]
+            scale_g = scale[:, g, :]  # [out_features, 1]
+
+            # Grid search over z ∈ [0, 15]
+            best_z = zero_point[:, g, 0].clone()
+            best_error = float('inf')
+
+            for z_candidate in range(16):
+                # Quantize with this zero_point
+                W_int = torch.round(W_group_g / scale_g + z_candidate).clamp(0, 15)
+                W_dequant = (W_int - z_candidate) * scale_g
+
+                # Compute MSE only on important columns
+                error_per_col = (W_group_g - W_dequant).pow(2)  # [out_features, group_size]
+                error_important = error_per_col[:, importance_mask_g].mean()  # scalar
+
+                if error_important < best_error:
+                    best_error = error_important
+                    best_z = z_candidate
+
+            # Apply same zero_point to all output features for this group
+            zero_point[:, g, 0] = best_z
+
+        return zero_point
+
+    @torch.no_grad()
+    def quantize_weight_groupwise_asymmetric(self, W, important_mask=None):
+        """
+        Group-wise ASYMMETRIC quantization with importance-aware zero_point.
         Uses full INT4 range [0, 15] with computed zero_point.
+
+        When important_mask is provided, adjusts zero_point to minimize
+        quantization error on weight columns corresponding to important
+        input channels.
 
         Args:
             W: Weight tensor [out_features, in_features]
+            important_mask: Optional boolean tensor [in_features] indicating important channels
 
         Returns:
             W_quant: Quantized and dequantized weights
@@ -220,20 +281,43 @@ class GroupWiseAWQKneeL2Quantizer:
         if padded_in_features > in_features:
             W_padded = torch.zeros(out_features, padded_in_features, device=W.device, dtype=W.dtype)
             W_padded[:, :in_features] = W
+
+            # Pad importance mask too
+            if important_mask is not None:
+                important_mask_padded = torch.zeros(padded_in_features, dtype=torch.bool, device=important_mask.device)
+                important_mask_padded[:in_features] = important_mask
+            else:
+                important_mask_padded = None
         else:
             W_padded = W
+            important_mask_padded = important_mask
 
         # Reshape to [out_features, n_groups, group_size]
         W_grouped = W_padded.reshape(out_features, n_groups, self.group_size)
 
-        # Compute min and max per group
+        # Reshape importance mask to [n_groups, group_size]
+        if important_mask_padded is not None:
+            importance_grouped = important_mask_padded.reshape(n_groups, self.group_size)
+        else:
+            importance_grouped = None
+
+        # Compute min and max per group (standard, use full range)
         W_min = W_grouped.min(dim=2, keepdim=True)[0]
         W_max = W_grouped.max(dim=2, keepdim=True)[0]
 
-        # Asymmetric quantization parameters
+        # Standard scale computation
         scale = (W_max - W_min) / 15.0
         scale = scale.clamp(min=1e-8)
-        zero_point = torch.round(-W_min / scale).clamp(0, 15)
+
+        # Compute zero_point
+        if importance_grouped is not None:
+            # Importance-aware zero_point: minimize error on important columns
+            zero_point = self._compute_importance_aware_zero_point(
+                W_grouped, scale, importance_grouped
+            )
+        else:
+            # Standard zero_point
+            zero_point = torch.round(-W_min / scale).clamp(0, 15)
 
         # Quantize to [0, 15]
         W_int = torch.round(W_grouped / scale + zero_point).clamp(0, 15)
@@ -255,30 +339,31 @@ class GroupWiseAWQKneeL2Quantizer:
         """
         Grid search for optimal per-input-channel scaling factor.
 
-        KEY INNOVATION: MSE computed ONLY on important channels (above knee point)
+        KEY INNOVATION: Identifies important channels via Kneedle, then passes
+        importance mask to quantization function to adjust zero_point.
 
         Algorithm:
         1. Compute L2 salience for all channels
         2. Find knee point → identify important channels
         3. For α in [0, 0.05, ..., 1.0]:
            a. Compute scales: s[j] = salience[j]^α
-           b. Quantize with these scales
-           c. Compute MSE ONLY on important channels (not all!)
+           b. Quantize with these scales (importance mask used internally)
+           c. Compute standard MSE (on all channels)
            d. Track best α
-        4. Return scales that minimize important-channel MSE
+        4. Return scales and importance mask
 
         Returns:
-            best_scales, best_alpha, best_error
+            best_scales, best_alpha, best_error, important_mask
         """
         if name not in self.activation_data or len(self.activation_data[name]) == 0:
             in_features = module.weight.shape[1]
-            return torch.ones(in_features).to(self.device), 0.0, 0.0
+            return torch.ones(in_features).to(self.device), 0.0, 0.0, None
 
         # Get L2 activation salience
         activation_salience = self.get_activation_salience_l2(name)
         if activation_salience is None:
             in_features = module.weight.shape[1]
-            return torch.ones(in_features).to(self.device), 0.0, 0.0
+            return torch.ones(in_features).to(self.device), 0.0, 0.0, None
 
         # Find knee point and create importance mask
         knee_threshold, important_mask, stats = self.find_knee_threshold(activation_salience)
@@ -315,10 +400,6 @@ class GroupWiseAWQKneeL2Quantizer:
         activation_salience = activation_salience.to(self.device)
         important_mask = important_mask.to(self.device)
 
-        # Expand mask for broadcasting: [1, in_features] for inputs, affects all outputs
-        # When computing Y = X @ W.t(), important input channels affect all output dims
-        # So we mask the input: X_important = X[:, important_mask]
-
         # Grid search over α
         for grid_idx in range(self.n_grid + 1):
             alpha = grid_idx / self.n_grid
@@ -330,6 +411,8 @@ class GroupWiseAWQKneeL2Quantizer:
             W_scaled = W * scales.unsqueeze(0)
 
             # Quantize with GROUP-WISE ASYMMETRIC quantization
+            # Note: We don't pass important_mask here during search (for speed)
+            # It will be used during final quantization in quantize_layer
             W_quant = self.quantize_weight_groupwise_asymmetric(W_scaled)
 
             # Compensate input
@@ -340,29 +423,8 @@ class GroupWiseAWQKneeL2Quantizer:
             else:
                 Y_quant = torch.matmul(X_compensated, W_quant.t())
 
-            # KEY INNOVATION: Compute MSE ONLY on important input channels
-            # Since Y = X @ W.t(), we can compute per-channel contributions to output
-            # and weight the error by channel importance
-
-            # Method: Compute error on outputs from important channels only
-            # Y = X @ W.t() = sum_j (X[:, j] * W[:, j])
-            # Focus on: sum over j where important_mask[j] = True
-
-            # Create masked versions for error computation
-            # Zero out unimportant channels in both orig and quant
-            X_important = X_search.clone()
-            X_important[:, ~important_mask] = 0  # Zero out unimportant channels
-
-            # Recompute outputs with only important channels
-            if b is not None:
-                Y_orig_important = torch.matmul(X_important, W.t()) + b
-                Y_quant_important = torch.matmul(X_important / scales.unsqueeze(0), W_quant.t()) + b
-            else:
-                Y_orig_important = torch.matmul(X_important, W.t())
-                Y_quant_important = torch.matmul(X_important / scales.unsqueeze(0), W_quant.t())
-
-            # Compute MSE on important-channel outputs only
-            error = (Y_orig_important - Y_quant_important).pow(2).mean().item()
+            # Compute standard MSE on all outputs
+            error = (Y_orig - Y_quant).pow(2).mean().item()
 
             if error < best_error:
                 best_error = error
@@ -374,20 +436,20 @@ class GroupWiseAWQKneeL2Quantizer:
             del Y_quant
         torch.cuda.empty_cache()
 
-        return best_scales, best_alpha, best_error
+        return best_scales, best_alpha, best_error, important_mask
 
     @torch.no_grad()
     def quantize_layer(self, name, module):
         """
-        Apply Group-Wise AWQ with Knee-L2 Importance Weighting.
+        Apply Group-Wise AWQ with Knee-L2 Importance-Aware Zero-Point.
 
         Steps:
         1. Compute L2 salience
         2. Find knee point → identify important channels
-        3. Grid search for best scales (MSE on important channels only)
-        4. Quantize with best scales
+        3. Grid search for best scales (standard MSE)
+        4. Quantize with best scales AND importance mask (adjusts zero_point)
         """
-        best_scales, best_alpha, best_error = self.search_best_scale(name, module)
+        best_scales, best_alpha, best_error, important_mask = self.search_best_scale(name, module)
 
         W = module.weight.data
 
@@ -395,7 +457,8 @@ class GroupWiseAWQKneeL2Quantizer:
         W_scaled = W * best_scales.unsqueeze(0)
 
         # Quantize with GROUP-WISE ASYMMETRIC quantization
-        W_quant = self.quantize_weight_groupwise_asymmetric(W_scaled)
+        # Pass importance mask to adjust zero_point for important weights
+        W_quant = self.quantize_weight_groupwise_asymmetric(W_scaled, important_mask)
 
         # Divide by scales to restore original magnitude
         W_final = W_quant / best_scales.unsqueeze(0)
@@ -440,18 +503,19 @@ class GroupWiseAWQKneeL2Quantizer:
     def quantize_model(self):
         """Quantize all linear layers using Group-Wise AWQ with Knee-L2."""
         print("\n" + "=" * 80)
-        print("Quantizing with Group-Wise AWQ + Knee-L2 Importance Weighting")
+        print("Quantizing with Group-Wise AWQ + Knee-L2 Importance-Aware Zero-Point")
         print("=" * 80)
         print("Method:")
         print("  1. Compute per-channel L2 salience: s[j] = E[X[:, j]²]")
         print("  2. Sort salience, apply Kneedle on first half")
         print("  3. Create importance mask: important = (salience >= knee)")
         print("  4. Grid search for optimal α ∈ [0, 1]")
-        print("     → MSE computed focusing on important channels")
+        print("     → Standard MSE on all channels")
         print("  5. Scale weight columns: W[:, j] *= s[j]^α")
         print(f"  6. GROUP-WISE ASYMMETRIC INT4 quantization [0, 15] (group_size={self.group_size})")
+        print("     → Zero-point adjusted to minimize error on important weights")
         print("  7. Descaling: W_final = Q(W*s) / s")
-        print("\nKey Innovation: Knee-point identifies truly critical channels")
+        print("\nKey Innovation: Zero-point optimization focuses on critical weights")
         print("=" * 80)
 
         quantized_count = 0
@@ -556,17 +620,18 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     print("=" * 80)
-    print("Group-Wise AWQ with Knee-L2 Importance Weighting")
+    print("Group-Wise AWQ with Knee-L2 Importance-Aware Zero-Point")
     print("=" * 80)
     print("Algorithm:")
     print("  1. Per-channel L2 salience: s[j] = E[X[:, j]²]")
     print("  2. Sort salience → Kneedle algorithm → Find knee point")
     print("  3. Mask: important = (salience >= knee threshold)")
-    print("  4. Grid search with importance-weighted MSE")
+    print("  4. Grid search with standard MSE")
     print("  5. Column-wise weight scaling: W[:, j] *= s[j]^α")
     print(f"  6. GROUP-WISE ASYMMETRIC INT4 quantization [0, 15] (group_size={args.group_size})")
+    print("     → Zero-point adjusted to minimize error on important weights")
     print("  7. Descaling: W_final = Q(W*s) / s")
-    print("\nInnovation: Focus optimization on truly important channels")
+    print("\nInnovation: Zero-point optimization focuses on critical weights")
     print("=" * 80)
     print(f"Device: {device}")
     print(f"Model: {model_name}")
@@ -628,9 +693,9 @@ def main():
     print(f"Quantized model saved to: {args.output_dir}")
     print("\nGroup-Wise AWQ Knee-L2 Approach:")
     print("  ✓ Kneedle algorithm identifies critical channels")
-    print("  ✓ Importance-weighted MSE optimization")
-    print("  ✓ Focuses precision on high-impact channels")
-    print("  ✓ Prevents overfitting to unimportant channels")
+    print("  ✓ Zero-point adjusted to minimize error on important weights")
+    print("  ✓ Focuses quantization budget on high-impact channels")
+    print("  ✓ Prevents wasting precision on unimportant channels")
     print(f"  ✓ GROUP-WISE ASYMMETRIC quantization [0, 15]")
     print("=" * 80)
 
