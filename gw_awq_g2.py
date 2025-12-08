@@ -210,10 +210,18 @@ class GroupWiseAWQGradientSquaredQuantizer:
                 # grad_per_input[j] = sum_i |x_i[j] * d_silu[i]|
                 grad_per_input = (X_abs * d_silu_sum).sum(dim=0)  # [in_features]
 
+                # Check if gradients are valid
+                if torch.isnan(grad_per_input).any() or torch.isinf(grad_per_input).any():
+                    # Skip this batch if it has invalid values
+                    continue
+
                 # L2 normalize per batch to prevent overflow
                 grad_norm = grad_per_input.norm()
-                if grad_norm > 0:
+                if grad_norm > 1e-10:
                     grad_per_input = grad_per_input / grad_norm
+                else:
+                    # Skip batches with zero gradients
+                    continue
 
                 # Square the normalized values (now safe from overflow)
                 grad_squared = grad_per_input.pow(2)
@@ -226,18 +234,28 @@ class GroupWiseAWQGradientSquaredQuantizer:
                 del X_batch, W_gpu, Z, sigmoid_Z, d_silu, X_abs, d_silu_sum, grad_per_input, grad_squared
                 torch.cuda.empty_cache()
 
+        # Check if we got any valid batches
+        if total_samples == 0:
+            print(f"    ⚠️  Warning: No valid gradient batches, using uniform importance")
+            return torch.ones(in_features)
+
         # Average over batches
-        grad_squared_avg = importance_sum / max(total_samples, 1)
+        grad_squared_avg = importance_sum / total_samples
+
+        # Add small epsilon to prevent log(0) issues
+        eps = 1e-8
+        grad_squared_avg = grad_squared_avg + eps
 
         # Apply logarithmic transformation: ln(1 + g²)
         log_grad_squared = torch.log1p(grad_squared_avg)  # log1p(x) = ln(1+x)
 
         # Normalize by max: ln(1+g²)/max(ln(1+g²))
         max_val = log_grad_squared.max()
-        if max_val > 0:
+        if max_val > eps:
             grad_norm = log_grad_squared / max_val
         else:
-            grad_norm = log_grad_squared
+            # If all values are essentially zero, return uniform importance
+            grad_norm = torch.ones_like(grad_squared_avg) * 0.5
 
         # Saliency: E[1 + ln(1+g²)/max(ln(1+g²))]
         salience = 1.0 + grad_norm
