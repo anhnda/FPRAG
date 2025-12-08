@@ -143,6 +143,9 @@ class GroupWiseAWQKneeL2Quantizer:
         salience_np = salience.cpu().numpy()
         n_channels = len(salience_np)
 
+        # Clean data: replace NaN/inf with 0
+        salience_np = np.nan_to_num(salience_np, nan=0.0, posinf=0.0, neginf=0.0)
+
         # Sort in descending order
         sorted_salience = np.sort(salience_np)[::-1]
 
@@ -150,35 +153,40 @@ class GroupWiseAWQKneeL2Quantizer:
         half_point = n_channels // 2
         first_half = sorted_salience[:half_point]
 
-        # Prepare data for Kneedle
-        x = np.arange(len(first_half))
-        y = first_half
+        # Validate data for Kneedle
+        # Check if all values are the same or very close
+        if len(first_half) < 3 or np.ptp(first_half) < 1e-10:
+            # No clear knee, use median fallback
+            knee_idx = len(first_half) // 2
+            knee_threshold = first_half[knee_idx]
+        else:
+            # Prepare data for Kneedle
+            x = np.arange(len(first_half))
+            y = first_half
 
-        # Find knee point using Kneedle algorithm
-        # curve='convex' because salience decreases
-        # direction='decreasing' because we're going from high to low
-        try:
-            knee = KneeLocator(
-                x, y,
-                curve='convex',
-                direction='decreasing',
-                online=False
-            )
+            # Find knee point using Kneedle algorithm
+            # curve='convex' because salience decreases
+            # direction='decreasing' because we're going from high to low
+            try:
+                knee = KneeLocator(
+                    x, y,
+                    curve='convex',
+                    direction='decreasing',
+                    online=False
+                )
 
-            if knee.knee is not None:
-                knee_idx = knee.knee
-                knee_threshold = first_half[knee_idx]
-            else:
+                if knee.knee is not None:
+                    knee_idx = knee.knee
+                    knee_threshold = first_half[knee_idx]
+                else:
+                    # Fallback: use median of first half
+                    knee_idx = len(first_half) // 2
+                    knee_threshold = first_half[knee_idx]
+
+            except Exception as e:
                 # Fallback: use median of first half
                 knee_idx = len(first_half) // 2
                 knee_threshold = first_half[knee_idx]
-                print(f"    ⚠️  Kneedle failed, using median fallback")
-
-        except Exception as e:
-            # Fallback: use median of first half
-            knee_idx = len(first_half) // 2
-            knee_threshold = first_half[knee_idx]
-            print(f"    ⚠️  Kneedle error ({e}), using median fallback")
 
         # Create importance mask
         important_mask = salience >= knee_threshold
