@@ -234,6 +234,12 @@ class GroupWiseAWQGradientSquaredQuantizer:
         # Saliency: E[1 + ln(1+g²)/max(ln(1+g²))]
         salience = 1.0 + grad_norm
 
+        # Debug: Check if gradient importance is actually varying
+        print(f"    G² debug - min: {salience.min():.4f}, max: {salience.max():.4f}, "
+              f"std: {salience.std():.4f}, range: {(salience.max()-salience.min()):.4f}")
+        print(f"    Raw g² - min: {grad_squared_avg.min():.6f}, max: {grad_squared_avg.max():.6f}, "
+              f"ratio: {grad_squared_avg.max()/grad_squared_avg.min():.2f}x")
+
         return salience
 
     def get_salience(self, name, module):
