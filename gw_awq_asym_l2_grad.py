@@ -252,7 +252,7 @@ class GroupWiseAWQAsymmetricL2GradQuantizer:
             # s[j] = sum_i (X[i, j]² * |grad_input[i, j]|)
             x2 = x_device.pow(2)  # [N, in_features]
             grad_abs = grad_input.abs()  # [N, in_features]
-            channel_salience = (x2 * grad_abs).sum(dim=0).cpu()  # [in_features]
+            channel_salience = (x2 * grad_abs+1).sum(dim=0).cpu()  # [in_features]
 
             salience_sum += channel_salience
             total_samples += batch_size

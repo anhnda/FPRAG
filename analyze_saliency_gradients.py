@@ -193,7 +193,7 @@ class SaliencyGradientAnalyzer:
 
         return weight_grad_squared.cpu()
 
-    def analyze_top_channels(self, results, top_k=10, output_dir='./visualizations/saliency_gradient_analysis'):
+    def analyze_top_channels(self, results, top_k=10, output_dir='./visualizations/saliency_gradient_analysis', target_module=None):
         """
         Analyze top-k channels by saliency and create visualizations.
         """
@@ -216,7 +216,7 @@ class SaliencyGradientAnalyzer:
             ch_idx = ch_idx.item()
             self.visualize_channel(
                 ch_idx, rank + 1, X, pre_act, weight_gradients,
-                saliency[ch_idx].item(), output_dir
+                saliency[ch_idx].item(), output_dir, target_module
             )
 
         # Create summary statistics
@@ -225,11 +225,13 @@ class SaliencyGradientAnalyzer:
         # Create overall distribution plots
         self.plot_saliency_distribution(saliency, top_k_indices, output_dir)
 
-    def visualize_channel(self, ch_idx, rank, X, pre_act, weight_gradients, saliency_score, output_dir):
+    def visualize_channel(self, ch_idx, rank, X, pre_act, weight_gradients, saliency_score, output_dir, target_module=None):
         """
         Create visualization for a single channel showing:
         1. Sorted [X*,j]^2 (squared input contributions)
-        2. grad(w*,j)^2 (squared weight gradients)
+        2. Corresponding X values in sorted order
+        3. Sorted grad(w*,j)^2 (squared weight gradients)
+        4. Corresponding weight values in sorted order
         """
         # For channel j, we want to analyze how each input feature i contributes
         # [X*,j] means the contribution of input feature * to output channel j
@@ -243,9 +245,16 @@ class SaliencyGradientAnalyzer:
         # We'll average over tokens to get per-feature importance
         X_squared = X ** 2  # (tokens, in_features)
         X_squared_mean = torch.mean(X_squared, dim=0)  # (in_features,)
+        X_mean = torch.mean(X, dim=0)  # (in_features,) - mean of actual X values
 
         # Get weight gradients for this channel
         grad_squared = weight_gradients[ch_idx]  # (in_features,)
+
+        # Get actual weights for this channel if available
+        if target_module is not None:
+            weights = target_module.weight[ch_idx].detach().cpu()  # (in_features,)
+        else:
+            weights = None
 
         # Sort by X_squared_mean
         X_sorted_values, X_sorted_indices = torch.sort(X_squared_mean, descending=True)
@@ -253,30 +262,55 @@ class SaliencyGradientAnalyzer:
         # Sort by grad_squared
         grad_sorted_values, grad_sorted_indices = torch.sort(grad_squared, descending=True)
 
-        # Create figure with 3 subplots
-        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+        # Create figure with 2 rows, 3 columns
+        fig, axes = plt.subplots(2, 3, figsize=(18, 10))
 
-        # Plot 1: Sorted X^2
-        ax = axes[0]
+        # Plot 1 (Row 1, Col 1): Sorted X^2
+        ax = axes[0, 0]
         n_features = len(X_sorted_values)
         ax.plot(range(n_features), X_sorted_values.numpy(), linewidth=1.5, alpha=0.8)
         ax.set_xlabel('Feature Rank (sorted by X²)', fontsize=11)
         ax.set_ylabel('Mean Squared Input (X²)', fontsize=11)
-        ax.set_title(f'Rank {rank}: Channel {ch_idx}\nSorted Input Magnitudes', fontsize=12)
+        ax.set_title(f'Rank {rank}: Channel {ch_idx}\nSorted Input Magnitudes (X²)', fontsize=12)
         ax.set_yscale('log')
         ax.grid(True, alpha=0.3)
 
-        # Plot 2: Sorted grad^2
-        ax = axes[1]
+        # Plot 2 (Row 2, Col 1): Corresponding X values in sorted X² order
+        ax = axes[1, 0]
+        X_mean_sorted_by_X2 = X_mean[X_sorted_indices]
+        ax.plot(range(n_features), X_mean_sorted_by_X2.numpy(), linewidth=1.5, alpha=0.8, color='steelblue')
+        ax.set_xlabel('Feature Rank (sorted by X²)', fontsize=11)
+        ax.set_ylabel('Mean Input Value (X)', fontsize=11)
+        ax.set_title(f'Corresponding X Values\n(in X² sorted order)', fontsize=12)
+        ax.axhline(y=0, color='gray', linestyle='--', linewidth=1, alpha=0.5)
+        ax.grid(True, alpha=0.3)
+
+        # Plot 3 (Row 1, Col 2): Sorted grad^2
+        ax = axes[0, 1]
         ax.plot(range(n_features), grad_sorted_values.numpy(), linewidth=1.5, alpha=0.8, color='orangered')
         ax.set_xlabel('Weight Rank (sorted by grad²)', fontsize=11)
         ax.set_ylabel('Squared Weight Gradient', fontsize=11)
-        ax.set_title(f'Rank {rank}: Channel {ch_idx}\nSorted Weight Gradients', fontsize=12)
+        ax.set_title(f'Rank {rank}: Channel {ch_idx}\nSorted Weight Gradients (grad²)', fontsize=12)
         ax.set_yscale('log')
         ax.grid(True, alpha=0.3)
 
-        # Plot 3: Joint scatter plot
-        ax = axes[2]
+        # Plot 4 (Row 2, Col 2): Corresponding weight values in sorted grad² order
+        ax = axes[1, 1]
+        if weights is not None:
+            weights_sorted_by_grad2 = weights[grad_sorted_indices]
+            ax.plot(range(n_features), weights_sorted_by_grad2.numpy(), linewidth=1.5, alpha=0.8, color='darkred')
+            ax.set_xlabel('Weight Rank (sorted by grad²)', fontsize=11)
+            ax.set_ylabel('Weight Value (W)', fontsize=11)
+            ax.set_title(f'Corresponding Weight Values\n(in grad² sorted order)', fontsize=12)
+            ax.axhline(y=0, color='gray', linestyle='--', linewidth=1, alpha=0.5)
+            ax.grid(True, alpha=0.3)
+        else:
+            ax.text(0.5, 0.5, 'Weights not available', ha='center', va='center',
+                   transform=ax.transAxes, fontsize=12)
+            ax.axis('off')
+
+        # Plot 5 (Row 1, Col 3): Joint scatter plot
+        ax = axes[0, 2]
         # Sample points for clearer visualization
         sample_indices = np.random.choice(n_features, size=min(2000, n_features), replace=False)
         ax.scatter(
@@ -298,8 +332,33 @@ class SaliencyGradientAnalyzer:
                 transform=ax.transAxes, fontsize=10,
                 verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
 
+        # Plot 6 (Row 2, Col 3): X vs Weight correlation
+        ax = axes[1, 2]
+        if weights is not None:
+            ax.scatter(
+                X_mean[sample_indices].numpy(),
+                weights[sample_indices].numpy(),
+                alpha=0.4, s=10, c='green'
+            )
+            ax.set_xlabel('Mean Input Value (X)', fontsize=11)
+            ax.set_ylabel('Weight Value (W)', fontsize=11)
+            ax.set_title(f'X vs W Correlation', fontsize=12)
+            ax.axhline(y=0, color='gray', linestyle='--', linewidth=1, alpha=0.5)
+            ax.axvline(x=0, color='gray', linestyle='--', linewidth=1, alpha=0.5)
+            ax.grid(True, alpha=0.3)
+
+            # Add correlation coefficient
+            corr_xw, _ = spearmanr(X_mean.numpy(), weights.numpy())
+            ax.text(0.05, 0.95, f'Spearman ρ = {corr_xw:.3f}',
+                    transform=ax.transAxes, fontsize=10,
+                    verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+        else:
+            ax.text(0.5, 0.5, 'Weights not available', ha='center', va='center',
+                   transform=ax.transAxes, fontsize=12)
+            ax.axis('off')
+
         plt.suptitle(f'Channel {ch_idx} Analysis (Saliency = {saliency_score:.4f})',
-                     fontsize=14, fontweight='bold', y=1.02)
+                     fontsize=14, fontweight='bold', y=0.995)
         plt.tight_layout()
         plt.savefig(f'{output_dir}/channel_{ch_idx}_rank_{rank}.png', dpi=150, bbox_inches='tight')
         plt.close()
@@ -419,7 +478,7 @@ def main():
     )
 
     # Analyze top channels
-    analyzer.analyze_top_channels(results, top_k=top_k, output_dir=output_dir)
+    analyzer.analyze_top_channels(results, top_k=top_k, output_dir=output_dir, target_module=target_module)
 
     print("\n" + "="*60)
     print("Analysis complete!")
