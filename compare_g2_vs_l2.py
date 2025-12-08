@@ -4,7 +4,7 @@ Cross-Dataset Validation: G² vs L2 Salience
 Comprehensive evaluation to compare:
 - GW-AWQ-L2: Standard L2 salience E[X²] for all layers
 - GW-AWQ-G²: Gradient-squared salience for SiLU-followed layers
-  - SiLU layers: E[1 + g²/max(g²)] where g = ∇SiLU(XW)/∇W
+  - SiLU layers: E[1 + ln(1+g²)/max(ln(1+g²))] where g = ∇SiLU(XW)/∇W
   - Other layers: E[X²] (standard L2)
 
 Datasets tested:
@@ -48,7 +48,7 @@ class G2vsL2Validator:
         print("\nComparing:")
         print("  • L2:  E[X²] - Standard activation magnitude for ALL layers")
         print("  • G²:  HYBRID approach")
-        print("         - SiLU-followed layers: E[1 + g²/max(g²)]")
+        print("         - SiLU-followed layers: E[1 + ln(1+g²)/max(ln(1+g²))]")
         print("           where g = ∇SiLU(XW)/∇W (gradient-based)")
         print("         - Other layers: E[X²] (standard)")
         print("="*80)
@@ -296,7 +296,8 @@ class G2vsL2Validator:
             print(f"\n   Key Benefits:")
             print(f"     • Gradient-aware quantization for SiLU layers")
             print(f"     • Captures output sensitivity: g = ∇SiLU(XW)/∇W")
-            print(f"     • E[1 + g²/max(g²)] importance scoring")
+            print(f"     • E[1 + ln(1+g²)/max(ln(1+g²))] importance scoring")
+            print(f"     • Log transformation compresses dynamic range")
             print(f"     • Prevents 'dead neuron resurrection' from quantization noise")
             winner = "G² (Gradient)"
         elif l2_wins > g2_wins:
@@ -330,9 +331,9 @@ class G2vsL2Validator:
 
         print("\nG² (Gradient):")
         print("  Salience:")
-        print("    - SiLU layers: E[1 + g²/max(g²)] where g = ∇SiLU(XW)/∇W")
+        print("    - SiLU layers: E[1 + ln(1+g²)/max(ln(1+g²))] where g = ∇SiLU(XW)/∇W")
         print("    - Other layers: E[X²] (standard)")
-        print("  Pros:  Output-sensitive, handles risky dead neurons")
+        print("  Pros:  Output-sensitive, log compression, handles risky dead neurons")
         print("  Cons:  More complex, requires gradient computation")
 
         print("\nKey Insight:")
@@ -384,7 +385,7 @@ class G2vsL2Validator:
             f.write("## Comparison\n\n")
             f.write("- **L2 (Standard)**: E[X²] - Standard activation magnitude for all layers\n")
             f.write("- **G² (Gradient)**: Hybrid approach\n")
-            f.write("  - SiLU-followed layers: E[1 + g²/max(g²)] where g = ∇SiLU(XW)/∇W\n")
+            f.write("  - SiLU-followed layers: E[1 + ln(1+g²)/max(ln(1+g²))] where g = ∇SiLU(XW)/∇W\n")
             f.write("  - Other layers: E[X²] (standard)\n\n")
             f.write("## Results\n\n")
             f.write("| Dataset | L2 (Standard) | G² (Gradient) | Delta | Winner |\n")
@@ -401,7 +402,8 @@ class G2vsL2Validator:
                 f.write("The gradient-squared approach successfully:\n")
                 f.write("- Detects output-sensitive channels via ∇SiLU(XW)/∇W\n")
                 f.write("- Prevents 'dead neuron resurrection' from quantization noise\n")
-                f.write("- Uses E[1 + g²/max(g²)] to prioritize risky channels\n\n")
+                f.write("- Uses E[1 + ln(1+g²)/max(ln(1+g²))] to prioritize risky channels\n")
+                f.write("- Logarithmic transformation compresses dynamic range\n\n")
                 f.write("This validates the theoretical advantage of gradient-based importance scoring.\n")
             elif analysis['l2_wins'] > analysis['g2_wins']:
                 f.write("✅ **Standard L2 proves sufficient for this model**\n\n")

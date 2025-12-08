@@ -8,8 +8,8 @@ Key Difference from gw_awq_asym_l2.py:
 Algorithm:
 For layers followed by SiLU:
 1. Compute gradients g of SiLU output w.r.t. weight W
-2. Normalize: g_norm² = g²/max(g²)
-3. Saliency per channel: s[j] = E[1 + g_norm²[j]]
+2. Normalize: g_norm = ln(1+g²)/max(ln(1+g²))
+3. Saliency per channel: s[j] = E[1 + g_norm[j]]
 
 For layers NOT followed by SiLU:
 1. Use AWQ-style: s[j] = E[X[:, j]²] (L2 activation magnitude)
@@ -37,7 +37,7 @@ class GroupWiseAWQGradientSquaredQuantizer:
     Group-Wise AWQ with Gradient-Squared (G²) Saliency for SiLU-followed layers.
 
     Key Features:
-    - Gradient-based saliency for layers followed by SiLU: E[1 + g²/max(g²)]
+    - Gradient-based saliency for layers followed by SiLU: E[1 + ln(1+g²)/max(ln(1+g²))]
     - AWQ-style saliency for other layers: E[X²] (L2)
     - Grid search for optimal scaling exponent α
     - GROUP-WISE ASYMMETRIC INT4 quantization [0, 15]
@@ -65,7 +65,7 @@ class GroupWiseAWQGradientSquaredQuantizer:
         print(f"  Group size: {group_size}")
         print(f"  Quantization: GROUP-WISE ASYMMETRIC [0, 15]")
         print(f"  Salience metric:")
-        print(f"    - SiLU-followed layers: E[1 + g²/max(g²)] (gradient-based)")
+        print(f"    - SiLU-followed layers: E[1 + ln(1+g²)/max(ln(1+g²))] (gradient-based)")
         print(f"    - Other layers: E[X²] (AWQ L2-style)")
         print(f"  Detected {len(self.silu_followed_layers)} SiLU-followed layers")
 
@@ -158,8 +158,8 @@ class GroupWiseAWQGradientSquaredQuantizer:
            b. Apply SiLU: Y = SiLU(Z) = Z * sigmoid(Z)
            c. Compute gradient: g = dY/dW for each weight
            d. Accumulate g² per channel
-        2. Normalize: g_norm² = g²/max(g²)
-        3. Saliency: s[j] = E[1 + g_norm²[j]]
+        2. Normalize: g_norm = ln(1+g²)/max(ln(1+g²))
+        3. Saliency: s[j] = E[1 + g_norm[j]]
 
         Args:
             name: Layer name
@@ -221,15 +221,18 @@ class GroupWiseAWQGradientSquaredQuantizer:
         # Average over samples
         grad_squared_avg = grad_squared_sum / max(total_samples, 1)
 
-        # Normalize by max
-        max_val = grad_squared_avg.max()
-        if max_val > 0:
-            grad_norm_squared = grad_squared_avg / max_val
-        else:
-            grad_norm_squared = grad_squared_avg
+        # Apply logarithmic transformation: ln(1 + g²)
+        log_grad_squared = torch.log1p(grad_squared_avg)  # log1p(x) = ln(1+x)
 
-        # Saliency: E[1 + g²/max(g²)]
-        salience = 1.0 + grad_norm_squared
+        # Normalize by max: ln(1+g²)/max(ln(1+g²))
+        max_val = log_grad_squared.max()
+        if max_val > 0:
+            grad_norm = log_grad_squared / max_val
+        else:
+            grad_norm = log_grad_squared
+
+        # Saliency: E[1 + ln(1+g²)/max(ln(1+g²))]
+        salience = 1.0 + grad_norm
 
         return salience
 
@@ -471,8 +474,8 @@ class GroupWiseAWQGradientSquaredQuantizer:
         print("Method:")
         print("  For SiLU-followed layers:")
         print("    1. Compute gradients g of SiLU output w.r.t. weight W")
-        print("    2. Normalize: g_norm² = g²/max(g²)")
-        print("    3. Saliency: s[j] = E[1 + g_norm²[j]]")
+        print("    2. Normalize: g_norm = ln(1+g²)/max(ln(1+g²))")
+        print("    3. Saliency: s[j] = E[1 + g_norm[j]]")
         print("  For other layers:")
         print("    1. AWQ-style saliency: s[j] = E[X[:, j]²]")
         print("  Then for all layers:")
@@ -578,8 +581,8 @@ def main():
     print("Algorithm:")
     print("  SiLU-followed layers:")
     print("    1. Compute gradients g of SiLU(XW) w.r.t. W")
-    print("    2. Normalize: g²/max(g²)")
-    print("    3. Saliency: s[j] = E[1 + g²/max(g²)]")
+    print("    2. Normalize: ln(1+g²)/max(ln(1+g²))")
+    print("    3. Saliency: s[j] = E[1 + ln(1+g²)/max(ln(1+g²))]")
     print("  Other layers:")
     print("    1. AWQ-style: s[j] = E[X[:, j]²]")
     print("  All layers:")
