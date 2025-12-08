@@ -51,9 +51,8 @@ class GroupWiseAWQGradientSquaredQuantizer:
         self.n_grid = n_grid
         self.group_size = group_size
 
-        # Storage for activations and gradients
+        # Storage for activations
         self.activation_data = {}
-        self.gradient_data = {}
         self.hooks = []
         self.layer_scales = {}
 
@@ -95,11 +94,8 @@ class GroupWiseAWQGradientSquaredQuantizer:
 
         return silu_layers
 
-    def register_hooks(self, compute_gradients=False):
-        """
-        Register forward hooks to capture activations.
-        If compute_gradients=True, also capture inputs for gradient computation.
-        """
+    def register_hooks(self):
+        """Register forward hooks to capture activations."""
         def get_hook(name):
             def hook(module, input, output):
                 if name not in self.activation_data:
@@ -111,23 +107,6 @@ class GroupWiseAWQGradientSquaredQuantizer:
 
                 # Store on CPU to save GPU memory
                 self.activation_data[name].append(inp.cpu())
-
-                # If this layer is followed by SiLU and we need gradients
-                if compute_gradients and name in self.silu_followed_layers:
-                    if name not in self.gradient_data:
-                        self.gradient_data[name] = []
-
-                    # Store on CPU to save memory - we'll process on GPU in batches later
-                    if isinstance(input, tuple):
-                        inp_cpu = input[0].detach().cpu()
-                    else:
-                        inp_cpu = input.detach().cpu()
-
-                    self.gradient_data[name].append({
-                        'input': inp_cpu,
-                        'weight': module.weight.detach().cpu().clone(),
-                        'bias': module.bias.detach().cpu().clone() if module.bias is not None else None
-                    })
 
             return hook
 
@@ -169,7 +148,7 @@ class GroupWiseAWQGradientSquaredQuantizer:
         salience = salience_sum / total_samples
         return salience
 
-    def compute_gradient_salience(self, name):
+    def compute_gradient_salience(self, name, module):
         """
         Compute gradient-based saliency for SiLU-followed layers.
 
@@ -182,25 +161,29 @@ class GroupWiseAWQGradientSquaredQuantizer:
         2. Normalize: g_norm² = g²/max(g²)
         3. Saliency: s[j] = E[1 + g_norm²[j]]
 
+        Args:
+            name: Layer name
+            module: The linear module (to get W and b)
+
         Returns:
             Tensor of shape [in_features]
         """
-        if name not in self.gradient_data or len(self.gradient_data[name]) == 0:
+        if name not in self.activation_data or len(self.activation_data[name]) == 0:
             return None
 
-        grad_list = self.gradient_data[name]
-        in_features = grad_list[0]['weight'].shape[1]
+        X_list = self.activation_data[name]
+        in_features = module.weight.shape[1]
+
+        # Get weight and bias from module (no need to store separately!)
+        W = module.weight.data.cpu()  # [out_features, in_features]
+        b = module.bias.data.cpu() if module.bias is not None else None
 
         # Accumulate squared gradients per input channel ON CPU
         grad_squared_sum = torch.zeros(in_features)
         total_samples = 0
 
-        for data in tqdm(grad_list, desc=f"Computing gradients for {name}", leave=False):
-            # Keep data on CPU, compute in small batches
-            X = data['input']  # Already on CPU: [batch, in_features]
-            W = data['weight']  # Already on CPU: [out_features, in_features]
-            b = data['bias'] if data['bias'] is not None else None
-
+        for X in tqdm(X_list, desc=f"Computing gradients for {name}", leave=False):
+            # X is already on CPU: [batch, in_features]
             # Process in small batches on GPU to avoid OOM
             batch_size = min(32, X.shape[0])
             for start_idx in range(0, X.shape[0], batch_size):
@@ -248,9 +231,13 @@ class GroupWiseAWQGradientSquaredQuantizer:
 
         return salience
 
-    def get_salience(self, name):
+    def get_salience(self, name, module):
         """
         Get saliency for a layer based on whether it's followed by SiLU.
+
+        Args:
+            name: Layer name
+            module: The linear module
 
         Returns:
             Tensor of shape [in_features]
@@ -258,14 +245,7 @@ class GroupWiseAWQGradientSquaredQuantizer:
         if name in self.silu_followed_layers:
             # Use gradient-based saliency
             print(f"  Computing G² saliency for SiLU-followed layer: {name}")
-            salience = self.compute_gradient_salience(name)
-
-            # Clear gradient data for this layer immediately after use
-            if name in self.gradient_data:
-                del self.gradient_data[name]
-                torch.cuda.empty_cache()
-
-            return salience
+            return self.compute_gradient_salience(name, module)
         else:
             # Use AWQ-style activation saliency
             return self.get_activation_salience_awq(name)
@@ -344,7 +324,7 @@ class GroupWiseAWQGradientSquaredQuantizer:
             return torch.ones(in_features).to(self.device), 0.0, 0.0
 
         # Get salience (either gradient-based or AWQ-style)
-        salience = self.get_salience(name)
+        salience = self.get_salience(name, module)
         if salience is None:
             in_features = module.weight.shape[1]
             return torch.ones(in_features).to(self.device), 0.0, 0.0
@@ -453,13 +433,11 @@ class GroupWiseAWQGradientSquaredQuantizer:
         torch.cuda.empty_cache()
 
     def calibrate(self, calibration_data, n_samples=500):
-        """Run calibration on the dataset to collect activations and gradients."""
+        """Run calibration on the dataset to collect activations."""
         print(f"\nCalibrating with {min(n_samples, len(calibration_data))} samples...")
+        print("Collecting activations for all layers...")
         self.model.eval()
-
-        # First pass: collect activations for all layers
-        print("Pass 1: Collecting activations...")
-        self.register_hooks(compute_gradients=False)
+        self.register_hooks()
 
         successful = 0
         for i, text in enumerate(tqdm(calibration_data[:n_samples], desc="Calibration")):
@@ -479,36 +457,9 @@ class GroupWiseAWQGradientSquaredQuantizer:
                 continue
 
         self.remove_hooks()
-
-        # Second pass: collect gradient data for SiLU-followed layers
-        if len(self.silu_followed_layers) > 0:
-            print(f"\nPass 2: Collecting gradient data for {len(self.silu_followed_layers)} SiLU-followed layers...")
-            self.register_hooks(compute_gradients=True)
-
-            successful_grad = 0
-            # Use fewer samples for gradient computation (memory intensive)
-            n_grad_samples = min(64, n_samples)  # Reduced from 128 to save memory
-            for i, text in enumerate(tqdm(calibration_data[:n_grad_samples], desc="Gradient calibration")):
-                try:
-                    inputs = self.tokenizer(text, return_tensors="pt",
-                                           truncation=True, max_length=512)
-                    inputs = {k: v.to(self.device) for k, v in inputs.items()}
-
-                    # We don't need actual backward pass, just store forward pass data
-                    with torch.no_grad():
-                        _ = self.model(**inputs, use_cache=False, return_dict=True)
-
-                    successful_grad += 1
-
-                except Exception as e:
-                    if i % 50 == 0 and i > 0:
-                        print(f"\nNote: Some gradient samples skipped")
-                    continue
-
-            self.remove_hooks()
-            print(f"Gradient calibration complete! Processed {successful_grad}/{n_grad_samples} samples")
-
         print(f"Calibration complete! Successfully processed {successful}/{n_samples} samples")
+        print(f"  - {len(self.silu_followed_layers)} layers will use G² saliency")
+        print(f"  - {len([n for n, m in self.model.named_modules() if isinstance(m, nn.Linear)]) - len(self.silu_followed_layers)} layers will use AWQ L2 saliency")
 
     def quantize_model(self):
         """Quantize all linear layers using Group-Wise AWQ with G² Saliency."""
@@ -552,7 +503,6 @@ class GroupWiseAWQGradientSquaredQuantizer:
                 # Clear activation data immediately after quantizing
                 if name in self.activation_data:
                     del self.activation_data[name]
-                # gradient_data is already cleared in get_salience()
 
                 # More frequent cache clearing
                 if quantized_count % 5 == 0 and torch.cuda.is_available():
@@ -583,7 +533,6 @@ class GroupWiseAWQGradientSquaredQuantizer:
                 print(f"  Other layers (AWQ) - Mean: {np.mean(awq_alphas):.3f}, Median: {np.median(awq_alphas):.3f}")
 
         self.activation_data = {}
-        self.gradient_data = {}
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -637,9 +586,10 @@ def main():
     print(f"    4. GROUP-WISE ASYMMETRIC INT4 quantization [0, 15] (group_size={args.group_size})")
     print("    5. Descaling: W_final = Q(W*s) / s")
     print("\nMemory Optimization:")
-    print("  - Gradient computation done in CPU batches")
+    print("  - No duplicate storage: reuses activation_data for gradient computation")
+    print("  - Gradient computation done in small GPU batches")
     print("  - Aggressive memory clearing after each layer")
-    print("  - If OOM occurs, set: PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True")
+    print("  - If OOM still occurs, set: PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True")
     print("=" * 80)
     print(f"Device: {device}")
     print(f"Model: {model_name}")
