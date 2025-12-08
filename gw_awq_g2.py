@@ -178,8 +178,8 @@ class GroupWiseAWQGradientSquaredQuantizer:
         W = module.weight.data.cpu()  # [out_features, in_features]
         b = module.bias.data.cpu() if module.bias is not None else None
 
-        # Accumulate squared gradients per input channel ON CPU
-        grad_squared_sum = torch.zeros(in_features)
+        # Accumulate L2-normalized gradient importance per channel
+        importance_sum = torch.zeros(in_features)
         total_samples = 0
 
         for X in tqdm(X_list, desc=f"Computing gradients for {name}", leave=False):
@@ -210,26 +210,24 @@ class GroupWiseAWQGradientSquaredQuantizer:
                 # grad_per_input[j] = sum_i |x_i[j] * d_silu[i]|
                 grad_per_input = (X_abs * d_silu_sum).sum(dim=0)  # [in_features]
 
-                # Clip to prevent overflow when squaring
-                grad_per_input = torch.clamp(grad_per_input, max=1e4)
+                # L2 normalize per batch to prevent overflow
+                grad_norm = grad_per_input.norm()
+                if grad_norm > 0:
+                    grad_per_input = grad_per_input / grad_norm
+
+                # Square the normalized values (now safe from overflow)
+                grad_squared = grad_per_input.pow(2)
 
                 # Move to CPU and accumulate
-                grad_squared_sum += grad_per_input.pow(2).cpu()
-                total_samples += X_batch.shape[0]
+                importance_sum += grad_squared.cpu()
+                total_samples += 1  # Count batches, not samples
 
                 # Clear GPU memory
-                del X_batch, W_gpu, Z, sigmoid_Z, d_silu, X_abs, d_silu_sum, grad_per_input
+                del X_batch, W_gpu, Z, sigmoid_Z, d_silu, X_abs, d_silu_sum, grad_per_input, grad_squared
                 torch.cuda.empty_cache()
 
-        # Average over samples
-        grad_squared_avg = grad_squared_sum / max(total_samples, 1)
-
-        # Handle NaN/inf values - replace with median
-        valid_mask = torch.isfinite(grad_squared_avg)
-        if not valid_mask.all():
-            median_val = grad_squared_avg[valid_mask].median() if valid_mask.any() else 1.0
-            grad_squared_avg = torch.where(valid_mask, grad_squared_avg, median_val)
-            print(f"    ⚠️  Warning: {(~valid_mask).sum()} channels had inf/nan, replaced with median")
+        # Average over batches
+        grad_squared_avg = importance_sum / max(total_samples, 1)
 
         # Apply logarithmic transformation: ln(1 + g²)
         log_grad_squared = torch.log1p(grad_squared_avg)  # log1p(x) = ln(1+x)
@@ -245,10 +243,12 @@ class GroupWiseAWQGradientSquaredQuantizer:
         salience = 1.0 + grad_norm
 
         # Debug: Check if gradient importance is actually varying
-        print(f"    G² debug - min: {salience.min():.4f}, max: {salience.max():.4f}, "
-              f"std: {salience.std():.4f}, range: {(salience.max()-salience.min()):.4f}")
-        print(f"    Raw g² - min: {grad_squared_avg.min():.6f}, max: {grad_squared_avg.max():.6f}, "
-              f"ratio: {grad_squared_avg.max()/grad_squared_avg.min():.2f}x")
+        min_val, max_val = grad_squared_avg.min(), grad_squared_avg.max()
+        ratio = max_val / min_val if min_val > 0 else float('inf')
+        print(f"    G² stats - salience: [{salience.min():.4f}, {salience.max():.4f}], "
+              f"std={salience.std():.4f}, range={salience.max()-salience.min():.4f}")
+        print(f"    Raw g²   - [{min_val:.6f}, {max_val:.6f}], ratio={ratio:.2f}x, "
+              f"std={grad_squared_avg.std():.6f}")
 
         return salience
 
