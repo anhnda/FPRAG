@@ -210,6 +210,9 @@ class GroupWiseAWQGradientSquaredQuantizer:
                 # grad_per_input[j] = sum_i |x_i[j] * d_silu[i]|
                 grad_per_input = (X_abs * d_silu_sum).sum(dim=0)  # [in_features]
 
+                # Clip to prevent overflow when squaring
+                grad_per_input = torch.clamp(grad_per_input, max=1e4)
+
                 # Move to CPU and accumulate
                 grad_squared_sum += grad_per_input.pow(2).cpu()
                 total_samples += X_batch.shape[0]
@@ -220,6 +223,13 @@ class GroupWiseAWQGradientSquaredQuantizer:
 
         # Average over samples
         grad_squared_avg = grad_squared_sum / max(total_samples, 1)
+
+        # Handle NaN/inf values - replace with median
+        valid_mask = torch.isfinite(grad_squared_avg)
+        if not valid_mask.all():
+            median_val = grad_squared_avg[valid_mask].median() if valid_mask.any() else 1.0
+            grad_squared_avg = torch.where(valid_mask, grad_squared_avg, median_val)
+            print(f"    ⚠️  Warning: {(~valid_mask).sum()} channels had inf/nan, replaced with median")
 
         # Apply logarithmic transformation: ln(1 + g²)
         log_grad_squared = torch.log1p(grad_squared_avg)  # log1p(x) = ln(1+x)
