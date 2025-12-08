@@ -252,7 +252,7 @@ class SaliencyGradientAnalyzer:
 
         # Get actual weights for this channel if available
         if target_module is not None:
-            weights = target_module.weight[ch_idx].detach().cpu()  # (in_features,)
+            weights = target_module.weight[ch_idx].detach().cpu().float()  # (in_features,) - convert to float32
         else:
             weights = None
 
