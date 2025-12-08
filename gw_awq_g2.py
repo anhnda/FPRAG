@@ -183,12 +183,14 @@ class GroupWiseAWQGradientSquaredQuantizer:
         total_samples = 0
 
         for X in tqdm(X_list, desc=f"Computing gradients for {name}", leave=False):
-            # X is already on CPU: [batch, in_features]
+            # X is on CPU and might be [batch, seq_len, hidden] - flatten it
+            X_flat = X.reshape(-1, X.shape[-1])  # [batch * seq_len, in_features]
+
             # Process in small batches on GPU to avoid OOM
-            batch_size = min(32, X.shape[0])
-            for start_idx in range(0, X.shape[0], batch_size):
-                end_idx = min(start_idx + batch_size, X.shape[0])
-                X_batch = X[start_idx:end_idx].to(self.device)
+            batch_size = min(32, X_flat.shape[0])
+            for start_idx in range(0, X_flat.shape[0], batch_size):
+                end_idx = min(start_idx + batch_size, X_flat.shape[0])
+                X_batch = X_flat[start_idx:end_idx].to(self.device)
 
                 # Forward pass
                 W_gpu = W.to(self.device)
