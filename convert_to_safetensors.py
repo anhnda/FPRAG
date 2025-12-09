@@ -113,6 +113,52 @@ def convert_to_safetensors(model_path, output_dir):
     tokenizer.save_pretrained(output_dir)
     print(f"✅ Saved tokenizer to {output_dir}")
 
+    # Copy custom modeling files if they exist
+    print("\nCopying custom modeling files...")
+    try:
+        import glob
+        import shutil
+        from pathlib import Path
+
+        # Find the cached model directory
+        # HuggingFace caches models in ~/.cache/huggingface/hub/models--{org}--{model}/snapshots/{hash}/
+        cache_dir = Path.home() / ".cache" / "huggingface" / "hub"
+
+        # Search for the model cache directory
+        model_cache_pattern = model_path.replace("/", "--")
+        model_dirs = list(cache_dir.glob(f"models--{model_cache_pattern}"))
+
+        if model_dirs:
+            # Get the latest snapshot
+            snapshot_dirs = list(model_dirs[0].glob("snapshots/*"))
+            if snapshot_dirs:
+                source_dir = snapshot_dirs[0]  # Use first (usually only one)
+
+                # Copy all Python files (custom modeling code)
+                python_files = list(source_dir.glob("*.py"))
+                copied_count = 0
+                for py_file in python_files:
+                    dest_file = os.path.join(output_dir, py_file.name)
+                    shutil.copy(py_file, dest_file)
+                    print(f"  ✅ Copied {py_file.name}")
+                    copied_count += 1
+
+                if copied_count == 0:
+                    print("  ℹ️  No custom Python files found (model may not need them)")
+            else:
+                print("  ⚠️  No snapshot found in cache")
+        else:
+            print(f"  ℹ️  Model cache not found, checking if model uses custom code...")
+            # If model doesn't use custom code, this is fine
+            if hasattr(model.config, 'auto_map'):
+                print("  ⚠️  Model requires custom code but cache not accessible")
+            else:
+                print("  ✅ Model doesn't require custom code")
+
+    except Exception as e:
+        print(f"  ⚠️  Could not copy custom files: {e}")
+        # Not critical, continue anyway
+
     # Verify the saved files
     print("\n" + "=" * 80)
     print("Verifying saved files...")
