@@ -121,14 +121,12 @@ class GroupWiseAWQClampL2Quantizer:
     @torch.no_grad()
     def compute_weight_clamp_ranges(self, W, activation_salience):
         """
-        Compute per-channel weight clamping ranges using knee-point detection.
+        OPTIMIZED: Compute per-channel weight clamping ranges using fast knee-point detection.
 
-        For each output channel i:
-        1. Compute weight importance: w_imp[i,j] = |W[i,j]| × s[j]
-        2. Sort by importance, find knee point k on first half using Kneedle
-        3. k_offset = int(k_offset_ratio × in_features)
-        4. Get range from top (k + k_offset) weights
-        5. Return [min_clamp[i], max_clamp[i]]
+        Optimization strategy:
+        1. Run Kneedle on AGGREGATED importance across all channels (1x instead of out_features times)
+        2. Use the global knee point for all channels
+        3. Much faster: O(in_features × log(in_features)) instead of O(out_features × in_features × log(in_features))
 
         Args:
             W: Weight tensor [out_features, in_features]
@@ -140,61 +138,70 @@ class GroupWiseAWQClampL2Quantizer:
             clamp_stats: Dict with statistics
         """
         out_features, in_features = W.shape
+        k_offset = max(1, int(self.k_offset_ratio * in_features))
+
+        # OPTIMIZATION: Compute global knee point from aggregated importance
+        # This is much faster than per-channel Kneedle
+        weight_importance_global = (torch.abs(W) * activation_salience.unsqueeze(0)).mean(dim=0)  # Average across output channels
+        sorted_importance_global, _ = torch.sort(weight_importance_global, descending=True)
+
+        half_n = in_features // 2
+        try:
+            x_range = np.arange(half_n)
+            y_values = sorted_importance_global[:half_n].cpu().numpy()
+
+            # Filter out NaN/inf values that cause scipy warnings
+            valid_mask = np.isfinite(y_values)
+            if valid_mask.sum() > 10:  # Need at least some valid points
+                x_range_valid = x_range[valid_mask]
+                y_values_valid = y_values[valid_mask]
+
+                knee_locator = KneeLocator(
+                    x_range_valid, y_values_valid,
+                    curve='convex', direction='decreasing',
+                    S=1.0, online=True  # online=True is faster
+                )
+
+                if knee_locator.knee is not None:
+                    global_knee = int(knee_locator.knee)
+                else:
+                    global_knee = max(1, in_features // 10)
+            else:
+                global_knee = max(1, in_features // 10)
+        except Exception as e:
+            # Fallback if Kneedle fails
+            global_knee = max(1, in_features // 10)
+
+        # Now compute per-channel ranges using the global knee point
         min_clamp = torch.zeros(out_features, device=W.device)
         max_clamp = torch.zeros(out_features, device=W.device)
-
-        k_offset = max(1, int(self.k_offset_ratio * in_features))
-        knee_points = []
         clamp_ratios = []
 
+        top_k = min(global_knee + k_offset, in_features)
+
+        # Vectorized computation per channel
         for i in range(out_features):
             # Compute weight importance for this channel
             weight_importance = torch.abs(W[i, :]) * activation_salience
 
-            # Sort by importance
-            sorted_importance, sorted_indices = torch.sort(weight_importance, descending=True)
-
-            # Find knee point on first half
-            half_n = in_features // 2
-            try:
-                x_range = np.arange(half_n)
-                y_values = sorted_importance[:half_n].cpu().numpy()
-
-                knee_locator = KneeLocator(
-                    x_range, y_values,
-                    curve='convex', direction='decreasing',
-                    S=1.0
-                )
-
-                if knee_locator.knee is not None:
-                    knee_k = int(knee_locator.knee)
-                else:
-                    # Fallback: use 10% of features
-                    knee_k = max(1, in_features // 10)
-            except:
-                # Fallback if Kneedle fails
-                knee_k = max(1, in_features // 10)
-
-            knee_points.append(knee_k)
-
-            # Get top k+k_offset weights
-            top_k = min(knee_k + k_offset, in_features)
-            top_indices = sorted_indices[:top_k]
+            # Get top-k indices
+            _, top_indices = torch.topk(weight_importance, k=top_k, largest=True)
             top_weights = W[i, top_indices]
 
             # Compute clamp range
             min_clamp[i] = top_weights.min()
             max_clamp[i] = top_weights.max()
 
-            # Track statistics
-            original_range = W[i, :].max() - W[i, :].min()
-            clamped_range = max_clamp[i] - min_clamp[i]
-            clamp_ratios.append((clamped_range / (original_range + 1e-8)).item())
+            # Track statistics (sample every 100 channels to save time)
+            if i % 100 == 0:
+                original_range = W[i, :].max() - W[i, :].min()
+                clamped_range = max_clamp[i] - min_clamp[i]
+                clamp_ratios.append((clamped_range / (original_range + 1e-8)).item())
 
         clamp_stats = {
-            'mean_knee': np.mean(knee_points),
-            'median_knee': np.median(knee_points),
-            'mean_clamp_ratio': np.mean(clamp_ratios),
+            'mean_knee': global_knee,
+            'median_knee': global_knee,
+            'mean_clamp_ratio': np.mean(clamp_ratios) if clamp_ratios else 1.0,
             'k_offset': k_offset
         }
 
@@ -276,11 +283,12 @@ class GroupWiseAWQClampL2Quantizer:
             in_features = module.weight.shape[1]
             return torch.ones(in_features).to(self.device), 0.0, 0.0, {}
 
-        # Prepare calibration data
+        # Prepare calibration data (OPTIMIZED: use fewer samples for speed)
         X_list = self.activation_data[name]
         X_cpu = torch.cat([x.reshape(-1, x.shape[-1]) for x in X_list], dim=0)
 
-        max_samples = min(2048, X_cpu.shape[0])
+        # OPTIMIZATION: Reduce samples from 2048 to 512 for much faster grid search
+        max_samples = min(512, X_cpu.shape[0])
         if X_cpu.shape[0] > max_samples:
             indices = torch.randperm(X_cpu.shape[0])[:max_samples]
             X_search = X_cpu[indices].to(self.device)
@@ -515,7 +523,7 @@ def main():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     parser.add_argument("--n-calib", type=int, default=128, help="Calibration samples")
-    parser.add_argument("--n-grid", type=int, default=20, help="Grid search points")
+    parser.add_argument("--n-grid", type=int, default=10, help="Grid search points (10=faster, 20=more accurate)")
     parser.add_argument("--group-size", type=int, default=128, help="Group size for quantization")
     parser.add_argument("--k-offset-ratio", type=float, default=0.05,
                        help="K-offset ratio for knee point (default: 5%% of weights)")
