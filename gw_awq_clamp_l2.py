@@ -1,24 +1,31 @@
 """
-Group-Wise AWQ Implementation with ASYMMETRIC Quantization + L2 Salience + Knee-Point Weight Clamping
+Group-Wise AWQ Implementation with ASYMMETRIC Quantization + L2 Salience + Knee-Point Weight Clamping (v3)
 
 Key Difference from gw_awq_asym_l2.py:
 - gw_awq_asym_l2.py: No weight clamping, uses full weight range
 - gw_awq_clamp_l2.py: Uses Kneedle algorithm to find knee point in sorted E[X²] importance,
-                       then clamps weights to the range of top-k+k_offset important weights
+                       then clamps weights to range of top important weights (capped at 35%)
 
-Algorithm:
+Algorithm (v3 - CAPPED PERCENTILE):
 1. Compute per-input-channel salience: s[j] = E[X[:, j]²] (L2 norm)
-2. For each output channel:
-   a. Compute per-weight importance: w_imp[i,j] = |W[i,j]| × s[j]
-   b. Sort weights by importance and find knee point k on first half (Kneedle)
-   c. Compute k_offset = int(k_offset_ratio × num_weights) (default: 5%)
-   d. Get weight range: [min(W_top), max(W_top)] where W_top = top (k+k_offset) weights
-   e. Clamp all weights in channel to this range
+2. For each layer (global knee detection, NOT per-channel):
+   a. Compute weight importance: w_imp[i,j] = |W[i,j]| × s[j]
+   b. Aggregate importance across output channels (mean)
+   c. Sort by importance and find knee k on FULL curve (Kneedle with S=1.5)
+   d. Cap knee: k_capped = min(k, 0.35 × num_weights) to ensure clamping has effect
+   e. Compute k_offset = int(k_offset_ratio × num_weights) (default: 0%)
+   f. Get weight range per channel: [min(W_top), max(W_top)] where W_top = top (k_capped+k_offset) weights
+   g. Clamp all weights in each channel to their respective range
 3. Grid search for optimal α ∈ [0, 1]
 4. Scale weight COLUMNS: W[:, j] *= s[j]^α
 5. Quantize with GROUP-WISE ASYMMETRIC scales
    - Per group: scale = (max - min) / 15, zero_point = round(-min / scale)
 6. Divide by input scales: W_final = Q(W*s) / s
+
+Key Innovation (v3):
+- Capped percentile approach prevents clamp_ratio = 1.0 (no effect)
+- Balances adaptive knee detection with guaranteed range reduction
+- Default cap at 35% ensures top weights don't span full range
 """
 
 import torch
@@ -124,16 +131,18 @@ class GroupWiseAWQClampL2Quantizer:
         """
         OPTIMIZED: Compute per-channel weight clamping ranges using fast knee-point detection.
 
-        NEW APPROACH (v2 - SECOND HALF KNEE):
+        NEW APPROACH (v3 - CAPPED PERCENTILE):
         1. Sort weights by importance (descending)
-        2. Find knee on SECOND HALF (indices half_n to end, where importance → 0)
-        3. Clamp from BEGINNING TO KNEE (the important weights)
-        4. Ignore unimportant tail after knee
+        2. Find knee on FULL curve (where steep drop transitions to flat)
+        3. Cap knee at max_knee_ratio (default: 35%) to ensure clamping has effect
+        4. Clamp from BEGINNING TO CAPPED_KNEE (the important weights)
+        5. Ignore unimportant tail after knee
 
         Rationale:
-        - Knee in 2nd half marks where importance flattens to near-zero
-        - Only preserve range of important weights (beginning to knee)
-        - Tail weights are insignificant, so ignore them
+        - Knee detection is adaptive to the actual importance distribution
+        - Capping prevents including too many weights (which would span full range → no effect)
+        - Ensures clamp_ratio < 1.0 (actual range reduction)
+        - Balances adaptive detection with guaranteed quantization benefit
 
         Optimization:
         - Run Kneedle once on aggregated importance (all channels)
@@ -157,15 +166,14 @@ class GroupWiseAWQClampL2Quantizer:
         weight_importance_global = (torch.abs(W) * activation_salience.unsqueeze(0)).mean(dim=0)  # Average across output channels
         sorted_importance_global, _ = torch.sort(weight_importance_global, descending=True)
 
-        # NEW: Find knee on SECOND HALF (where importance flattens to ~0)
-        half_n = in_features // 2
-        second_half_start = half_n
-        second_half_len = in_features - second_half_start
+        # STRATEGY: Find knee on FULL curve, but cap at max_knee_ratio to ensure clamping has effect
+        # This balances between adaptive knee detection and guaranteed range reduction
+        max_knee_ratio = 0.35  # Cap knee at 35% of features (ensures top weights don't span full range)
 
         try:
-            # Use SECOND HALF for knee detection
-            x_range = np.arange(second_half_len) + second_half_start  # Offset to actual indices
-            y_values = sorted_importance_global[second_half_start:].cpu().numpy()
+            # Use FULL curve for knee detection (more reliable than second-half only)
+            x_range = np.arange(in_features)
+            y_values = sorted_importance_global.cpu().numpy()
 
             # Filter out NaN/inf values
             valid_mask = np.isfinite(y_values)
@@ -176,19 +184,22 @@ class GroupWiseAWQClampL2Quantizer:
                 knee_locator = KneeLocator(
                     x_range_valid, y_values_valid,
                     curve='convex', direction='decreasing',
-                    S=1.0, online=True
+                    S=1.5,  # Slightly more sensitive (lower = earlier detection, higher = later detection)
+                    online=True
                 )
 
                 if knee_locator.knee is not None:
-                    global_knee = int(knee_locator.knee)
+                    detected_knee = int(knee_locator.knee)
+                    # Cap the knee to prevent including too many weights
+                    global_knee = min(detected_knee, int(in_features * max_knee_ratio))
                 else:
-                    # Fallback: use 50% of features (middle)
-                    global_knee = in_features // 2
+                    # Fallback: use 25% of features (conservative)
+                    global_knee = int(in_features * 0.25)
             else:
-                global_knee = in_features // 2
+                global_knee = int(in_features * 0.25)
         except Exception:
             # Fallback if Kneedle fails
-            global_knee = in_features // 2
+            global_knee = int(in_features * 0.25)
 
         # NEW: Clamp from BEGINNING TO KNEE (important weights only)
         # Ignore weights after knee (unimportant tail)
@@ -221,9 +232,14 @@ class GroupWiseAWQClampL2Quantizer:
         clamp_stats = {
             'mean_knee': global_knee,
             'median_knee': global_knee,
+            'detected_knee': detected_knee if 'detected_knee' in locals() else global_knee,  # Raw knee before capping
             'mean_clamp_ratio': np.mean(clamp_ratios) if clamp_ratios else 1.0,
             'k_offset': k_offset,
-            'top_k': top_k  # Number of important weights (from beginning to knee)
+            'top_k': top_k,  # Number of important weights (from beginning to knee)
+            'knee_percentage': (global_knee / in_features) * 100,  # Knee as % of total features
+            'detected_percentage': (detected_knee / in_features) * 100 if 'detected_knee' in locals() else 0,  # Raw detection
+            'top_k_percentage': (top_k / in_features) * 100,  # top_k as % of total features
+            'capped': (detected_knee > global_knee) if 'detected_knee' in locals() else False  # Was knee capped?
         }
 
         return min_clamp, max_clamp, clamp_stats
@@ -504,7 +520,11 @@ class GroupWiseAWQClampL2Quantizer:
                         print(f"\n  Layer {name}:")
                         print(f"    α={info['alpha']:.3f}, error={info['error']:.6f}")
                         if clamp_info:
-                            print(f"    knee={clamp_info.get('mean_knee', 0):.1f}, "
+                            capped_str = " [CAPPED]" if clamp_info.get('capped', False) else ""
+                            detected_pct = clamp_info.get('detected_percentage', 0)
+                            print(f"    knee={clamp_info.get('mean_knee', 0):.0f} ({clamp_info.get('knee_percentage', 0):.1f}%{capped_str}), "
+                                  f"detected={detected_pct:.1f}%, "
+                                  f"top_k={clamp_info.get('top_k', 0)} ({clamp_info.get('top_k_percentage', 0):.1f}%), "
                                   f"clamp_ratio={clamp_info.get('mean_clamp_ratio', 0):.3f}")
 
                 quantized_count += 1
@@ -538,10 +558,22 @@ class GroupWiseAWQClampL2Quantizer:
 
         if self.layer_clamp_stats:
             mean_knees = [info.get('mean_knee', 0) for info in self.layer_clamp_stats.values()]
+            knee_percentages = [info.get('knee_percentage', 0) for info in self.layer_clamp_stats.values()]
+            top_k_percentages = [info.get('top_k_percentage', 0) for info in self.layer_clamp_stats.values()]
             clamp_ratios = [info.get('mean_clamp_ratio', 0) for info in self.layer_clamp_stats.values()]
             print(f"\nWeight clamping statistics:")
-            print(f"  Mean knee point: {np.mean(mean_knees):.1f}")
+            print(f"  Mean knee point: {np.mean(mean_knees):.1f} ({np.mean(knee_percentages):.1f}% of features)")
+            print(f"  Mean top_k: {np.mean(top_k_percentages):.1f}% of features")
             print(f"  Mean clamp ratio: {np.mean(clamp_ratios):.3f} (clamped/original range)")
+            print(f"\n  ⚠️  Clamp ratio = {np.mean(clamp_ratios):.3f}:")
+            if np.mean(clamp_ratios) > 0.95:
+                print(f"      Clamping has MINIMAL effect (top weights span full range)")
+                print(f"      → Knee at {np.mean(knee_percentages):.1f}% includes too many weights")
+                print(f"      → Try: (1) Reduce k-offset-ratio, or (2) Use percentile instead")
+            elif np.mean(clamp_ratios) > 0.7:
+                print(f"      Clamping has MODERATE effect")
+            else:
+                print(f"      Clamping has STRONG effect (range reduced by {(1-np.mean(clamp_ratios))*100:.1f}%)")
 
         self.activation_data = {}
         if torch.cuda.is_available():

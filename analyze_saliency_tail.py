@@ -154,19 +154,25 @@ class SaliencyTailAnalyzer:
 
     def detect_dual_knees(self, sorted_values):
         """
-        Detect knee points on BOTH first half and second half.
+        Detect knee points using THREE methods:
+        1. First-half knee: Aggressive (~10-20% of features)
+        2. Second-half knee: Conservative (~50-80% of features)
+        3. Capped full-curve (v3): Balanced, capped at 35% of features
 
         Returns:
             knee_1st: Knee index on first half
             knee_2nd: Knee index on second half
+            knee_v3: Knee index on full curve, capped at 35%
         """
         n = len(sorted_values)
         half_n = n // 2
+        max_knee_cap = int(n * 0.35)  # Cap at 35% for v3
 
         knee_1st = None
         knee_2nd = None
+        knee_v3 = None
 
-        # First half knee detection
+        # First half knee detection (v1)
         try:
             x_range = np.arange(half_n)
             y_values = sorted_values[:half_n].cpu().numpy()
@@ -185,7 +191,7 @@ class SaliencyTailAnalyzer:
         if knee_1st is None:
             knee_1st = n // 10  # Fallback
 
-        # Second half knee detection
+        # Second half knee detection (v2)
         try:
             second_half_start = half_n
             second_half_len = n - second_half_start
@@ -206,7 +212,28 @@ class SaliencyTailAnalyzer:
         if knee_2nd is None:
             knee_2nd = n // 2  # Fallback
 
-        return knee_1st, knee_2nd
+        # Capped full-curve knee detection (v3)
+        try:
+            x_range = np.arange(n)
+            y_values = sorted_values.cpu().numpy()
+            valid_mask = np.isfinite(y_values)
+
+            if valid_mask.sum() > 10:
+                knee_loc = KneeLocator(
+                    x_range[valid_mask], y_values[valid_mask],
+                    curve='convex', direction='decreasing', S=1.5
+                )
+                if knee_loc.knee is not None:
+                    detected_knee = int(knee_loc.knee)
+                    knee_v3 = min(detected_knee, max_knee_cap)  # Cap at 35%
+                else:
+                    knee_v3 = int(n * 0.25)  # Fallback: 25%
+            else:
+                knee_v3 = int(n * 0.25)
+        except:
+            knee_v3 = int(n * 0.25)
+
+        return knee_1st, knee_2nd, knee_v3
 
     def analyze_top_channels(self, results, top_k=10, output_dir='./visualizations/saliency_tail_analysis', target_module=None):
         """Analyze top-k channels by saliency with dual knee and tail analysis."""
@@ -255,59 +282,66 @@ class SaliencyTailAnalyzer:
         X_sorted_values, X_sorted_indices = torch.sort(X_squared_mean, descending=True)
         grad_sorted_values, grad_sorted_indices = torch.sort(grad_squared, descending=True)
 
-        # Detect dual knees
-        knee_1st_x2, knee_2nd_x2 = self.detect_dual_knees(X_sorted_values)
-        knee_1st_grad2, knee_2nd_grad2 = self.detect_dual_knees(grad_sorted_values)
+        # Detect knees using THREE methods (v1, v2, v3)
+        knee_1st_x2, knee_2nd_x2, knee_v3_x2 = self.detect_dual_knees(X_sorted_values)
+        knee_1st_grad2, knee_2nd_grad2, knee_v3_grad2 = self.detect_dual_knees(grad_sorted_values)
 
         # Create figure with 4 rows, 3 columns
         fig, axes = plt.subplots(4, 3, figsize=(18, 18))
 
         n_features = len(X_sorted_values)
 
-        # Row 1: Sorted X² with dual knees
+        # Row 1: Sorted X² with triple knees
         ax = axes[0, 0]
-        ax.plot(range(n_features), X_sorted_values.numpy(), linewidth=1.5, alpha=0.8)
-        ax.axvline(knee_1st_x2, color='blue', linestyle='--', linewidth=2, label=f'1st-half knee: {knee_1st_x2}')
-        ax.axvline(knee_2nd_x2, color='red', linestyle='--', linewidth=2, label=f'2nd-half knee: {knee_2nd_x2}')
+        ax.plot(range(n_features), X_sorted_values.numpy(), linewidth=1.5, alpha=0.8, color='gray', label='X²')
+        ax.axvline(knee_1st_x2, color='blue', linestyle='--', linewidth=2, label=f'v1 (1st-half): {knee_1st_x2}')
+        ax.axvline(knee_2nd_x2, color='red', linestyle='--', linewidth=2, label=f'v2 (2nd-half): {knee_2nd_x2}')
+        ax.axvline(knee_v3_x2, color='green', linestyle='--', linewidth=2, label=f'v3 (capped): {knee_v3_x2}')
         ax.plot(knee_1st_x2, X_sorted_values[knee_1st_x2].numpy(), 'bo', markersize=10)
         ax.plot(knee_2nd_x2, X_sorted_values[knee_2nd_x2].numpy(), 'ro', markersize=10)
+        ax.plot(knee_v3_x2, X_sorted_values[knee_v3_x2].numpy(), 'go', markersize=10)
         ax.set_xlabel('Feature Rank (sorted by X²)', fontsize=11)
         ax.set_ylabel('Mean Squared Input (X²)', fontsize=11)
-        ax.set_title(f'Rank {rank}: Ch {ch_idx} - Sorted X² (Dual Knees)', fontsize=12)
+        ax.set_title(f'Rank {rank}: Ch {ch_idx} - Sorted X² (3 Knee Methods)', fontsize=12)
         ax.set_yscale('log')
-        ax.legend(fontsize=9)
+        ax.legend(fontsize=8, loc='best')
         ax.grid(True, alpha=0.3)
 
-        # Row 1: Sorted grad² with dual knees
+        # Row 1: Sorted grad² with triple knees
         ax = axes[0, 1]
-        ax.plot(range(n_features), grad_sorted_values.numpy(), linewidth=1.5, alpha=0.8, color='orangered')
-        ax.axvline(knee_1st_grad2, color='blue', linestyle='--', linewidth=2, label=f'1st-half knee: {knee_1st_grad2}')
-        ax.axvline(knee_2nd_grad2, color='red', linestyle='--', linewidth=2, label=f'2nd-half knee: {knee_2nd_grad2}')
+        ax.plot(range(n_features), grad_sorted_values.numpy(), linewidth=1.5, alpha=0.8, color='orangered', label='grad²')
+        ax.axvline(knee_1st_grad2, color='blue', linestyle='--', linewidth=2, label=f'v1 (1st-half): {knee_1st_grad2}')
+        ax.axvline(knee_2nd_grad2, color='red', linestyle='--', linewidth=2, label=f'v2 (2nd-half): {knee_2nd_grad2}')
+        ax.axvline(knee_v3_grad2, color='green', linestyle='--', linewidth=2, label=f'v3 (capped): {knee_v3_grad2}')
         ax.plot(knee_1st_grad2, grad_sorted_values[knee_1st_grad2].numpy(), 'bo', markersize=10)
         ax.plot(knee_2nd_grad2, grad_sorted_values[knee_2nd_grad2].numpy(), 'ro', markersize=10)
+        ax.plot(knee_v3_grad2, grad_sorted_values[knee_v3_grad2].numpy(), 'go', markersize=10)
         ax.set_xlabel('Weight Rank (sorted by grad²)', fontsize=11)
         ax.set_ylabel('Squared Weight Gradient', fontsize=11)
-        ax.set_title(f'Rank {rank}: Ch {ch_idx} - Sorted grad² (Dual Knees)', fontsize=12)
+        ax.set_title(f'Rank {rank}: Ch {ch_idx} - Sorted grad² (3 Knee Methods)', fontsize=12)
         ax.set_yscale('log')
-        ax.legend(fontsize=9)
+        ax.legend(fontsize=8, loc='best')
         ax.grid(True, alpha=0.3)
 
-        # Row 1: Knee comparison
+        # Row 1: Knee comparison (3 methods)
         ax = axes[0, 2]
         knee_data = {
-            'X² (1st)': knee_1st_x2,
-            'X² (2nd)': knee_2nd_x2,
-            'grad² (1st)': knee_1st_grad2,
-            'grad² (2nd)': knee_2nd_grad2
+            'X² (v1)': knee_1st_x2,
+            'X² (v2)': knee_2nd_x2,
+            'X² (v3)': knee_v3_x2,
+            'grad² (v1)': knee_1st_grad2,
+            'grad² (v2)': knee_2nd_grad2,
+            'grad² (v3)': knee_v3_grad2
         }
-        bars = ax.bar(range(len(knee_data)), list(knee_data.values()), color=['blue', 'red', 'blue', 'red'])
+        colors = ['blue', 'red', 'green', 'blue', 'red', 'green']
+        bars = ax.bar(range(len(knee_data)), list(knee_data.values()), color=colors, alpha=0.7)
         ax.set_xticks(range(len(knee_data)))
-        ax.set_xticklabels(list(knee_data.keys()), rotation=45, ha='right')
+        ax.set_xticklabels(list(knee_data.keys()), rotation=45, ha='right', fontsize=9)
         ax.set_ylabel('Knee Index', fontsize=11)
-        ax.set_title(f'Knee Point Comparison', fontsize=12)
+        ax.set_title(f'Knee Point Comparison (3 Methods)', fontsize=12)
         ax.grid(True, alpha=0.3, axis='y')
         for i, (k, v) in enumerate(knee_data.items()):
-            ax.text(i, v, f'{v}', ha='center', va='bottom', fontsize=9)
+            ax.text(i, v, f'{v}', ha='center', va='bottom', fontsize=8)
 
         # Row 2: Tail distributions for X²
         if weights is not None:
