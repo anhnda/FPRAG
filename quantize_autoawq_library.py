@@ -114,15 +114,36 @@ def main():
     print("=" * 80)
 
     try:
-        model.quantize(
-            tokenizer,
-            quant_config=quant_config,
-            calib_data="wikitext",  # Use WikiText-2 for calibration
-            n_samples=args.calib_samples,
-            split="train"
-        )
+        # Try new API first (AutoAWQ >= 0.1.6)
+        try:
+            from datasets import load_dataset
 
-        print("\n✅ Quantization successful!")
+            # Load calibration data manually
+            print("Loading calibration dataset...")
+            dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
+            calib_data = [item['text'] for item in dataset if len(item['text'].strip()) > 0][:args.calib_samples]
+
+            model.quantize(
+                tokenizer,
+                quant_config=quant_config,
+                calib_data=calib_data  # Pass list of texts directly
+            )
+            print("\n✅ Quantization successful!")
+
+        except TypeError as te:
+            if "n_samples" in str(te):
+                # Old API (AutoAWQ < 0.1.6)
+                print("Trying older AutoAWQ API...")
+                model.quantize(
+                    tokenizer,
+                    quant_config=quant_config,
+                    calib_data="wikitext",
+                    n_samples=args.calib_samples,
+                    split="train"
+                )
+                print("\n✅ Quantization successful!")
+            else:
+                raise
 
     except Exception as e:
         print(f"\n❌ Quantization failed: {e}")
@@ -130,6 +151,8 @@ def main():
         print("  - Ensure you have enough GPU memory (at least 16GB)")
         print("  - Try reducing --calib-samples")
         print("  - Check that the model supports AutoAWQ")
+        print(f"  - Your AutoAWQ version may be incompatible")
+        print(f"\nTo check AutoAWQ version: pip show autoawq")
         raise
 
     # Get model size after quantization
