@@ -45,7 +45,7 @@ class GroupWiseAWQClampL2Quantizer:
     - GROUP-WISE ASYMMETRIC INT4 quantization [0, 15]
     """
 
-    def __init__(self, model, tokenizer, device="cuda", bits=4, n_grid=20, group_size=128, k_offset_ratio=0.05):
+    def __init__(self, model, tokenizer, device="cuda", bits=4, n_grid=20, group_size=128, k_offset_ratio=0.05, fast_mode=False):
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
@@ -53,6 +53,7 @@ class GroupWiseAWQClampL2Quantizer:
         self.n_grid = n_grid
         self.group_size = group_size
         self.k_offset_ratio = k_offset_ratio
+        self.fast_mode = fast_mode
 
         # Storage for activations
         self.activation_data = {}
@@ -62,7 +63,7 @@ class GroupWiseAWQClampL2Quantizer:
 
         print(f"\n[Group-Wise AWQ ASYMMETRIC L2 + Knee-Point Clamping Quantizer Initialized]")
         print(f"  Target bits: {bits}")
-        print(f"  Grid search points: {n_grid}")
+        print(f"  Mode: {'FAST (α=0.5 fixed)' if fast_mode else f'Grid search ({n_grid + 1} points)'}")
         print(f"  Group size: {group_size}")
         print(f"  K-offset ratio: {k_offset_ratio * 100:.1f}% (knee point offset)")
         print(f"  Quantization: GROUP-WISE ASYMMETRIC [0, 15]")
@@ -172,31 +173,32 @@ class GroupWiseAWQClampL2Quantizer:
             # Fallback if Kneedle fails
             global_knee = max(1, in_features // 10)
 
-        # Now compute per-channel ranges using the global knee point
-        min_clamp = torch.zeros(out_features, device=W.device)
-        max_clamp = torch.zeros(out_features, device=W.device)
-        clamp_ratios = []
-
+        # OPTIMIZED: Fully vectorized per-channel range computation
         top_k = min(global_knee + k_offset, in_features)
 
-        # Vectorized computation per channel
-        for i in range(out_features):
-            # Compute weight importance for this channel
-            weight_importance = torch.abs(W[i, :]) * activation_salience
+        # Compute weight importance for ALL channels at once [out_features, in_features]
+        weight_importance_all = torch.abs(W) * activation_salience.unsqueeze(0)
 
-            # Get top-k indices
-            _, top_indices = torch.topk(weight_importance, k=top_k, largest=True)
-            top_weights = W[i, top_indices]
+        # Get top-k indices for all channels in parallel
+        _, top_indices_all = torch.topk(weight_importance_all, k=top_k, dim=1, largest=True)
 
-            # Compute clamp range
-            min_clamp[i] = top_weights.min()
-            max_clamp[i] = top_weights.max()
+        # Gather top weights for all channels
+        # Use advanced indexing to get top weights
+        batch_idx = torch.arange(out_features, device=W.device).unsqueeze(1).expand(-1, top_k)
+        top_weights_all = W[batch_idx, top_indices_all]  # [out_features, top_k]
 
-            # Track statistics (sample every 100 channels to save time)
-            if i % 100 == 0:
-                original_range = W[i, :].max() - W[i, :].min()
-                clamped_range = max_clamp[i] - min_clamp[i]
-                clamp_ratios.append((clamped_range / (original_range + 1e-8)).item())
+        # Compute min/max per channel
+        min_clamp = top_weights_all.min(dim=1)[0]
+        max_clamp = top_weights_all.max(dim=1)[0]
+
+        # Sample statistics for speed
+        sample_indices = torch.arange(0, out_features, 100, device=W.device)
+        if len(sample_indices) > 0:
+            original_ranges = W[sample_indices].max(dim=1)[0] - W[sample_indices].min(dim=1)[0]
+            clamped_ranges = max_clamp[sample_indices] - min_clamp[sample_indices]
+            clamp_ratios = (clamped_ranges / (original_ranges + 1e-8)).cpu().tolist()
+        else:
+            clamp_ratios = [1.0]
 
         clamp_stats = {
             'mean_knee': global_knee,
@@ -222,10 +224,8 @@ class GroupWiseAWQClampL2Quantizer:
         """
         out_features, in_features = W.shape
 
-        # Apply per-channel clamping
-        W_clamped = W.clone()
-        for i in range(out_features):
-            W_clamped[i, :] = torch.clamp(W_clamped[i, :], min=min_clamp[i], max=max_clamp[i])
+        # OPTIMIZED: Vectorized per-channel clamping (no loop!)
+        W_clamped = torch.clamp(W, min=min_clamp.unsqueeze(1), max=max_clamp.unsqueeze(1))
 
         # Pad to make in_features divisible by group_size
         n_groups = (in_features + self.group_size - 1) // self.group_size
@@ -287,8 +287,8 @@ class GroupWiseAWQClampL2Quantizer:
         X_list = self.activation_data[name]
         X_cpu = torch.cat([x.reshape(-1, x.shape[-1]) for x in X_list], dim=0)
 
-        # OPTIMIZATION: Reduce samples from 2048 to 512 for much faster grid search
-        max_samples = min(512, X_cpu.shape[0])
+        # OPTIMIZATION: Reduce samples from 2048 to 128 for much faster grid search
+        max_samples = min(128, X_cpu.shape[0])
         if X_cpu.shape[0] > max_samples:
             indices = torch.randperm(X_cpu.shape[0])[:max_samples]
             X_search = X_cpu[indices].to(self.device)
@@ -316,20 +316,14 @@ class GroupWiseAWQClampL2Quantizer:
         # Compute weight clamp ranges (done once, independent of alpha)
         min_clamp, max_clamp, clamp_stats = self.compute_weight_clamp_ranges(W, activation_salience)
 
-        # Grid search over α
-        for grid_idx in range(self.n_grid + 1):
-            alpha = grid_idx / self.n_grid
-
-            # Compute per-input-channel scales from L2 salience
+        # FAST MODE: Skip grid search, use fixed α=0.5
+        if self.fast_mode:
+            alpha = 0.5
             scales = activation_salience.pow(alpha).clamp(min=1e-5)
 
-            # Scale weight COLUMNS
+            # Quick error estimate
             W_scaled = W * scales.unsqueeze(0)
-
-            # Quantize with GROUP-WISE ASYMMETRIC quantization + CLAMPING
             W_quant = self.quantize_weight_groupwise_asymmetric_clamped(W_scaled, min_clamp, max_clamp)
-
-            # Compensate input
             X_compensated = X_search / scales.unsqueeze(0)
 
             if b is not None:
@@ -337,14 +331,42 @@ class GroupWiseAWQClampL2Quantizer:
             else:
                 Y_quant = torch.matmul(X_compensated, W_quant.t())
 
-            # Compute reconstruction error (MSE)
             error = (Y_orig - Y_quant).pow(2).mean().item()
 
-            if error < best_error:
-                best_error = error
-                best_alpha = alpha
-                best_scales = scales.clone()
-                best_clamp_stats = clamp_stats
+            best_error = error
+            best_alpha = alpha
+            best_scales = scales
+            best_clamp_stats = clamp_stats
+        else:
+            # Grid search over α
+            for grid_idx in range(self.n_grid + 1):
+                alpha = grid_idx / self.n_grid
+
+                # Compute per-input-channel scales from L2 salience
+                scales = activation_salience.pow(alpha).clamp(min=1e-5)
+
+                # Scale weight COLUMNS
+                W_scaled = W * scales.unsqueeze(0)
+
+                # Quantize with GROUP-WISE ASYMMETRIC quantization + CLAMPING
+                W_quant = self.quantize_weight_groupwise_asymmetric_clamped(W_scaled, min_clamp, max_clamp)
+
+                # Compensate input
+                X_compensated = X_search / scales.unsqueeze(0)
+
+                if b is not None:
+                    Y_quant = torch.matmul(X_compensated, W_quant.t()) + b
+                else:
+                    Y_quant = torch.matmul(X_compensated, W_quant.t())
+
+                # Compute reconstruction error (MSE)
+                error = (Y_orig - Y_quant).pow(2).mean().item()
+
+                if error < best_error:
+                    best_error = error
+                    best_alpha = alpha
+                    best_scales = scales.clone()
+                    best_clamp_stats = clamp_stats
 
         del X_search, Y_orig
         if 'Y_quant' in locals():
@@ -523,10 +545,11 @@ def main():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     parser.add_argument("--n-calib", type=int, default=128, help="Calibration samples")
-    parser.add_argument("--n-grid", type=int, default=10, help="Grid search points (10=faster, 20=more accurate)")
+    parser.add_argument("--n-grid", type=int, default=5, help="Grid search points (5=fast, 10=balanced, 20=accurate)")
     parser.add_argument("--group-size", type=int, default=128, help="Group size for quantization")
     parser.add_argument("--k-offset-ratio", type=float, default=0.05,
                        help="K-offset ratio for knee point (default: 5%% of weights)")
+    parser.add_argument("--fast", action="store_true", help="Fast mode: skip grid search, use fixed α=0.5")
     parser.add_argument("--output-dir", type=str, default="./quantized_models/minicpm_gw_awq_clamp_l2",
                        help="Output directory")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
@@ -594,7 +617,8 @@ def main():
         bits=4,
         n_grid=args.n_grid,
         group_size=args.group_size,
-        k_offset_ratio=args.k_offset_ratio
+        k_offset_ratio=args.k_offset_ratio,
+        fast_mode=args.fast
     )
 
     # Calibrate and quantize
