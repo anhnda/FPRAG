@@ -9,6 +9,10 @@ This script:
    - grad(w*,j)^2 (squared weight gradients from SiLU output) with knee point detection
 4. Uses Kneedle algorithm to detect knee points on the first half of sorted data
    for both E[X²] and grad² curves
+5. Compares weight ranges:
+   - Top important weights (up to knee_point + k_offset) vs all weights
+   - Separate comparisons for X²-based and grad²-based importance rankings
+   - Box plots, statistics, and distribution histograms
 """
 
 import torch
@@ -196,9 +200,12 @@ class SaliencyGradientAnalyzer:
 
         return weight_grad_squared.cpu()
 
-    def analyze_top_channels(self, results, top_k=10, output_dir='./visualizations/saliency_gradient_analysis', target_module=None):
+    def analyze_top_channels(self, results, top_k=10, output_dir='./visualizations/saliency_gradient_analysis', target_module=None, k_offset=0):
         """
         Analyze top-k channels by saliency and create visualizations.
+
+        Args:
+            k_offset: Offset to add to knee point when selecting top weights for range analysis (default: 0)
         """
         os.makedirs(output_dir, exist_ok=True)
 
@@ -222,7 +229,7 @@ class SaliencyGradientAnalyzer:
             ch_idx = ch_idx.item()
             knee_info = self.visualize_channel(
                 ch_idx, rank + 1, X, pre_act, weight_gradients,
-                saliency[ch_idx].item(), output_dir, target_module
+                saliency[ch_idx].item(), output_dir, target_module, k_offset
             )
             knee_points_info.append(knee_info)
 
@@ -232,13 +239,17 @@ class SaliencyGradientAnalyzer:
         # Create overall distribution plots
         self.plot_saliency_distribution(saliency, top_k_indices, output_dir)
 
-    def visualize_channel(self, ch_idx, rank, X, pre_act, weight_gradients, saliency_score, output_dir, target_module=None):
+    def visualize_channel(self, ch_idx, rank, X, pre_act, weight_gradients, saliency_score, output_dir, target_module=None, k_offset=0):
         """
         Create visualization for a single channel showing:
         1. Sorted [X*,j]^2 (squared input contributions) with knee point
         2. Corresponding X values in sorted order
         3. Sorted grad(w*,j)^2 (squared weight gradients) with knee point
         4. Corresponding weight values in sorted order
+        5. Weight range comparison: top important weights (up to knee + k_offset) vs all weights
+
+        Args:
+            k_offset: Offset to add to knee point when selecting top weights for range analysis (default: 0)
 
         Returns:
             dict: Dictionary containing channel index and knee point indices for X² and grad²
@@ -276,8 +287,8 @@ class SaliencyGradientAnalyzer:
         knee_idx_x2 = None
         knee_idx_grad2 = None
 
-        # Create figure with 2 rows, 3 columns
-        fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+        # Create figure with 3 rows, 3 columns
+        fig, axes = plt.subplots(3, 3, figsize=(18, 14))
 
         # Plot 1 (Row 1, Col 1): Sorted X^2
         ax = axes[0, 0]
@@ -420,6 +431,101 @@ class SaliencyGradientAnalyzer:
                    transform=ax.transAxes, fontsize=12)
             ax.axis('off')
 
+        # Row 3: Weight range comparisons
+        # Plot 7 (Row 3, Col 1): Weight range for top-k based on X² importance
+        ax = axes[2, 0]
+        if weights is not None and knee_idx_x2 is not None:
+            top_k_x2 = min(knee_idx_x2 + k_offset, n_features)
+            top_weights_x2 = weights[X_sorted_indices[:top_k_x2]]
+            all_weights = weights
+
+            # Compute statistics
+            data_to_plot = [all_weights.numpy(), top_weights_x2.numpy()]
+            labels = [f'All Weights\n(n={len(all_weights)})', f'Top by X²\n(n={top_k_x2})']
+
+            # Create box plot
+            bp = ax.boxplot(data_to_plot, labels=labels, patch_artist=True, widths=0.6)
+
+            # Color the boxes
+            bp['boxes'][0].set_facecolor('lightblue')
+            bp['boxes'][1].set_facecolor('lightcoral')
+
+            ax.set_ylabel('Weight Value', fontsize=11)
+            ax.set_title(f'Weight Range Comparison (X² knee={knee_idx_x2}, offset={k_offset})', fontsize=11)
+            ax.grid(True, alpha=0.3, axis='y')
+            ax.axhline(y=0, color='gray', linestyle='--', linewidth=1, alpha=0.5)
+
+            # Add statistics text
+            stats_text = f'Top weights: μ={top_weights_x2.mean():.3f}, σ={top_weights_x2.std():.3f}\n'
+            stats_text += f'All weights: μ={all_weights.mean():.3f}, σ={all_weights.std():.3f}\n'
+            stats_text += f'Range ratio: {(top_weights_x2.max() - top_weights_x2.min()) / (all_weights.max() - all_weights.min()):.3f}'
+            ax.text(0.05, 0.95, stats_text, transform=ax.transAxes, fontsize=9,
+                   verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+        else:
+            ax.text(0.5, 0.5, 'Knee point not detected\nor weights unavailable',
+                   ha='center', va='center', transform=ax.transAxes, fontsize=11)
+            ax.axis('off')
+
+        # Plot 8 (Row 3, Col 2): Weight range for top-k based on grad² importance
+        ax = axes[2, 1]
+        if weights is not None and knee_idx_grad2 is not None:
+            top_k_grad2 = min(knee_idx_grad2 + k_offset, n_features)
+            top_weights_grad2 = weights[grad_sorted_indices[:top_k_grad2]]
+            all_weights = weights
+
+            # Compute statistics
+            data_to_plot = [all_weights.numpy(), top_weights_grad2.numpy()]
+            labels = [f'All Weights\n(n={len(all_weights)})', f'Top by grad²\n(n={top_k_grad2})']
+
+            # Create box plot
+            bp = ax.boxplot(data_to_plot, labels=labels, patch_artist=True, widths=0.6)
+
+            # Color the boxes
+            bp['boxes'][0].set_facecolor('lightblue')
+            bp['boxes'][1].set_facecolor('orange')
+
+            ax.set_ylabel('Weight Value', fontsize=11)
+            ax.set_title(f'Weight Range Comparison (grad² knee={knee_idx_grad2}, offset={k_offset})', fontsize=11)
+            ax.grid(True, alpha=0.3, axis='y')
+            ax.axhline(y=0, color='gray', linestyle='--', linewidth=1, alpha=0.5)
+
+            # Add statistics text
+            stats_text = f'Top weights: μ={top_weights_grad2.mean():.3f}, σ={top_weights_grad2.std():.3f}\n'
+            stats_text += f'All weights: μ={all_weights.mean():.3f}, σ={all_weights.std():.3f}\n'
+            stats_text += f'Range ratio: {(top_weights_grad2.max() - top_weights_grad2.min()) / (all_weights.max() - all_weights.min()):.3f}'
+            ax.text(0.05, 0.95, stats_text, transform=ax.transAxes, fontsize=9,
+                   verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+        else:
+            ax.text(0.5, 0.5, 'Knee point not detected\nor weights unavailable',
+                   ha='center', va='center', transform=ax.transAxes, fontsize=11)
+            ax.axis('off')
+
+        # Plot 9 (Row 3, Col 3): Combined weight distribution histogram
+        ax = axes[2, 2]
+        if weights is not None and knee_idx_x2 is not None and knee_idx_grad2 is not None:
+            top_k_x2 = min(knee_idx_x2 + k_offset, n_features)
+            top_k_grad2 = min(knee_idx_grad2 + k_offset, n_features)
+            top_weights_x2 = weights[X_sorted_indices[:top_k_x2]]
+            top_weights_grad2 = weights[grad_sorted_indices[:top_k_grad2]]
+
+            # Create overlapping histograms
+            ax.hist(all_weights.numpy(), bins=50, alpha=0.3, label='All weights', color='gray', density=True)
+            ax.hist(top_weights_x2.numpy(), bins=30, alpha=0.5, label=f'Top by X² (n={top_k_x2})',
+                   color='red', density=True)
+            ax.hist(top_weights_grad2.numpy(), bins=30, alpha=0.5, label=f'Top by grad² (n={top_k_grad2})',
+                   color='orange', density=True)
+
+            ax.set_xlabel('Weight Value', fontsize=11)
+            ax.set_ylabel('Density', fontsize=11)
+            ax.set_title('Weight Distribution Comparison', fontsize=11)
+            ax.legend(fontsize=9)
+            ax.grid(True, alpha=0.3, axis='y')
+            ax.axvline(x=0, color='black', linestyle='--', linewidth=1, alpha=0.5)
+        else:
+            ax.text(0.5, 0.5, 'Knee points not detected\nor weights unavailable',
+                   ha='center', va='center', transform=ax.transAxes, fontsize=11)
+            ax.axis('off')
+
         plt.suptitle(f'Channel {ch_idx} Analysis (Saliency = {saliency_score:.4f})',
                      fontsize=14, fontweight='bold', y=0.995)
         plt.tight_layout()
@@ -428,11 +534,31 @@ class SaliencyGradientAnalyzer:
 
         print(f"  Saved visualization for channel {ch_idx} (rank {rank})")
 
-        # Return knee point information
+        # Return knee point information and weight range statistics
+        weight_range_info = {}
+        if weights is not None:
+            if knee_idx_x2 is not None:
+                top_k_x2 = min(knee_idx_x2 + k_offset, n_features)
+                top_weights_x2 = weights[X_sorted_indices[:top_k_x2]]
+                weight_range_info['top_x2_mean'] = top_weights_x2.mean().item()
+                weight_range_info['top_x2_std'] = top_weights_x2.std().item()
+                weight_range_info['top_x2_range'] = (top_weights_x2.max() - top_weights_x2.min()).item()
+            if knee_idx_grad2 is not None:
+                top_k_grad2 = min(knee_idx_grad2 + k_offset, n_features)
+                top_weights_grad2 = weights[grad_sorted_indices[:top_k_grad2]]
+                weight_range_info['top_grad2_mean'] = top_weights_grad2.mean().item()
+                weight_range_info['top_grad2_std'] = top_weights_grad2.std().item()
+                weight_range_info['top_grad2_range'] = (top_weights_grad2.max() - top_weights_grad2.min()).item()
+
+            weight_range_info['all_mean'] = weights.mean().item()
+            weight_range_info['all_std'] = weights.std().item()
+            weight_range_info['all_range'] = (weights.max() - weights.min()).item()
+
         return {
             'channel_idx': ch_idx,
             'knee_x2': knee_idx_x2,
-            'knee_grad2': knee_idx_grad2
+            'knee_grad2': knee_idx_grad2,
+            **weight_range_info
         }
 
     def create_summary(self, results, top_k_indices, output_dir, knee_points_info):
@@ -454,7 +580,7 @@ class SaliencyGradientAnalyzer:
             # Get knee point info for this channel
             knee_info = knee_points_info[rank]
 
-            summary_data.append({
+            summary_entry = {
                 'Rank': rank + 1,
                 'Channel_Index': ch_idx,
                 'Saliency': saliency[ch_idx].item(),
@@ -465,7 +591,23 @@ class SaliencyGradientAnalyzer:
                 'Spearman_Correlation': corr,
                 'Knee_X2_Index': knee_info['knee_x2'] if knee_info['knee_x2'] is not None else -1,
                 'Knee_Grad2_Index': knee_info['knee_grad2'] if knee_info['knee_grad2'] is not None else -1
-            })
+            }
+
+            # Add weight range statistics if available
+            if 'all_mean' in knee_info:
+                summary_entry['All_Weights_Mean'] = knee_info['all_mean']
+                summary_entry['All_Weights_Std'] = knee_info['all_std']
+                summary_entry['All_Weights_Range'] = knee_info['all_range']
+            if 'top_x2_mean' in knee_info:
+                summary_entry['Top_X2_Mean'] = knee_info['top_x2_mean']
+                summary_entry['Top_X2_Std'] = knee_info['top_x2_std']
+                summary_entry['Top_X2_Range'] = knee_info['top_x2_range']
+            if 'top_grad2_mean' in knee_info:
+                summary_entry['Top_Grad2_Mean'] = knee_info['top_grad2_mean']
+                summary_entry['Top_Grad2_Std'] = knee_info['top_grad2_std']
+                summary_entry['Top_Grad2_Range'] = knee_info['top_grad2_range']
+
+            summary_data.append(summary_entry)
 
         df = pd.DataFrame(summary_data)
         df.to_csv(f'{output_dir}/top_channels_summary.csv', index=False)
@@ -519,6 +661,7 @@ def main():
     layer_idx = 3  # Analyze layer 3
     n_calibration_samples = 128
     top_k = 10
+    k_offset = 0  # Offset to add to knee point for weight range analysis
     output_dir = './visualizations/saliency_gradient_analysis'
 
     # Set device
@@ -553,7 +696,7 @@ def main():
     )
 
     # Analyze top channels
-    analyzer.analyze_top_channels(results, top_k=top_k, output_dir=output_dir, target_module=target_module)
+    analyzer.analyze_top_channels(results, top_k=top_k, output_dir=output_dir, target_module=target_module, k_offset=k_offset)
 
     print("\n" + "="*60)
     print("Analysis complete!")
