@@ -155,62 +155,62 @@ class SaliencyTailAnalyzer:
     def detect_dual_knees(self, sorted_values):
         """
         Detect knee points using TWO methods:
-        1. First-half knee: Run Kneedle on data[:quarter] (aggressive, ~10-20% of features)
-        2. Tail knee: Run Kneedle on data[3/4:] (conservative, finds where tail flattens at ~75%)
+        1. First-half knee: Perpendicular distance from line connecting start to half point
+        2. Tail knee: Perpendicular distance from line connecting half point to end point
 
         Returns:
-            knee_1st: Knee index from first-quarter detection (absolute index)
-            knee_2nd: Knee index from tail detection starting at 3/4 (absolute index)
+            knee_1st: Knee index from first-half detection (absolute index)
+            knee_2nd: Knee index from tail detection (absolute index)
         """
         n = len(sorted_values)
-        quarter_n = n // 4
-        three_quarter_n = (3 * n) // 4
+        half_n = n // 2
 
-        knee_1st = None
-        knee_2nd = None
+        values = sorted_values.cpu().numpy()
 
-        # First quarter knee detection: Run Kneedle on data[:quarter]
-        try:
-            x_range = np.arange(quarter_n)  # Relative indices [0, 1, 2, ..., quarter-1]
-            y_values = sorted_values[:quarter_n].cpu().numpy()  # Extract first quarter
-            valid_mask = np.isfinite(y_values)
+        # First-half knee: Find furthest point from line (0, values[0]) to (half_n, values[half_n])
+        knee_1st = self._find_knee_perpendicular(values, 0, half_n)
 
-            if valid_mask.sum() > 10:
-                knee_loc = KneeLocator(
-                    x_range[valid_mask], y_values[valid_mask],
-                    curve='convex', direction='decreasing', S=1.0
-                )
-                if knee_loc.knee is not None:
-                    knee_1st = int(knee_loc.knee)  # Already in absolute coordinates (0 to quarter-1)
-        except:
-            pass
-
-        if knee_1st is None:
-            knee_1st = n // 10  # Fallback
-
-        # Tail knee detection: Run Kneedle on data[3/4:]
-        try:
-            tail_start = three_quarter_n
-            tail_len = n - tail_start
-            x_range = np.arange(tail_len)  # Relative indices [0, 1, 2, ...]
-            y_values = sorted_values[tail_start:].cpu().numpy()  # Extract last quarter
-            valid_mask = np.isfinite(y_values)
-
-            if valid_mask.sum() > 10:
-                knee_loc = KneeLocator(
-                    x_range[valid_mask], y_values[valid_mask],
-                    curve='convex', direction='decreasing', S=1.0
-                )
-                if knee_loc.knee is not None:
-                    knee_relative = int(knee_loc.knee)  # Relative to tail
-                    knee_2nd = tail_start + knee_relative  # Convert to absolute index
-        except:
-            pass
-
-        if knee_2nd is None:
-            knee_2nd = three_quarter_n  # Fallback to 3/4 position
+        # Tail knee: Find furthest point from line (half_n, values[half_n]) to (n-1, values[n-1])
+        knee_2nd = self._find_knee_perpendicular(values, half_n, n - 1)
 
         return knee_1st, knee_2nd
+
+    def _find_knee_perpendicular(self, values, start_idx, end_idx):
+        """
+        Find knee point using perpendicular distance method.
+
+        Algorithm:
+        1. Draw a line from (start_idx, values[start_idx]) to (end_idx, values[end_idx])
+        2. Find the point between start and end with maximum perpendicular distance to this line
+        3. Return the index of that point
+        """
+        if end_idx - start_idx < 2:
+            return start_idx
+
+        # Line endpoints
+        x1, y1 = start_idx, values[start_idx]
+        x2, y2 = end_idx, values[end_idx]
+
+        # Compute perpendicular distances for all points between start and end
+        max_distance = 0
+        max_idx = start_idx
+
+        for i in range(start_idx + 1, end_idx):
+            x0, y0 = i, values[i]
+
+            # Perpendicular distance from point (x0, y0) to line through (x1, y1) and (x2, y2)
+            # Formula: |((y2-y1)*x0 - (x2-x1)*y0 + x2*y1 - y2*x1)| / sqrt((y2-y1)^2 + (x2-x1)^2)
+            numerator = abs((y2 - y1) * x0 - (x2 - x1) * y0 + x2 * y1 - y2 * x1)
+            denominator = np.sqrt((y2 - y1)**2 + (x2 - x1)**2)
+
+            if denominator > 0:
+                distance = numerator / denominator
+
+                if distance > max_distance:
+                    max_distance = distance
+                    max_idx = i
+
+        return max_idx
 
     def analyze_top_channels(self, results, top_k=10, output_dir='./visualizations/saliency_tail_analysis', target_module=None):
         """Analyze top-k channels by saliency with dual knee and tail analysis."""
