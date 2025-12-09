@@ -444,7 +444,7 @@ class SaliencyGradientAnalyzer:
             labels = [f'All Weights\n(n={len(all_weights)})', f'Top by X²\n(n={top_k_x2})']
 
             # Create box plot
-            bp = ax.boxplot(data_to_plot, labels=labels, patch_artist=True, widths=0.6)
+            bp = ax.boxplot(data_to_plot, tick_labels=labels, patch_artist=True, widths=0.6)
 
             # Color the boxes
             bp['boxes'][0].set_facecolor('lightblue')
@@ -478,7 +478,7 @@ class SaliencyGradientAnalyzer:
             labels = [f'All Weights\n(n={len(all_weights)})', f'Top by grad²\n(n={top_k_grad2})']
 
             # Create box plot
-            bp = ax.boxplot(data_to_plot, labels=labels, patch_artist=True, widths=0.6)
+            bp = ax.boxplot(data_to_plot, tick_labels=labels, patch_artist=True, widths=0.6)
 
             # Color the boxes
             bp['boxes'][0].set_facecolor('lightblue')
