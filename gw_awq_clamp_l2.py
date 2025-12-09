@@ -124,10 +124,21 @@ class GroupWiseAWQClampL2Quantizer:
         """
         OPTIMIZED: Compute per-channel weight clamping ranges using fast knee-point detection.
 
-        Optimization strategy:
-        1. Run Kneedle on AGGREGATED importance across all channels (1x instead of out_features times)
-        2. Use the global knee point for all channels
-        3. Much faster: O(in_features × log(in_features)) instead of O(out_features × in_features × log(in_features))
+        NEW APPROACH (v2 - SECOND HALF KNEE):
+        1. Sort weights by importance (descending)
+        2. Find knee on SECOND HALF (indices half_n to end, where importance → 0)
+        3. Clamp from BEGINNING TO KNEE (the important weights)
+        4. Ignore unimportant tail after knee
+
+        Rationale:
+        - Knee in 2nd half marks where importance flattens to near-zero
+        - Only preserve range of important weights (beginning to knee)
+        - Tail weights are insignificant, so ignore them
+
+        Optimization:
+        - Run Kneedle once on aggregated importance (all channels)
+        - Vectorized per-channel clamping (no loops)
+        - O(in_features × log(in_features)) complexity
 
         Args:
             W: Weight tensor [out_features, in_features]
@@ -146,34 +157,41 @@ class GroupWiseAWQClampL2Quantizer:
         weight_importance_global = (torch.abs(W) * activation_salience.unsqueeze(0)).mean(dim=0)  # Average across output channels
         sorted_importance_global, _ = torch.sort(weight_importance_global, descending=True)
 
+        # NEW: Find knee on SECOND HALF (where importance flattens to ~0)
         half_n = in_features // 2
-        try:
-            x_range = np.arange(half_n)
-            y_values = sorted_importance_global[:half_n].cpu().numpy()
+        second_half_start = half_n
+        second_half_len = in_features - second_half_start
 
-            # Filter out NaN/inf values that cause scipy warnings
+        try:
+            # Use SECOND HALF for knee detection
+            x_range = np.arange(second_half_len) + second_half_start  # Offset to actual indices
+            y_values = sorted_importance_global[second_half_start:].cpu().numpy()
+
+            # Filter out NaN/inf values
             valid_mask = np.isfinite(y_values)
-            if valid_mask.sum() > 10:  # Need at least some valid points
+            if valid_mask.sum() > 10:
                 x_range_valid = x_range[valid_mask]
                 y_values_valid = y_values[valid_mask]
 
                 knee_locator = KneeLocator(
                     x_range_valid, y_values_valid,
                     curve='convex', direction='decreasing',
-                    S=1.0, online=True  # online=True is faster
+                    S=1.0, online=True
                 )
 
                 if knee_locator.knee is not None:
                     global_knee = int(knee_locator.knee)
                 else:
-                    global_knee = max(1, in_features // 10)
+                    # Fallback: use 50% of features (middle)
+                    global_knee = in_features // 2
             else:
-                global_knee = max(1, in_features // 10)
-        except Exception as e:
+                global_knee = in_features // 2
+        except Exception:
             # Fallback if Kneedle fails
-            global_knee = max(1, in_features // 10)
+            global_knee = in_features // 2
 
-        # OPTIMIZED: Fully vectorized per-channel range computation
+        # NEW: Clamp from BEGINNING TO KNEE (important weights only)
+        # Ignore weights after knee (unimportant tail)
         top_k = min(global_knee + k_offset, in_features)
 
         # Compute weight importance for ALL channels at once [out_features, in_features]
@@ -204,7 +222,8 @@ class GroupWiseAWQClampL2Quantizer:
             'mean_knee': global_knee,
             'median_knee': global_knee,
             'mean_clamp_ratio': np.mean(clamp_ratios) if clamp_ratios else 1.0,
-            'k_offset': k_offset
+            'k_offset': k_offset,
+            'top_k': top_k  # Number of important weights (from beginning to knee)
         }
 
         return min_clamp, max_clamp, clamp_stats
