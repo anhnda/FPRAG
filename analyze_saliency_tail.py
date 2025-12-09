@@ -155,23 +155,24 @@ class SaliencyTailAnalyzer:
     def detect_dual_knees(self, sorted_values):
         """
         Detect knee points using TWO methods:
-        1. First-half knee: Run Kneedle on data[:half] (aggressive, ~10-20% of features)
-        2. Second-half knee: Run Kneedle on data[half:] (conservative, finds where tail flattens)
+        1. First-half knee: Run Kneedle on data[:quarter] (aggressive, ~10-20% of features)
+        2. Tail knee: Run Kneedle on data[3/4:] (conservative, finds where tail flattens at ~75%)
 
         Returns:
-            knee_1st: Knee index from first-half detection (absolute index)
-            knee_2nd: Knee index from second-half detection (absolute index)
+            knee_1st: Knee index from first-quarter detection (absolute index)
+            knee_2nd: Knee index from tail detection starting at 3/4 (absolute index)
         """
         n = len(sorted_values)
-        half_n = n // 2
+        quarter_n = n // 4
+        three_quarter_n = (3 * n) // 4
 
         knee_1st = None
         knee_2nd = None
 
-        # First half knee detection: Run Kneedle on data[:half]
+        # First quarter knee detection: Run Kneedle on data[:quarter]
         try:
-            x_range = np.arange(half_n)  # Relative indices [0, 1, 2, ..., half-1]
-            y_values = sorted_values[:half_n].cpu().numpy()  # Extract first half
+            x_range = np.arange(quarter_n)  # Relative indices [0, 1, 2, ..., quarter-1]
+            y_values = sorted_values[:quarter_n].cpu().numpy()  # Extract first quarter
             valid_mask = np.isfinite(y_values)
 
             if valid_mask.sum() > 10:
@@ -180,19 +181,19 @@ class SaliencyTailAnalyzer:
                     curve='convex', direction='decreasing', S=1.0
                 )
                 if knee_loc.knee is not None:
-                    knee_1st = int(knee_loc.knee)  # Already in absolute coordinates (0 to half-1)
+                    knee_1st = int(knee_loc.knee)  # Already in absolute coordinates (0 to quarter-1)
         except:
             pass
 
         if knee_1st is None:
             knee_1st = n // 10  # Fallback
 
-        # Second half knee detection: Run Kneedle on data[half:]
+        # Tail knee detection: Run Kneedle on data[3/4:]
         try:
-            second_half_start = half_n
-            second_half_len = n - second_half_start
-            x_range = np.arange(second_half_len)  # Relative indices [0, 1, 2, ...]
-            y_values = sorted_values[second_half_start:].cpu().numpy()  # Extract second half
+            tail_start = three_quarter_n
+            tail_len = n - tail_start
+            x_range = np.arange(tail_len)  # Relative indices [0, 1, 2, ...]
+            y_values = sorted_values[tail_start:].cpu().numpy()  # Extract last quarter
             valid_mask = np.isfinite(y_values)
 
             if valid_mask.sum() > 10:
@@ -201,13 +202,13 @@ class SaliencyTailAnalyzer:
                     curve='convex', direction='decreasing', S=1.0
                 )
                 if knee_loc.knee is not None:
-                    knee_relative = int(knee_loc.knee)  # Relative to second half
-                    knee_2nd = second_half_start + knee_relative  # Convert to absolute index
+                    knee_relative = int(knee_loc.knee)  # Relative to tail
+                    knee_2nd = tail_start + knee_relative  # Convert to absolute index
         except:
             pass
 
         if knee_2nd is None:
-            knee_2nd = n // 2  # Fallback
+            knee_2nd = three_quarter_n  # Fallback to 3/4 position
 
         return knee_1st, knee_2nd
 
