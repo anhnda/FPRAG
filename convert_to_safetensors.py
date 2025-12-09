@@ -70,6 +70,28 @@ def convert_to_safetensors(model_path, output_dir):
     print(f"Model size: {size_mb:.2f} MB")
     print(f"Number of tensors: {len(state_dict)}")
 
+    # Handle shared tensors (e.g., lm_head.weight and model.embed_tokens.weight)
+    print("\nChecking for shared tensors...")
+    shared_tensors = {}
+    tensor_ptrs = {}
+
+    for key, tensor in state_dict.items():
+        ptr = tensor.data_ptr()
+        if ptr in tensor_ptrs:
+            shared_tensors[key] = tensor_ptrs[ptr]
+            print(f"  Found shared tensor: {key} shares memory with {tensor_ptrs[ptr]}")
+        else:
+            tensor_ptrs[ptr] = key
+
+    # Clone shared tensors to make them independent
+    if shared_tensors:
+        print(f"\nCloning {len(shared_tensors)} shared tensor(s) to make them independent...")
+        for key in shared_tensors:
+            state_dict[key] = state_dict[key].clone()
+            print(f"  ✅ Cloned {key}")
+    else:
+        print("  No shared tensors found")
+
     # Save as safetensors
     print(f"\nSaving model to safetensors format...")
     safetensors_path = os.path.join(output_dir, "model.safetensors")
