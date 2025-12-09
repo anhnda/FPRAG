@@ -50,12 +50,30 @@ def main():
 
     # Load model
     print("\nLoading model...")
-    model = AutoAWQForCausalLM.from_pretrained(
-        args.model_path,
-        trust_remote_code=True,
-        safetensors=True,
-        device_map="cuda"
-    )
+    try:
+        model = AutoAWQForCausalLM.from_pretrained(
+            args.model_path,
+            trust_remote_code=True,
+            safetensors=True,
+            device_map="cuda"
+        )
+    except OSError as e:
+        if "model.safetensors" in str(e):
+            print("\n" + "=" * 80)
+            print("ERROR: Model requires safetensors format")
+            print("=" * 80)
+            print("AutoAWQ requires models in safetensors format, but this model")
+            print("is stored in PyTorch bin format.")
+            print("\nSOLUTION:")
+            print("1. Convert the model to safetensors format:")
+            print(f"   python convert_to_safetensors.py --input-model {args.model_path} --output-dir ./models/MiniCPM-2B-safetensors")
+            print("\n2. Then run quantization with the converted model:")
+            print("   python quantize_autoawq_library.py --model-path ./models/MiniCPM-2B-safetensors")
+            print("\nAlternatively, use a pre-converted safetensors model from HuggingFace.")
+            print("=" * 80)
+            exit(1)
+        else:
+            raise
 
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(
