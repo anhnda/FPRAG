@@ -5,8 +5,10 @@ This script:
 1. Computes saliency scores for all channels in a target layer
 2. Identifies top 10 channels with largest saliency
 3. For these channels, visualizes:
-   - Sorted [X*,j]^2 (squared input magnitudes)
-   - grad(w*,j)^2 (squared weight gradients from SiLU output)
+   - Sorted [X*,j]^2 (squared input magnitudes) with knee point detection
+   - grad(w*,j)^2 (squared weight gradients from SiLU output) with knee point detection
+4. Uses Kneedle algorithm to detect knee points on the first half of sorted data
+   for both E[X²] and grad² curves
 """
 
 import torch
@@ -19,6 +21,7 @@ from datasets import load_dataset
 from tqdm import tqdm
 import os
 import pandas as pd
+from kneed import KneeLocator
 
 # Set style
 sns.set_style("whitegrid")
@@ -211,16 +214,20 @@ class SaliencyGradientAnalyzer:
         for rank, ch_idx in enumerate(top_k_indices):
             print(f"  Rank {rank+1}: Channel {ch_idx.item()}, Saliency = {saliency[ch_idx]:.4f}")
 
+        # Store knee point info for summary
+        knee_points_info = []
+
         # Create visualizations for each top channel
         for rank, ch_idx in enumerate(top_k_indices):
             ch_idx = ch_idx.item()
-            self.visualize_channel(
+            knee_info = self.visualize_channel(
                 ch_idx, rank + 1, X, pre_act, weight_gradients,
                 saliency[ch_idx].item(), output_dir, target_module
             )
+            knee_points_info.append(knee_info)
 
         # Create summary statistics
-        self.create_summary(results, top_k_indices, output_dir)
+        self.create_summary(results, top_k_indices, output_dir, knee_points_info)
 
         # Create overall distribution plots
         self.plot_saliency_distribution(saliency, top_k_indices, output_dir)
@@ -228,10 +235,13 @@ class SaliencyGradientAnalyzer:
     def visualize_channel(self, ch_idx, rank, X, pre_act, weight_gradients, saliency_score, output_dir, target_module=None):
         """
         Create visualization for a single channel showing:
-        1. Sorted [X*,j]^2 (squared input contributions)
+        1. Sorted [X*,j]^2 (squared input contributions) with knee point
         2. Corresponding X values in sorted order
-        3. Sorted grad(w*,j)^2 (squared weight gradients)
+        3. Sorted grad(w*,j)^2 (squared weight gradients) with knee point
         4. Corresponding weight values in sorted order
+
+        Returns:
+            dict: Dictionary containing channel index and knee point indices for X² and grad²
         """
         # For channel j, we want to analyze how each input feature i contributes
         # [X*,j] means the contribution of input feature * to output channel j
@@ -262,6 +272,10 @@ class SaliencyGradientAnalyzer:
         # Sort by grad_squared
         grad_sorted_values, grad_sorted_indices = torch.sort(grad_squared, descending=True)
 
+        # Initialize knee point tracking
+        knee_idx_x2 = None
+        knee_idx_grad2 = None
+
         # Create figure with 2 rows, 3 columns
         fig, axes = plt.subplots(2, 3, figsize=(18, 10))
 
@@ -269,6 +283,31 @@ class SaliencyGradientAnalyzer:
         ax = axes[0, 0]
         n_features = len(X_sorted_values)
         ax.plot(range(n_features), X_sorted_values.numpy(), linewidth=1.5, alpha=0.8)
+
+        # Detect knee point on first half of data
+        half_n = n_features // 2
+        try:
+            # Use KneeLocator on first half
+            x_range_half = np.arange(half_n)
+            y_values_half = X_sorted_values[:half_n].numpy()
+
+            # Since values are sorted descending and on log scale, use 'convex' and 'decreasing'
+            knee_locator_x2 = KneeLocator(
+                x_range_half, y_values_half,
+                curve='convex', direction='decreasing',
+                S=1.0  # Sensitivity parameter
+            )
+
+            if knee_locator_x2.knee is not None:
+                knee_idx_x2 = int(knee_locator_x2.knee)
+                ax.axvline(knee_idx_x2, color='red', linestyle='--', linewidth=2,
+                          label=f'Knee point: {knee_idx_x2}')
+                ax.plot(knee_idx_x2, X_sorted_values[knee_idx_x2].numpy(),
+                       'ro', markersize=10, label=f'Knee value: {X_sorted_values[knee_idx_x2].item():.2e}')
+                ax.legend(fontsize=9)
+        except Exception as e:
+            print(f"    Warning: Could not detect knee point for X²: {e}")
+
         ax.set_xlabel('Feature Rank (sorted by X²)', fontsize=11)
         ax.set_ylabel('Mean Squared Input (X²)', fontsize=11)
         ax.set_title(f'Rank {rank}: Channel {ch_idx}\nSorted Input Magnitudes (X²)', fontsize=12)
@@ -288,6 +327,30 @@ class SaliencyGradientAnalyzer:
         # Plot 3 (Row 1, Col 2): Sorted grad^2
         ax = axes[0, 1]
         ax.plot(range(n_features), grad_sorted_values.numpy(), linewidth=1.5, alpha=0.8, color='orangered')
+
+        # Detect knee point on first half of data for grad²
+        try:
+            # Use KneeLocator on first half
+            x_range_half = np.arange(half_n)
+            y_values_half_grad = grad_sorted_values[:half_n].numpy()
+
+            # Since values are sorted descending and on log scale, use 'convex' and 'decreasing'
+            knee_locator_grad2 = KneeLocator(
+                x_range_half, y_values_half_grad,
+                curve='convex', direction='decreasing',
+                S=1.0  # Sensitivity parameter
+            )
+
+            if knee_locator_grad2.knee is not None:
+                knee_idx_grad2 = int(knee_locator_grad2.knee)
+                ax.axvline(knee_idx_grad2, color='red', linestyle='--', linewidth=2,
+                          label=f'Knee point: {knee_idx_grad2}')
+                ax.plot(knee_idx_grad2, grad_sorted_values[knee_idx_grad2].numpy(),
+                       'ro', markersize=10, label=f'Knee value: {grad_sorted_values[knee_idx_grad2].item():.2e}')
+                ax.legend(fontsize=9)
+        except Exception as e:
+            print(f"    Warning: Could not detect knee point for grad²: {e}")
+
         ax.set_xlabel('Weight Rank (sorted by grad²)', fontsize=11)
         ax.set_ylabel('Squared Weight Gradient', fontsize=11)
         ax.set_title(f'Rank {rank}: Channel {ch_idx}\nSorted Weight Gradients (grad²)', fontsize=12)
@@ -365,7 +428,14 @@ class SaliencyGradientAnalyzer:
 
         print(f"  Saved visualization for channel {ch_idx} (rank {rank})")
 
-    def create_summary(self, results, top_k_indices, output_dir):
+        # Return knee point information
+        return {
+            'channel_idx': ch_idx,
+            'knee_x2': knee_idx_x2,
+            'knee_grad2': knee_idx_grad2
+        }
+
+    def create_summary(self, results, top_k_indices, output_dir, knee_points_info):
         """Create summary statistics for top channels."""
         saliency = results['saliency']
         weight_gradients = results['weight_gradients']
@@ -381,6 +451,9 @@ class SaliencyGradientAnalyzer:
             from scipy.stats import spearmanr
             corr, _ = spearmanr(X_squared_mean.numpy(), grad_squared.numpy())
 
+            # Get knee point info for this channel
+            knee_info = knee_points_info[rank]
+
             summary_data.append({
                 'Rank': rank + 1,
                 'Channel_Index': ch_idx,
@@ -389,7 +462,9 @@ class SaliencyGradientAnalyzer:
                 'Max_X_Squared': X_squared_mean.max().item(),
                 'Mean_Grad_Squared': grad_squared.mean().item(),
                 'Max_Grad_Squared': grad_squared.max().item(),
-                'Spearman_Correlation': corr
+                'Spearman_Correlation': corr,
+                'Knee_X2_Index': knee_info['knee_x2'] if knee_info['knee_x2'] is not None else -1,
+                'Knee_Grad2_Index': knee_info['knee_grad2'] if knee_info['knee_grad2'] is not None else -1
             })
 
         df = pd.DataFrame(summary_data)
