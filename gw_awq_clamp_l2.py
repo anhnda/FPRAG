@@ -545,7 +545,7 @@ def main():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     parser.add_argument("--n-calib", type=int, default=128, help="Calibration samples")
-    parser.add_argument("--n-grid", type=int, default=5, help="Grid search points (5=fast, 10=balanced, 20=accurate)")
+    parser.add_argument("--n-grid", type=int, default=20, help="Grid search points (5=fast, 10=balanced, 20=accurate)")
     parser.add_argument("--group-size", type=int, default=128, help="Group size for quantization")
     parser.add_argument("--k-offset-ratio", type=float, default=0.05,
                        help="K-offset ratio for knee point (default: 5%% of weights)")
