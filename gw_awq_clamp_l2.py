@@ -3,22 +3,34 @@ Group-Wise AWQ Implementation with ASYMMETRIC Quantization + L2 Salience + Knee-
 
 Key Difference from gw_awq_asym_l2.py:
 - gw_awq_asym_l2.py: No weight clamping, uses full weight range
-- gw_awq_clamp_l2.py: Uses Kneedle algorithm to find knee point in sorted E[X²] importance,
-                       then clamps weights to the range of top-k+k_offset important weights
+- gw_awq_clamp_l2.py: Uses Kneedle algorithm on SECOND HALF to find where importance
+                       flattens, then clamps to range of important weights (beginning to knee)
+
+NEW APPROACH (v2):
+- Find knee on SECOND HALF of sorted importance (where it flattens to near-zero)
+- Clamp from BEGINNING TO KNEE (important weights only)
+- Ignore unimportant tail after knee point
 
 Algorithm:
 1. Compute per-input-channel salience: s[j] = E[X[:, j]²] (L2 norm)
 2. For each output channel:
    a. Compute per-weight importance: w_imp[i,j] = |W[i,j]| × s[j]
-   b. Sort weights by importance and find knee point k on first half (Kneedle)
-   c. Compute k_offset = int(k_offset_ratio × num_weights) (default: 5%)
-   d. Get weight range: [min(W_top), max(W_top)] where W_top = top (k+k_offset) weights
-   e. Clamp all weights in channel to this range
+   b. Sort weights by importance (descending)
+   c. Find knee point k on SECOND HALF using Kneedle (where importance → 0)
+   d. k_offset = int(k_offset_ratio × num_weights) (default: 5%)
+   e. Get weight range from BEGINNING TO (k + k_offset)
+   f. Clamp all weights in channel to this range
+   g. Ignore weights after knee (unimportant tail)
 3. Grid search for optimal α ∈ [0, 1]
 4. Scale weight COLUMNS: W[:, j] *= s[j]^α
 5. Quantize with GROUP-WISE ASYMMETRIC scales
    - Per group: scale = (max - min) / 15, zero_point = round(-min / scale)
 6. Divide by input scales: W_final = Q(W*s) / s
+
+Rationale:
+- Knee in 2nd half = boundary between "somewhat important" and "clearly unimportant"
+- Only preserve range of important weights (up to knee)
+- Don't waste bits representing unimportant tail
 """
 
 import torch
@@ -124,10 +136,22 @@ class GroupWiseAWQClampL2Quantizer:
         """
         OPTIMIZED: Compute per-channel weight clamping ranges using fast knee-point detection.
 
-        Optimization strategy:
-        1. Run Kneedle on AGGREGATED importance across all channels (1x instead of out_features times)
-        2. Use the global knee point for all channels
-        3. Much faster: O(in_features × log(in_features)) instead of O(out_features × in_features × log(in_features))
+        NEW APPROACH (v2 - Second Half Knee):
+        1. Sort weights by importance (descending)
+        2. Find knee on SECOND HALF (where importance flattens to near-zero)
+        3. Clamp weights from BEGINNING TO KNEE POINT (the important ones)
+        4. Ignore clearly non-significant weights after knee (the tail)
+
+        Rationale:
+        - Knee in 2nd half = boundary between "somewhat important" and "clearly unimportant"
+        - We only care about range of weights UP TO this knee point
+        - Tail weights after knee are insignificant anyway, so ignore them
+        - This reduces outliers in important weights while not worrying about unimportant tail
+
+        Optimization:
+        - Run Kneedle once on aggregated importance (all channels)
+        - Vectorized per-channel clamping (no loops)
+        - O(in_features × log(in_features)) complexity
 
         Args:
             W: Weight tensor [out_features, in_features]
@@ -146,34 +170,41 @@ class GroupWiseAWQClampL2Quantizer:
         weight_importance_global = (torch.abs(W) * activation_salience.unsqueeze(0)).mean(dim=0)  # Average across output channels
         sorted_importance_global, _ = torch.sort(weight_importance_global, descending=True)
 
+        # NEW: Find knee on SECOND HALF (where importance flattens out)
         half_n = in_features // 2
-        try:
-            x_range = np.arange(half_n)
-            y_values = sorted_importance_global[:half_n].cpu().numpy()
+        second_half_start = half_n
+        second_half_len = in_features - second_half_start
 
-            # Filter out NaN/inf values that cause scipy warnings
+        try:
+            # Use second half for knee detection
+            x_range = np.arange(second_half_len) + second_half_start  # Offset to actual indices
+            y_values = sorted_importance_global[second_half_start:].cpu().numpy()
+
+            # Filter out NaN/inf values
             valid_mask = np.isfinite(y_values)
-            if valid_mask.sum() > 10:  # Need at least some valid points
+            if valid_mask.sum() > 10:
                 x_range_valid = x_range[valid_mask]
                 y_values_valid = y_values[valid_mask]
 
                 knee_locator = KneeLocator(
                     x_range_valid, y_values_valid,
                     curve='convex', direction='decreasing',
-                    S=1.0, online=True  # online=True is faster
+                    S=1.0, online=True
                 )
 
                 if knee_locator.knee is not None:
                     global_knee = int(knee_locator.knee)
                 else:
-                    global_knee = max(1, in_features // 10)
+                    # Fallback: use 50% of features (middle)
+                    global_knee = in_features // 2
             else:
-                global_knee = max(1, in_features // 10)
-        except Exception as e:
+                global_knee = in_features // 2
+        except Exception:
             # Fallback if Kneedle fails
-            global_knee = max(1, in_features // 10)
+            global_knee = in_features // 2
 
-        # OPTIMIZED: Fully vectorized per-channel range computation
+        # NEW: Clamp from BEGINNING TO KNEE (important weights only)
+        # Ignore weights after knee (unimportant tail)
         top_k = min(global_knee + k_offset, in_features)
 
         # Compute weight importance for ALL channels at once [out_features, in_features]
@@ -204,7 +235,8 @@ class GroupWiseAWQClampL2Quantizer:
             'mean_knee': global_knee,
             'median_knee': global_knee,
             'mean_clamp_ratio': np.mean(clamp_ratios) if clamp_ratios else 1.0,
-            'k_offset': k_offset
+            'k_offset': k_offset,
+            'top_k': top_k  # Number of important weights considered
         }
 
         return min_clamp, max_clamp, clamp_stats
@@ -452,20 +484,22 @@ class GroupWiseAWQClampL2Quantizer:
     def quantize_model(self):
         """Quantize all linear layers using Group-Wise AWQ with L2 Salience and Weight Clamping."""
         print("\n" + "=" * 80)
-        print("Quantizing with Group-Wise AWQ ASYMMETRIC + L2 Salience + Knee-Point Clamping")
+        print("Quantizing with Group-Wise AWQ ASYMMETRIC + L2 Salience + Knee-Point Clamping (v2)")
         print("=" * 80)
         print("Method:")
         print("  1. Compute per-input-channel L2 salience: s[j] = E[X[:, j]²]")
         print("  2. For each output channel:")
         print("     a. Compute weight importance: w_imp[i,j] = |W[i,j]| × s[j]")
-        print("     b. Sort by importance, find knee point k on first half (Kneedle)")
-        print(f"     c. k_offset = {self.k_offset_ratio * 100:.1f}% × num_weights")
-        print("     d. Clamp to range of top (k + k_offset) weights")
+        print("     b. Sort by importance (descending)")
+        print("     c. Find knee point k on SECOND HALF (Kneedle - where importance → 0)")
+        print(f"     d. k_offset = {self.k_offset_ratio * 100:.1f}% × num_weights")
+        print("     e. Clamp to range from BEGINNING TO (k + k_offset)")
+        print("     f. Ignore unimportant tail after knee")
         print("  3. Grid search for optimal α ∈ [0, 1]")
         print("  4. Scale weight columns: W[:, j] *= s[j]^α")
         print(f"  5. GROUP-WISE ASYMMETRIC INT4 quantization [0, 15] (group_size={self.group_size})")
         print("  6. Divide by input scales: W_final = Q(W*s) / s")
-        print("\nKey Innovation: Knee-point based weight clamping for better quantization")
+        print("\nKey Innovation: 2nd-half knee detection focuses on important weights only")
         print("=" * 80)
 
         quantized_count = 0
@@ -566,20 +600,22 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     print("=" * 80)
-    print("Group-Wise AWQ with ASYMMETRIC Quantization + L2 Salience + Knee-Point Clamping")
+    print("Group-Wise AWQ with ASYMMETRIC Quantization + L2 Salience + Knee-Point Clamping (v2)")
     print("=" * 80)
     print("Algorithm:")
     print("  1. Per-input-channel L2 salience: s[j] = E[X[:, j]²]")
-    print("  2. Knee-point detection per channel:")
+    print("  2. Knee-point detection per channel (NEW v2 approach):")
     print("     - Compute w_imp[i,j] = |W[i,j]| × s[j]")
-    print("     - Sort and find knee k on first half (Kneedle)")
+    print("     - Sort by importance (descending)")
+    print("     - Find knee k on SECOND HALF (Kneedle - where importance → 0)")
     print(f"     - k_offset = {args.k_offset_ratio * 100:.1f}% × num_weights")
-    print("     - Clamp to range of top (k + k_offset) weights")
+    print("     - Clamp from BEGINNING TO (k + k_offset)")
+    print("     - Ignore unimportant tail after knee")
     print("  3. Grid search optimal α ∈ [0, 1]")
     print("  4. Column-wise weight scaling: W[:, j] *= s[j]^α")
     print(f"  5. GROUP-WISE ASYMMETRIC INT4 quantization [0, 15] (group_size={args.group_size})")
     print("  6. Descaling: W_final = Q(W*s) / s")
-    print("\nKey Innovation: Knee-point based range limiting reduces quantization outliers")
+    print("\nKey Innovation: 2nd-half knee focuses on important weights, ignores tail")
     print("=" * 80)
     print(f"Device: {device}")
     print(f"Model: {model_name}")
