@@ -129,13 +129,16 @@ class HeuristicGroupWiseAWQQuantizer:
         total_samples = sum(x.reshape(-1, x.shape[-1]).shape[0] for x in X_list)
         in_features = X_list[0].shape[-1]
 
+        # Move scales to CPU for computation (activations are stored on CPU)
+        scales_cpu = scales.cpu() if scales.device.type != 'cpu' else scales
+
         # Accumulate scaled activation mean on CPU
         scaled_mean_sum = torch.zeros(in_features)
 
         for x in X_list:
             x_flat = x.reshape(-1, x.shape[-1])
-            # Scale the activations
-            xs_flat = x_flat / scales.unsqueeze(0)
+            # Scale the activations (both on CPU now)
+            xs_flat = x_flat / scales_cpu.unsqueeze(0)
             scaled_mean_sum += xs_flat.sum(dim=0)
 
         scaled_mean = scaled_mean_sum / total_samples
