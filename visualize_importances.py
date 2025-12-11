@@ -157,6 +157,10 @@ class ImportanceVisualizer:
         mean_sorted = mean_importance[mean_sorted_idx]
         l2_sorted = l2_importance[l2_sorted_idx]
 
+        # Create explicit x-axis arrays
+        x_original = np.arange(n_channels)
+        x_sorted = np.arange(n_channels)
+
         # Create figure with 3x3 layout
         fig = plt.figure(figsize=(24, 18))
 
@@ -164,18 +168,20 @@ class ImportanceVisualizer:
 
         # 1. Original order - E[X[:,j]]
         ax1 = plt.subplot(3, 3, 1)
-        ax1.plot(mean_importance, linewidth=0.5, alpha=0.7)
+        ax1.plot(x_original, mean_importance, linewidth=0.5, alpha=0.7)
         ax1.set_xlabel('Channel Index (original order)')
         ax1.set_ylabel('E[X[:,j]]')
         ax1.set_title(f'{layer_name}\nMean Activation - Original Order')
+        ax1.set_xlim(0, n_channels - 1)
         ax1.grid(True, alpha=0.3)
 
         # 2. Sorted order - E[X[:,j]]
         ax2 = plt.subplot(3, 3, 2)
-        ax2.plot(mean_sorted, linewidth=0.8, color='blue')
+        ax2.plot(x_sorted, mean_sorted, linewidth=0.8, color='blue')
         ax2.set_xlabel('Channel Rank (sorted by E[X[:,j]])')
         ax2.set_ylabel('E[X[:,j]]')
         ax2.set_title('Mean Activation - Sorted (Descending)')
+        ax2.set_xlim(0, n_channels - 1)
         ax2.grid(True, alpha=0.3)
         ax2.set_yscale('log')
 
@@ -192,18 +198,20 @@ class ImportanceVisualizer:
 
         # 4. Original order - E[X[:,j]²]
         ax4 = plt.subplot(3, 3, 4)
-        ax4.plot(l2_importance, linewidth=0.5, alpha=0.7, color='red')
+        ax4.plot(x_original, l2_importance, linewidth=0.5, alpha=0.7, color='red')
         ax4.set_xlabel('Channel Index (original order)')
         ax4.set_ylabel('E[X[:,j]²]')
         ax4.set_title('L2 Salience - Original Order')
+        ax4.set_xlim(0, n_channels - 1)
         ax4.grid(True, alpha=0.3)
 
         # 5. Sorted order - E[X[:,j]²]
         ax5 = plt.subplot(3, 3, 5)
-        ax5.plot(l2_sorted, linewidth=0.8, color='red')
+        ax5.plot(x_sorted, l2_sorted, linewidth=0.8, color='red')
         ax5.set_xlabel('Channel Rank (sorted by E[X[:,j]²])')
         ax5.set_ylabel('E[X[:,j]²]')
         ax5.set_title('L2 Salience - Sorted (Descending)')
+        ax5.set_xlim(0, n_channels - 1)
         ax5.grid(True, alpha=0.3)
         ax5.set_yscale('log')
 
