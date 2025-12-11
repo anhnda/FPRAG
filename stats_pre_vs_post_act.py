@@ -301,8 +301,8 @@ def main():
                 padding=False
             ).to(device)
 
-            # Forward pass
-            _ = model(**inputs)
+            # Forward pass (disable cache to avoid compatibility issues)
+            _ = model(**inputs, use_cache=False)
             n_collected += 1
 
     # Remove hook
