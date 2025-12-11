@@ -214,14 +214,14 @@ class RoundingErrorAnalyzer:
         important_errors = rounding_error_flat[:, important_mask]
         non_important_errors = rounding_error_flat[:, ~important_mask]
 
-        # Flatten to get all errors
-        important_errors_all = important_errors.flatten().cpu().numpy()
-        non_important_errors_all = non_important_errors.flatten().cpu().numpy()
+        # Flatten to get all errors (convert to float32 for numpy compatibility)
+        important_errors_all = important_errors.flatten().float().cpu().numpy()
+        non_important_errors_all = non_important_errors.flatten().float().cpu().numpy()
 
         # Per-channel statistics (average over output features)
-        per_channel_error_mean = rounding_error_flat.mean(dim=0).cpu().numpy()
-        per_channel_error_std = rounding_error_flat.std(dim=0).cpu().numpy()
-        per_channel_error_abs_mean = rounding_error_flat.abs().mean(dim=0).cpu().numpy()
+        per_channel_error_mean = rounding_error_flat.mean(dim=0).float().cpu().numpy()
+        per_channel_error_std = rounding_error_flat.std(dim=0).float().cpu().numpy()
+        per_channel_error_abs_mean = rounding_error_flat.abs().mean(dim=0).float().cpu().numpy()
 
         results = {
             'important_errors': important_errors_all,
@@ -229,7 +229,7 @@ class RoundingErrorAnalyzer:
             'per_channel_error_mean': per_channel_error_mean,
             'per_channel_error_std': per_channel_error_std,
             'per_channel_error_abs_mean': per_channel_error_abs_mean,
-            'importance_scores': importance_scores.cpu().numpy(),
+            'importance_scores': importance_scores.float().cpu().numpy(),
             'important_mask': important_mask.cpu().numpy(),
             'n_important': important_mask.sum().item(),
             'n_non_important': (~important_mask).sum().item()
