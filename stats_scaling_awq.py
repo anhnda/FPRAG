@@ -266,89 +266,80 @@ class AWQScalingVisualizer:
         mean_scaled = mean_orig / scales_np  # X_scaled = X / scale
         l2_scaled = l2_orig / (scales_np ** 2)  # E[(X/s)²] = E[X²]/s²
 
-        # Get weight statistics (sample a few output channels)
+        # Get weight statistics (sample output channels)
         W_np = W.float().cpu().numpy()
-        sample_out_channels = np.linspace(0, W_np.shape[0]-1, 5, dtype=int)
+        sample_out_channels = np.linspace(0, W_np.shape[0]-1, 6, dtype=int)
 
-        # Create figure
-        fig = plt.figure(figsize=(24, 20))
+        # Create figure with 5x3 layout
+        fig = plt.figure(figsize=(24, 25))
 
-        # === E[X[:,i]] VISUALIZATION ===
-
-        # 1. E[X[:,i]] - original vs scaled
-        ax1 = plt.subplot(4, 3, 1)
         x_idx = np.arange(n_features)
-        ax1.plot(x_idx, mean_orig, linewidth=0.5, alpha=0.7, label='Original', color='blue')
-        ax1.plot(x_idx, mean_scaled, linewidth=0.5, alpha=0.7, label='Scaled (÷ scale)', color='red')
+
+        # === ROW 1: E[X[:,i]] VISUALIZATION ===
+
+        # 1. E[X[:,i]] - BEFORE scaling
+        ax1 = plt.subplot(5, 3, 1)
+        ax1.plot(x_idx, mean_orig, linewidth=0.5, alpha=0.7, color='blue')
+        ax1.axhline(0, color='black', linestyle='--', linewidth=0.5, alpha=0.3)
         ax1.set_xlabel('Input Channel Index')
         ax1.set_ylabel('E[X[:,i]]')
-        ax1.set_title(f'{layer_name}\nE[X[:,i]] Before/After Scaling (α={best_alpha:.3f})')
-        ax1.legend(loc='upper right')
+        ax1.set_title(f'{layer_name}\nE[X[:,i]] BEFORE Scaling')
         ax1.grid(True, alpha=0.3)
 
-        # 2. E[X[:,i]] distribution histogram
-        ax2 = plt.subplot(4, 3, 2)
-        ax2.hist(np.abs(mean_orig), bins=50, alpha=0.6, label='Original', color='blue', density=True)
-        ax2.hist(np.abs(mean_scaled), bins=50, alpha=0.6, label='Scaled', color='red', density=True)
-        ax2.set_xlabel('|E[X[:,i]]|')
-        ax2.set_ylabel('Density')
-        ax2.set_title('Distribution of |E[X[:,i]]|')
-        ax2.set_xscale('log')
-        ax2.legend(loc='upper right')
+        # 2. E[X[:,i]] - AFTER scaling
+        ax2 = plt.subplot(5, 3, 2)
+        ax2.plot(x_idx, mean_scaled, linewidth=0.5, alpha=0.7, color='red')
+        ax2.axhline(0, color='black', linestyle='--', linewidth=0.5, alpha=0.3)
+        ax2.set_xlabel('Input Channel Index')
+        ax2.set_ylabel('E[X[:,i]]')
+        ax2.set_title(f'E[X[:,i]] AFTER Scaling (÷ scale, α={best_alpha:.3f})')
         ax2.grid(True, alpha=0.3)
 
-        # 3. Ratio: scaled / original
-        ax3 = plt.subplot(4, 3, 3)
-        ratio_mean = mean_scaled / (mean_orig + 1e-10)
-        ax3.scatter(x_idx, ratio_mean, s=1, alpha=0.5)
-        ax3.axhline(1.0, color='black', linestyle='--', linewidth=1, alpha=0.5, label='No change')
-        ax3.set_xlabel('Input Channel Index')
-        ax3.set_ylabel('E[X_scaled] / E[X_orig]')
-        ax3.set_title('Mean Activation Ratio (Scaled / Original)')
-        ax3.set_yscale('log')
+        # 3. E[X[:,i]] distribution comparison
+        ax3 = plt.subplot(5, 3, 3)
+        ax3.hist(mean_orig, bins=50, alpha=0.6, label='Before', color='blue', density=True)
+        ax3.hist(mean_scaled, bins=50, alpha=0.6, label='After', color='red', density=True)
+        ax3.axvline(0, color='black', linestyle='--', linewidth=1, alpha=0.5)
+        ax3.set_xlabel('E[X[:,i]]')
+        ax3.set_ylabel('Density')
+        ax3.set_title('E[X[:,i]] Distribution')
         ax3.legend(loc='upper right')
-        ax3.grid(True, alpha=0.3)
+        ax3.grid(True, alpha=0.3, axis='y')
 
-        # === E[X[:,i]²] VISUALIZATION ===
+        # === ROW 2: E[X[:,i]²] VISUALIZATION ===
 
-        # 4. E[X[:,i]²] - original vs scaled
-        ax4 = plt.subplot(4, 3, 4)
-        ax4.plot(x_idx, l2_orig, linewidth=0.5, alpha=0.7, label='Original', color='blue')
-        ax4.plot(x_idx, l2_scaled, linewidth=0.5, alpha=0.7, label='Scaled (÷ scale²)', color='red')
+        # 4. E[X[:,i]²] - BEFORE scaling
+        ax4 = plt.subplot(5, 3, 4)
+        ax4.plot(x_idx, l2_orig, linewidth=0.5, alpha=0.7, color='blue')
         ax4.set_xlabel('Input Channel Index')
         ax4.set_ylabel('E[X[:,i]²]')
-        ax4.set_title('E[X[:,i]²] (L2 Salience) Before/After Scaling')
-        ax4.legend(loc='upper right')
+        ax4.set_title('E[X[:,i]²] (L2 Salience) BEFORE Scaling')
         ax4.grid(True, alpha=0.3)
 
-        # 5. E[X[:,i]²] distribution histogram
-        ax5 = plt.subplot(4, 3, 5)
-        ax5.hist(l2_orig, bins=50, alpha=0.6, label='Original', color='blue', density=True)
-        ax5.hist(l2_scaled, bins=50, alpha=0.6, label='Scaled', color='red', density=True)
-        ax5.set_xlabel('E[X[:,i]²]')
-        ax5.set_ylabel('Density')
-        ax5.set_title('Distribution of E[X[:,i]²]')
-        ax5.set_xscale('log')
-        ax5.legend(loc='upper right')
+        # 5. E[X[:,i]²] - AFTER scaling
+        ax5 = plt.subplot(5, 3, 5)
+        ax5.plot(x_idx, l2_scaled, linewidth=0.5, alpha=0.7, color='red')
+        ax5.set_xlabel('Input Channel Index')
+        ax5.set_ylabel('E[X[:,i]²]')
+        ax5.set_title('E[X[:,i]²] AFTER Scaling (÷ scale²)')
         ax5.grid(True, alpha=0.3)
 
-        # 6. Ratio: scaled / original
-        ax6 = plt.subplot(4, 3, 6)
-        ratio_l2 = l2_scaled / (l2_orig + 1e-10)
-        ax6.scatter(x_idx, ratio_l2, s=1, alpha=0.5)
-        ax6.axhline(1.0, color='black', linestyle='--', linewidth=1, alpha=0.5, label='No change')
-        ax6.set_xlabel('Input Channel Index')
-        ax6.set_ylabel('E[X²_scaled] / E[X²_orig]')
-        ax6.set_title('L2 Salience Ratio (Scaled / Original)')
-        ax6.set_yscale('log')
+        # 6. E[X[:,i]²] distribution comparison
+        ax6 = plt.subplot(5, 3, 6)
+        ax6.hist(l2_orig, bins=50, alpha=0.6, label='Before', color='blue', density=True)
+        ax6.hist(l2_scaled, bins=50, alpha=0.6, label='After', color='red', density=True)
+        ax6.set_xlabel('E[X[:,i]²]')
+        ax6.set_ylabel('Density')
+        ax6.set_title('E[X[:,i]²] Distribution')
+        ax6.set_xscale('log')
         ax6.legend(loc='upper right')
-        ax6.grid(True, alpha=0.3)
+        ax6.grid(True, alpha=0.3, axis='y')
 
-        # === SCALING FACTORS ===
+        # === ROW 3: SCALING FACTORS ===
 
-        # 7. Scaling factors distribution
-        ax7 = plt.subplot(4, 3, 7)
-        ax7.plot(x_idx, scales_np, linewidth=0.5, alpha=0.7)
+        # 7. Scaling factors per channel
+        ax7 = plt.subplot(5, 3, 7)
+        ax7.plot(x_idx, scales_np, linewidth=0.5, alpha=0.7, color='green')
         ax7.set_xlabel('Input Channel Index')
         ax7.set_ylabel('Scale Factor')
         ax7.set_title(f'AWQ Scaling Factors (s^α where α={best_alpha:.3f})')
@@ -356,8 +347,8 @@ class AWQScalingVisualizer:
         ax7.grid(True, alpha=0.3)
 
         # 8. Scale vs L2 salience
-        ax8 = plt.subplot(4, 3, 8)
-        ax8.scatter(l2_orig, scales_np, s=2, alpha=0.5)
+        ax8 = plt.subplot(5, 3, 8)
+        ax8.scatter(l2_orig, scales_np, s=2, alpha=0.5, color='green')
         ax8.set_xlabel('E[X[:,i]²] (L2 Salience)')
         ax8.set_ylabel('Scale Factor')
         ax8.set_title('Scaling Factor vs L2 Salience')
@@ -366,7 +357,7 @@ class AWQScalingVisualizer:
         ax8.grid(True, alpha=0.3)
 
         # 9. Scale distribution histogram
-        ax9 = plt.subplot(4, 3, 9)
+        ax9 = plt.subplot(5, 3, 9)
         ax9.hist(scales_np, bins=50, alpha=0.7, color='green', edgecolor='black')
         ax9.set_xlabel('Scale Factor')
         ax9.set_ylabel('Count')
@@ -374,20 +365,19 @@ class AWQScalingVisualizer:
         ax9.set_xscale('log')
         ax9.grid(True, alpha=0.3, axis='y')
 
-        # === WEIGHT DISTRIBUTION ===
+        # === ROW 4-5: WEIGHT DISTRIBUTIONS (6 sample output channels) ===
 
-        # 10-12. Weight distributions for sample output channels
-        for plot_idx, out_ch in enumerate(sample_out_channels[:3]):
-            ax = plt.subplot(4, 3, 10 + plot_idx)
+        for plot_idx, out_ch in enumerate(sample_out_channels):
+            ax = plt.subplot(5, 3, 10 + plot_idx)
 
             W_orig_ch = W_np[out_ch, :]
             W_scaled_ch = W_orig_ch * scales_np
 
-            ax.hist(W_orig_ch, bins=50, alpha=0.6, label='Original', color='blue', density=True)
-            ax.hist(W_scaled_ch, bins=50, alpha=0.6, label='Scaled (× scale)', color='red', density=True)
+            ax.hist(W_orig_ch, bins=50, alpha=0.6, label='Before', color='blue', density=True)
+            ax.hist(W_scaled_ch, bins=50, alpha=0.6, label='After (× scale)', color='red', density=True)
             ax.set_xlabel('Weight Value')
             ax.set_ylabel('Density')
-            ax.set_title(f'Weight Distribution: Output Channel {out_ch}')
+            ax.set_title(f'Weights W[{out_ch},:]')
             ax.legend(loc='upper right')
             ax.grid(True, alpha=0.3, axis='y')
 
