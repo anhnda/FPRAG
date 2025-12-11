@@ -428,6 +428,31 @@ class AWQScalingVisualizer:
         print(f"  Scaled - Mean |W|: {np.abs(W_scaled).mean():.6e}")
         print(f"  Scaled - Std W: {W_scaled.std():.6e}")
 
+        # Analyze by salience level
+        print(f"\n--- Analysis by Salience Level ---")
+        median_l2 = np.median(l2_orig)
+        high_salience_mask = l2_orig > median_l2
+        low_salience_mask = l2_orig <= median_l2
+
+        print(f"\nHIGH Salience Channels (top 50%, salience > {median_l2:.6e}):")
+        high_scales = scales[high_salience_mask]
+        print(f"  Mean scale: {high_scales.mean():.6e} (expect > 1 for high salience)")
+        print(f"  Channels with scale > 1: {(high_scales > 1).sum()} / {len(high_scales)}")
+        print(f"  E[X] ratio (scaled/orig): {np.abs(mean_scaled[high_salience_mask]).mean() / np.abs(mean_orig[high_salience_mask]).mean():.4f}")
+        print(f"  E[X²] ratio (scaled/orig): {l2_scaled[high_salience_mask].mean() / l2_orig[high_salience_mask].mean():.4f}")
+
+        print(f"\nLOW Salience Channels (bottom 50%, salience <= {median_l2:.6e}):")
+        low_scales = scales[low_salience_mask]
+        print(f"  Mean scale: {low_scales.mean():.6e} (expect < 1 for low salience)")
+        print(f"  Channels with scale < 1: {(low_scales < 1).sum()} / {len(low_scales)}")
+        print(f"  E[X] ratio (scaled/orig): {np.abs(mean_scaled[low_salience_mask]).mean() / np.abs(mean_orig[low_salience_mask]).mean():.4f}")
+        print(f"  E[X²] ratio (scaled/orig): {l2_scaled[low_salience_mask].mean() / l2_orig[low_salience_mask].mean():.4f}")
+
+        print(f"\n--- Interpretation ---")
+        print(f"  When scale > 1 (high salience): X↓ (÷scale), W↑ (×scale)")
+        print(f"  When scale < 1 (low salience): X↑ (÷scale), W↓ (×scale)")
+        print(f"  Goal: Protect important (high salience) channels with larger weights")
+
         print(f"\n{'='*80}")
 
 
