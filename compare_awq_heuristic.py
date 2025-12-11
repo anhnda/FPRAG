@@ -425,7 +425,7 @@ def main():
     parser.add_argument(
         "--heuristic-path",
         type=str,
-        default="./quantized_models/minicpm_awq_heuristic",
+        default="./quantized_models/awq_heuristic",
         help="Path to Heuristic AWQ model (awq_op.py output)"
     )
     parser.add_argument(
