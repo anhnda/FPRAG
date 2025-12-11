@@ -262,7 +262,52 @@ array = tensor.numpy()
 array = tensor.float().numpy()
 ```
 
-### 4. Activation Hook Best Practices
+### 4. Understanding Pre/Post Activation for SiLU Layers
+
+**CRITICAL:** When capturing pre/post activation for gate_proj layers with SiLU, understand the flow:
+
+```
+Input (X) → gate_proj (Linear) → Output (XW) → SiLU → SiLU(XW)
+            [in, hidden]         [in, intermediate]    [in, intermediate]
+```
+
+**Common mistakes:**
+```python
+# ❌ WRONG - This captures INPUT and OUTPUT of gate_proj
+def hook_fn(module, input, output):
+    pre_act = input[0]   # This is X (input to linear layer), NOT pre-activation
+    post_act = output    # This is XW (output of linear layer), NOT post-activation
+```
+
+**Correct approaches:**
+
+**Option 1: Manual SiLU application (simpler)**
+```python
+def hook_fn(module, input, output):
+    pre_act = output.detach().cpu()          # XW (pre-activation for SiLU)
+    post_act = silu(pre_act)                 # SiLU(XW) (post-activation)
+    self.pre_activation.append(pre_act)
+    self.post_activation.append(post_act)
+
+def silu(x):
+    return x * torch.sigmoid(x)
+```
+
+**Option 2: Hook both gate_proj and act_fn modules (more accurate)**
+```python
+# Hook gate_proj for pre-activation
+def gate_hook(module, input, output):
+    pre_activations.append(output.detach().cpu())
+
+# Hook the separate SiLU module for post-activation
+def silu_hook(module, input, output):
+    post_activations.append(output.detach().cpu())
+
+hook1 = model.layers[i].mlp.gate_proj.register_forward_hook(gate_hook)
+hook2 = model.layers[i].mlp.act_fn.register_forward_hook(silu_hook)
+```
+
+### 5. Activation Hook Best Practices
 
 When writing hooks to capture activations:
 
@@ -284,7 +329,15 @@ class ActivationCapture:
         return result
 ```
 
-### 5. Model Forward Pass Template
+**Note:** For AWQ quantization, you need the INPUT to linear layers (not pre/post activation):
+```python
+def awq_hook(module, input, output):
+    # Capture INPUT for computing activation salience
+    X = input[0].detach().cpu()
+    self.inputs.append(X)
+```
+
+### 6. Model Forward Pass Template
 
 Standard template for running MiniCPM model on calibration data:
 

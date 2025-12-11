@@ -30,10 +30,17 @@ class ActivationCapture:
         self.post_activation = []
 
     def hook_fn(self, module, input, output):
-        """Capture both pre-activation (input) and post-activation (output)"""
-        # input is a tuple, we want the first element
-        pre_act = input[0].detach().cpu()
-        post_act = output.detach().cpu()
+        """
+        Capture pre-activation (gate_proj output) and post-activation (after SiLU).
+
+        For gate_proj layer:
+        - output = gate_proj(input) = pre-activation for SiLU
+        - SiLU(output) = post-activation
+        """
+        # Output of gate_proj is the pre-activation for SiLU
+        pre_act = output.detach().cpu()
+        # Apply SiLU to get post-activation
+        post_act = silu(pre_act)
 
         self.pre_activation.append(pre_act)
         self.post_activation.append(post_act)
