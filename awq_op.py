@@ -32,6 +32,7 @@ import os
 import argparse
 import random
 import numpy as np
+import gc
 
 
 class HeuristicGroupWiseAWQQuantizer:
@@ -93,68 +94,47 @@ class HeuristicGroupWiseAWQQuantizer:
         self.hooks = []
 
     @torch.no_grad()
-    def get_activation_salience_l2(self, name):
+    def get_activation_stats(self, name):
         """
-        Compute per-input-channel activation salience using L2 norm: E[X[:, j]²]
-        This is used for AWQ scaling.
-        """
-        if name not in self.activation_data or len(self.activation_data[name]) == 0:
-            return None
+        Compute both L2 salience (E[X²]) and raw mean (E[X]) in ONE PASS.
 
-        X_list = self.activation_data[name]
-        total_samples = sum(x.reshape(-1, x.shape[-1]).shape[0] for x in X_list)
-        in_features = X_list[0].shape[-1]
-
-        # Accumulate L2 salience on CPU
-        salience_sum = torch.zeros(in_features)
-
-        for x in X_list:
-            x_flat = x.reshape(-1, x.shape[-1])
-            salience_sum += x_flat.pow(2).sum(dim=0)
-
-        salience = salience_sum / total_samples
-        return salience
-
-    @torch.no_grad()
-    def get_scaled_activation_mean(self, name, scales):
-        """
-        Compute mean of scaled activations: E[Xs[:, j]] where Xs = X / scales
-        This is used for heuristic quantization guidance.
+        Key Optimization: E[X/s] = E[X] / s
+        So we compute E[X] once, then reuse it by dividing by scales.
 
         Returns:
-            Tensor of shape [in_features] with SIGNED mean values
+            salience: E[X²] for AWQ scaling
+            raw_mean: E[X] for heuristic guidance (reusable)
         """
         if name not in self.activation_data or len(self.activation_data[name]) == 0:
-            return None
+            return None, None
 
         X_list = self.activation_data[name]
         total_samples = sum(x.reshape(-1, x.shape[-1]).shape[0] for x in X_list)
         in_features = X_list[0].shape[-1]
 
-        # Move scales to CPU for computation (activations are stored on CPU)
-        scales_cpu = scales.cpu() if scales.device.type != 'cpu' else scales
-
-        # Accumulate scaled activation mean on CPU
-        scaled_mean_sum = torch.zeros(in_features)
+        # Accumulate both statistics on CPU in one pass
+        l2_sum = torch.zeros(in_features, dtype=torch.float32)
+        mean_sum = torch.zeros(in_features, dtype=torch.float32)
 
         for x in X_list:
-            x_flat = x.reshape(-1, x.shape[-1])
-            # Scale the activations (both on CPU now)
-            xs_flat = x_flat / scales_cpu.unsqueeze(0)
-            scaled_mean_sum += xs_flat.sum(dim=0)
+            x_flat = x.reshape(-1, x.shape[-1]).float()
+            l2_sum += x_flat.pow(2).sum(dim=0)
+            mean_sum += x_flat.sum(dim=0)
 
-        scaled_mean = scaled_mean_sum / total_samples
-        return scaled_mean
+        salience = l2_sum / total_samples  # E[X²]
+        raw_mean = mean_sum / total_samples  # E[X]
+
+        return salience, raw_mean
 
     @torch.no_grad()
     def quantize_weight_heuristic_groupwise(self, W, group_activation_means, apply_heuristic=True):
         """
-        Heuristic-guided group-wise ASYMMETRIC quantization (OPTIMIZED).
+        FULLY VECTORIZED heuristic-guided group-wise ASYMMETRIC quantization.
 
-        Optimizations:
-        - Fast path: Skip heuristic for small layers
-        - Vectorized: Process multiple groups in parallel where possible
-        - Early exit: Skip if error is already small
+        Key Optimizations:
+        - Pure tensor operations (no Python loops)
+        - Processes all output channels and groups in parallel
+        - Top-k selection for flip candidates
 
         Args:
             W: Weight tensor [out_features, in_features]
@@ -166,10 +146,6 @@ class HeuristicGroupWiseAWQQuantizer:
         """
         out_features, in_features = W.shape
 
-        # Fast path: skip heuristic for small layers
-        if not apply_heuristic or out_features * in_features < 100000:
-            apply_heuristic = False
-
         # Pad to make in_features divisible by group_size
         n_groups = (in_features + self.group_size - 1) // self.group_size
         padded_in_features = n_groups * self.group_size
@@ -178,95 +154,85 @@ class HeuristicGroupWiseAWQQuantizer:
             W_padded = torch.zeros(out_features, padded_in_features, device=W.device, dtype=W.dtype)
             W_padded[:, :in_features] = W
 
-            # Pad activation means with zeros
-            group_activation_padded = torch.zeros(padded_in_features, device=W.device, dtype=W.dtype)
-            group_activation_padded[:in_features] = group_activation_means
+            act_padded = torch.zeros(padded_in_features, device=W.device, dtype=W.dtype)
+            act_padded[:in_features] = group_activation_means
         else:
             W_padded = W
-            group_activation_padded = group_activation_means
+            act_padded = group_activation_means
 
         # Reshape to [out_features, n_groups, group_size]
-        W_grouped = W_padded.reshape(out_features, n_groups, self.group_size)
-        group_act_grouped = group_activation_padded.reshape(n_groups, self.group_size)
+        W_g = W_padded.reshape(out_features, n_groups, self.group_size)
+        X_g = act_padded.reshape(1, n_groups, self.group_size)  # Broadcast over out_features
 
-        # Compute min and max per group for asymmetric quantization
-        W_min = W_grouped.min(dim=2, keepdim=True)[0]  # [out_features, n_groups, 1]
-        W_max = W_grouped.max(dim=2, keepdim=True)[0]  # [out_features, n_groups, 1]
+        # Compute min/max per group
+        w_min = W_g.min(dim=2, keepdim=True)[0]  # [out_features, n_groups, 1]
+        w_max = W_g.max(dim=2, keepdim=True)[0]
 
         # Asymmetric quantization parameters
-        scale = (W_max - W_min) / 15.0
+        max_int = 2**self.bits - 1
+        scale = (w_max - w_min) / max_int
         scale = scale.clamp(min=1e-8)
-        zero_point = torch.round(-W_min / scale).clamp(0, 15)
+        zp = torch.round(-w_min / scale).clamp(0, max_int)
 
         # Initial quantization (nearest rounding)
-        W_div = W_grouped / scale
-        W_int = torch.round(W_div + zero_point).clamp(0, 15)
+        W_div = W_g / scale
+        W_int = torch.round(W_div + zp).clamp(0, max_int)
 
-        # === HEURISTIC REFINEMENT (OPTIMIZED) ===
+        # === VECTORIZED HEURISTIC REFINEMENT ===
         if apply_heuristic:
-            # Process only every Nth output channel to speed up (sample-based)
-            stride = max(1, out_features // 100)  # Process at most 100 output channels
+            # Current quantized weights
+            W_quant_g = (W_int - zp) * scale
 
-            for out_idx in range(0, out_features, stride):
-                for group_idx in range(n_groups):
-                    w_group = W_grouped[out_idx, group_idx]  # [group_size]
-                    w_int_group = W_int[out_idx, group_idx]  # [group_size]
-                    group_scale = scale[out_idx, group_idx, 0]
-                    group_zp = zero_point[out_idx, group_idx, 0]
+            # Current error per group: sum((W - Wq) * X)
+            # Shape: [out_features, n_groups, 1]
+            diff = W_g - W_quant_g
+            current_error = (diff * X_g).sum(dim=2, keepdim=True)
 
-                    # Get activation mean for this group
-                    x_group = group_act_grouped[group_idx]  # [group_size]
+            # Target: reduce |error|
+            # If error > 0, we want correction < 0 → flip_impact should be < 0
+            # If error < 0, we want correction > 0 → flip_impact should be > 0
+            target_sign = torch.sign(current_error)  # [out_features, n_groups, 1]
 
-                    # Current quantized weights
-                    w_quant_group = (w_int_group - group_zp) * group_scale
+            # Determine flip direction based on rounding error
+            round_err = W_div + zp - W_int
+            flip_dir = torch.sign(round_err)
+            flip_dir[flip_dir == 0] = 1.0
 
-                    # Compute current error: error = dot(x, w - w_quant)
-                    current_error = torch.dot(x_group, w_group - w_quant_group)
+            # Check validity: bits in range [0, max_int]
+            w_flipped = W_int + flip_dir
+            valid_range_mask = (w_flipped >= 0) & (w_flipped <= max_int)
 
-                    # Early exit if error is small
-                    if abs(current_error) < 1e-5:
-                        continue
+            # Check if flip helps: sign(flip_dir * X) == target_sign
+            flip_impact = flip_dir * X_g * scale
+            beneficial_mask = (torch.sign(flip_dir * X_g) == target_sign)
 
-                    # Calculate flip direction (up or down from current quantized value)
-                    w_div_group = W_div[out_idx, group_idx] + group_zp
-                    flip_direction = torch.sign(w_div_group - w_int_group)
-                    flip_direction[flip_direction == 0] = 1.0
+            # Combined mask
+            valid_mask = valid_range_mask & beneficial_mask
 
-                    # Calculate impact of flipping each weight
-                    flip_impacts = x_group * flip_direction * group_scale
+            # Score candidates by impact magnitude
+            candidate_scores = torch.abs(flip_impact) * valid_mask.float()
+            candidate_scores[~valid_mask] = -1.0  # Invalid candidates get -1
 
-                    # Filter: impact must have same sign as error (to reduce it)
-                    target_sign = torch.sign(current_error)
-                    valid_mask = (torch.sign(flip_impacts) == target_sign)
+            # Select top-3 per group
+            k = min(3, self.group_size)
+            _, top_k_indices = torch.topk(candidate_scores, k, dim=2)
 
-                    # Ensure bits don't overflow [0, 15]
-                    w_int_proposed = w_int_group + flip_direction
-                    in_range = (w_int_proposed >= 0) & (w_int_proposed <= 15)
-                    valid_mask = valid_mask & in_range
+            # Create mask for top-k
+            top_k_mask = torch.zeros_like(valid_mask, dtype=torch.bool)
+            top_k_mask.scatter_(2, top_k_indices, True)
 
-                    if not valid_mask.any():
-                        continue
+            # Only apply if valid
+            final_mask = top_k_mask & valid_mask
 
-                    valid_indices = torch.nonzero(valid_mask).squeeze()
-                    if valid_indices.ndim == 0:
-                        valid_indices = valid_indices.unsqueeze(0)
+            # Apply flips
+            W_int = W_int + (flip_dir * final_mask.float())
+            W_int = W_int.clamp(0, max_int)
 
-                    candidate_impacts = flip_impacts[valid_indices]
+        # Dequantize
+        W_dequant_g = (W_int - zp) * scale
+        W_dequant = W_dequant_g.reshape(out_features, padded_in_features)
 
-                    # Simplified: just take top-k by impact (no sorting by rounding error)
-                    k = min(3, len(candidate_impacts))  # Limit flips per group
-                    if k > 0:
-                        top_k_vals, top_k_idx = torch.topk(candidate_impacts.abs(), k)
-                        indices_to_flip = valid_indices[top_k_idx]
-                        W_int[out_idx, group_idx, indices_to_flip] += flip_direction[indices_to_flip].long()
-
-        # Dequantize with adjusted integer values
-        W_dequant_grouped = (W_int - zero_point) * scale
-
-        # Reshape back
-        W_dequant = W_dequant_grouped.reshape(out_features, padded_in_features)
-
-        # Remove padding if added
+        # Remove padding
         if padded_in_features > in_features:
             W_dequant = W_dequant[:, :in_features]
 
@@ -275,72 +241,70 @@ class HeuristicGroupWiseAWQQuantizer:
     @torch.no_grad()
     def search_best_scale(self, name, module):
         """
-        Grid search for optimal per-input-channel scaling factor using L2 salience.
+        Grid search for optimal per-input-channel scaling factor.
+
+        Key Optimization: Compute E[X] once, reuse as E[Xs] = E[X] / s
         """
         if name not in self.activation_data or len(self.activation_data[name]) == 0:
             in_features = module.weight.shape[1]
             return torch.ones(in_features).to(self.device), 0.0, 0.0
 
-        # Get L2 activation salience
-        activation_salience = self.get_activation_salience_l2(name)
+        # Get stats ONCE (E[X²] and E[X])
+        activation_salience, raw_mean = self.get_activation_stats(name)
         if activation_salience is None:
             in_features = module.weight.shape[1]
             return torch.ones(in_features).to(self.device), 0.0, 0.0
 
-        # Prepare calibration data
+        activation_salience = activation_salience.to(self.device)
+        raw_mean = raw_mean.to(self.device)
+
+        # Prepare calibration data subsample
         X_list = self.activation_data[name]
-        X_cpu = torch.cat([x.reshape(-1, x.shape[-1]) for x in X_list], dim=0)
+        X_cpu = []
+        curr_len = 0
+        for x in X_list:
+            x_f = x.reshape(-1, x.shape[-1])
+            X_cpu.append(x_f)
+            curr_len += x_f.shape[0]
+            if curr_len >= 2048:
+                break
 
-        max_samples = min(2048, X_cpu.shape[0])
-        if X_cpu.shape[0] > max_samples:
-            indices = torch.randperm(X_cpu.shape[0])[:max_samples]
-            X_search = X_cpu[indices].to(self.device)
-        else:
-            X_search = X_cpu.to(self.device)
-
-        del X_cpu
+        X_search = torch.cat(X_cpu, dim=0)[:2048].to(self.device)
 
         W = module.weight.data
-        b = module.bias.data if module.bias is not None else None
 
         # Compute original output
-        if b is not None:
-            Y_orig = torch.matmul(X_search, W.t()) + b
-        else:
-            Y_orig = torch.matmul(X_search, W.t())
+        Y_orig = torch.matmul(X_search, W.t())
 
         best_error = float('inf')
         best_alpha = 0.0
         best_scales = torch.ones(W.shape[1], device=self.device)
 
-        activation_salience = activation_salience.to(self.device)
-
         # Grid search over α
         for grid_idx in range(self.n_grid + 1):
             alpha = grid_idx / self.n_grid
 
-            # Compute per-input-channel scales from L2 salience
+            # Compute scales = E[X²]^α
             scales = activation_salience.pow(alpha).clamp(min=1e-5)
 
             # Scale weight COLUMNS
             W_scaled = W * scales.unsqueeze(0)
 
-            # Compute scaled activation means for heuristic
-            scaled_act_mean = self.get_scaled_activation_mean(name, scales)
-            scaled_act_mean_gpu = scaled_act_mean.to(self.device)
+            # KEY OPTIMIZATION: E[X/s] = E[X] / s (no need to rescan data!)
+            scaled_act_mean = raw_mean / scales
 
-            # Quantize with HEURISTIC-GUIDED GROUP-WISE ASYMMETRIC quantization
-            W_quant = self.quantize_weight_heuristic_groupwise(W_scaled, scaled_act_mean_gpu, apply_heuristic=self.use_heuristic)
+            # Quantize with vectorized heuristic
+            W_quant = self.quantize_weight_heuristic_groupwise(
+                W_scaled,
+                scaled_act_mean,
+                apply_heuristic=self.use_heuristic
+            )
 
-            # Compensate input
-            X_compensated = X_search / scales.unsqueeze(0)
+            # Reconstruct: W_final = W_quant / s
+            W_recon = W_quant / scales.unsqueeze(0)
 
-            if b is not None:
-                Y_quant = torch.matmul(X_compensated, W_quant.t()) + b
-            else:
-                Y_quant = torch.matmul(X_compensated, W_quant.t())
-
-            # Compute reconstruction error (MSE)
+            # Measure error
+            Y_quant = torch.matmul(X_search, W_recon.t())
             error = (Y_orig - Y_quant).pow(2).mean().item()
 
             if error < best_error:
@@ -348,9 +312,8 @@ class HeuristicGroupWiseAWQQuantizer:
                 best_alpha = alpha
                 best_scales = scales.clone()
 
-        del X_search, Y_orig
-        if 'Y_quant' in locals():
-            del Y_quant
+        # Cleanup
+        del X_search, Y_orig, Y_quant, W_quant, W_recon
         torch.cuda.empty_cache()
 
         return best_scales, best_alpha, best_error
@@ -358,7 +321,7 @@ class HeuristicGroupWiseAWQQuantizer:
     @torch.no_grad()
     def quantize_layer(self, name, module):
         """
-        Apply Heuristic Group-Wise AWQ Quantization.
+        Apply Heuristic Group-Wise AWQ Quantization (OPTIMIZED).
         """
         best_scales, best_alpha, best_error = self.search_best_scale(name, module)
 
@@ -367,16 +330,19 @@ class HeuristicGroupWiseAWQQuantizer:
         # Scale weight COLUMNS
         W_scaled = W * best_scales.unsqueeze(0)
 
-        # Compute scaled activation means for heuristic
-        scaled_act_mean = self.get_scaled_activation_mean(name, best_scales)
-        if scaled_act_mean is None:
-            # Fallback: use standard group-wise quantization
-            scaled_act_mean = torch.zeros(W.shape[1], device=W.device)
+        # Get scaled activation mean: E[X/s] = E[X] / s
+        _, raw_mean = self.get_activation_stats(name)
+        if raw_mean is not None:
+            scaled_act_mean = (raw_mean.to(self.device) / best_scales)
         else:
-            scaled_act_mean = scaled_act_mean.to(W.device)
+            scaled_act_mean = torch.zeros(W.shape[1], device=W.device)
 
-        # Quantize with HEURISTIC-GUIDED GROUP-WISE ASYMMETRIC quantization
-        W_quant = self.quantize_weight_heuristic_groupwise(W_scaled, scaled_act_mean, apply_heuristic=self.use_heuristic)
+        # Quantize with vectorized heuristic
+        W_quant = self.quantize_weight_heuristic_groupwise(
+            W_scaled,
+            scaled_act_mean,
+            apply_heuristic=self.use_heuristic
+        )
 
         # Divide by scales to restore original magnitude
         W_final = W_quant / best_scales.unsqueeze(0)
@@ -391,30 +357,37 @@ class HeuristicGroupWiseAWQQuantizer:
             'error': best_error
         }
 
+        # Aggressive cleanup
+        del best_scales, scaled_act_mean, W_scaled, W_quant, W_final
+        if name in self.activation_data:
+            del self.activation_data[name]
+        torch.cuda.empty_cache()
+        gc.collect()
+
     def calibrate(self, calibration_data, n_samples=500):
-        """Run calibration on the dataset to collect activations."""
+        """Run calibration on the dataset to collect activations (OPTIMIZED)."""
         print(f"\nCalibrating with {min(n_samples, len(calibration_data))} samples...")
         self.model.eval()
         self.register_hooks()
 
         successful = 0
-        for i, text in enumerate(tqdm(calibration_data[:n_samples], desc="Calibration")):
-            try:
-                inputs = self.tokenizer(text, return_tensors="pt",
-                                       truncation=True, max_length=512)
-                inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        with torch.no_grad():
+            for i, text in enumerate(tqdm(calibration_data[:n_samples], desc="Calibration")):
+                try:
+                    inputs = self.tokenizer(text, return_tensors="pt",
+                                           truncation=True, max_length=512)
+                    inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
-                with torch.no_grad():
                     _ = self.model(**inputs, use_cache=False, return_dict=True)
 
-                successful += 1
+                    successful += 1
 
-            except Exception as e:
-                if i % 100 == 0 and i > 0:
-                    print(f"\nNote: Some samples skipped due to errors")
-                continue
+                except Exception:
+                    continue
 
         self.remove_hooks()
+        torch.cuda.empty_cache()
+        gc.collect()
         print(f"Calibration complete! Successfully processed {successful}/{n_samples} samples")
 
     def quantize_model(self):
@@ -453,18 +426,18 @@ class HeuristicGroupWiseAWQQuantizer:
 
                 quantized_count += 1
 
-                # Clear activation data
-                if name in self.activation_data:
-                    del self.activation_data[name]
-
-                if quantized_count % 10 == 0 and torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                # Cleanup happens in quantize_layer now
 
             except Exception as e:
                 print(f"\n⚠️  Error quantizing layer {name}: {e}")
                 import traceback
                 traceback.print_exc()
                 skipped_count += 1
+                # Clean up failed layer
+                if name in self.activation_data:
+                    del self.activation_data[name]
+                torch.cuda.empty_cache()
+                gc.collect()
                 continue
 
         print(f"\n✅ Quantization complete!")
