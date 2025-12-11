@@ -224,8 +224,8 @@ class HeuristicGroupWiseAWQQuantizer:
             # Only apply if valid
             final_mask = top_k_mask & valid_mask
 
-            # Apply flips
-            W_int = W_int + (flip_dir * final_mask.float())
+            # Apply flips (preserve dtype)
+            W_int = W_int + (flip_dir * final_mask.to(W.dtype))
             W_int = W_int.clamp(0, max_int)
 
         # Dequantize
@@ -235,6 +235,10 @@ class HeuristicGroupWiseAWQQuantizer:
         # Remove padding
         if padded_in_features > in_features:
             W_dequant = W_dequant[:, :in_features]
+
+        # Ensure output dtype matches input dtype
+        if W_dequant.dtype != W.dtype:
+            W_dequant = W_dequant.to(W.dtype)
 
         return W_dequant
 
@@ -307,6 +311,10 @@ class HeuristicGroupWiseAWQQuantizer:
 
             # Reconstruct: W_final = W_quant / s
             W_recon = W_quant / scales.unsqueeze(0)
+
+            # Ensure W_recon matches W dtype
+            if W_recon.dtype != W.dtype:
+                W_recon = W_recon.to(W.dtype)
 
             # Measure error
             Y_quant = torch.matmul(X_search, W_recon.t())
