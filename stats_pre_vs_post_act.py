@@ -39,9 +39,13 @@ class ActivationCapture:
         self.post_activation.append(post_act)
 
     def get_concatenated(self):
-        """Concatenate all captured activations"""
-        pre = torch.cat(self.pre_activation, dim=0)
-        post = torch.cat(self.post_activation, dim=0)
+        """Concatenate all captured activations, handling variable sequence lengths"""
+        # Reshape each tensor to [num_tokens, hidden_dim] before concatenating
+        pre_reshaped = [x.reshape(-1, x.shape[-1]) for x in self.pre_activation]
+        post_reshaped = [x.reshape(-1, x.shape[-1]) for x in self.post_activation]
+
+        pre = torch.cat(pre_reshaped, dim=0)
+        post = torch.cat(post_reshaped, dim=0)
         return pre, post
 
     def clear(self):
@@ -221,7 +225,7 @@ def main():
     # Configuration
     model_name = "openbmb/MiniCPM-2B-sft-bf16"
     target_layer_id = 3  # Layer 3 as mentioned by user
-    n_samples = 500  # Number of calibration samples
+    n_samples = 128  # Number of calibration samples
     max_seq_len = 512
     output_dir = "./visualizations/pre_post_activation_analysis"
 
