@@ -202,3 +202,125 @@ This project tests the hypothesis that standard quantization methods (like AWQ) 
 - Conclusion: "Risky channel, must preserve precision"
 
 The visualization tools empirically test whether such critical channels exist in real models (MiniCPM-2B).
+
+## Common Issues & Solutions
+
+When writing new analysis or quantization scripts for this project, be aware of these recurring issues:
+
+### 1. Model Cache Compatibility Error
+
+**Error:**
+```
+AttributeError: 'DynamicCache' object has no attribute 'get_usable_length'. Did you mean: 'get_seq_length'?
+```
+
+**Cause:** Version mismatch between transformers library and MiniCPM model code.
+
+**Solution:** Always disable caching when running model forward passes:
+```python
+# BAD - will cause error
+outputs = model(**inputs)
+
+# GOOD - disables problematic caching
+outputs = model(**inputs, use_cache=False)
+```
+
+### 2. Variable Sequence Length Concatenation Error
+
+**Error:**
+```
+RuntimeError: Sizes of tensors must match except in dimension 0. Expected size 13 but got size 184 for tensor number 1 in the list.
+```
+
+**Cause:** Different text samples have different sequence lengths after tokenization. Attempting to concatenate tensors with shapes `[seq_len_1, hidden_dim]` and `[seq_len_2, hidden_dim]` fails.
+
+**Solution:** Reshape each tensor to `[-1, hidden_dim]` before concatenating:
+```python
+# BAD - fails with variable sequence lengths
+all_activations = torch.cat(activation_list, dim=0)
+
+# GOOD - reshape first to handle variable lengths
+reshaped = [x.reshape(-1, x.shape[-1]) for x in activation_list]
+all_activations = torch.cat(reshaped, dim=0)
+```
+
+### 3. BFloat16 NumPy Incompatibility
+
+**Error:**
+```
+TypeError: Got unsupported ScalarType BFloat16
+```
+
+**Cause:** The MiniCPM model uses bfloat16 precision, but NumPy doesn't support this dtype.
+
+**Solution:** Convert to float32 before calling `.numpy()`:
+```python
+# BAD - fails if tensor is bfloat16
+array = tensor.numpy()
+
+# GOOD - convert to float32 first
+array = tensor.float().numpy()
+```
+
+### 4. Activation Hook Best Practices
+
+When writing hooks to capture activations:
+
+```python
+class ActivationCapture:
+    def __init__(self):
+        self.activations = []
+
+    def hook_fn(self, module, input, output):
+        # Always detach and move to CPU immediately to save GPU memory
+        act = output.detach().cpu()
+        self.activations.append(act)
+
+    def get_concatenated(self):
+        # Handle variable sequence lengths
+        reshaped = [x.reshape(-1, x.shape[-1]) for x in self.activations]
+        # Convert to float32 for numpy compatibility
+        result = torch.cat(reshaped, dim=0).float()
+        return result
+```
+
+### 5. Model Forward Pass Template
+
+Standard template for running MiniCPM model on calibration data:
+
+```python
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+model = AutoModelForCausalLM.from_pretrained(
+    "openbmb/MiniCPM-2B-sft-bf16",
+    torch_dtype=torch.bfloat16,
+    device_map="auto",
+    trust_remote_code=True
+)
+model.eval()
+
+tokenizer = AutoTokenizer.from_pretrained("openbmb/MiniCPM-2B-sft-bf16", trust_remote_code=True)
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+
+dataset = load_dataset('wikitext', 'wikitext-2-raw-v1', split='train')
+
+with torch.no_grad():
+    for sample in dataset:
+        text = sample['text']
+        if len(text.strip()) == 0:
+            continue
+
+        inputs = tokenizer(
+            text,
+            return_tensors='pt',
+            max_length=512,
+            truncation=True,
+            padding=False
+        ).to(device)
+
+        # CRITICAL: use_cache=False to avoid compatibility issues
+        outputs = model(**inputs, use_cache=False)
+```
+
+These patterns should be followed in all new scripts to avoid repeating these common errors.

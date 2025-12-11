@@ -70,6 +70,10 @@ def find_silu_layers(model):
 def visualize_pre_post_activation(pre_activation, post_activation, layer_name, output_dir):
     """Create comprehensive visualization of pre vs post activation distributions"""
 
+    # Convert to float32 for numpy compatibility (bfloat16 not supported)
+    pre_activation = pre_activation.float()
+    post_activation = post_activation.float()
+
     # Flatten to get all values
     pre_flat = pre_activation.reshape(-1).numpy()
     post_flat = post_activation.reshape(-1).numpy()
