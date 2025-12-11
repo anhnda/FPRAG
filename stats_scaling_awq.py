@@ -199,10 +199,10 @@ class AWQScalingVisualizer:
         """
         print("\nGrid search for optimal scaling...")
 
-        # Move to device
-        X_device = X.to(self.device)
-        W_device = W.to(self.device)
-        salience_device = salience.to(self.device)
+        # Move to device and convert to float32 for computation
+        X_device = X.float().to(self.device)
+        W_device = W.float().to(self.device)
+        salience_device = salience.float().to(self.device)
 
         # Original output
         output_orig = torch.matmul(X_device, W_device.T)
