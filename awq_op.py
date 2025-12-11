@@ -129,12 +129,14 @@ class HeuristicGroupWiseAWQQuantizer:
     @torch.no_grad()
     def quantize_weight_heuristic_groupwise(self, W, group_activation_means, apply_heuristic=True):
         """
-        FULLY VECTORIZED heuristic-guided group-wise ASYMMETRIC quantization.
+        Group-wise GLOBAL GREEDY heuristic quantization (asymmetric).
 
-        Key Optimizations:
-        - Pure tensor operations (no Python loops)
-        - Processes all output channels and groups in parallel
-        - Top-k selection for flip candidates
+        Key Innovation (from heuristic_quantize.py):
+        - Collects flip candidates GLOBALLY across all groups
+        - Sorts by rounding cost (distance to boundary)
+        - Greedily minimizes TOTAL dot product error
+
+        This is more sophisticated than per-group top-k selection.
 
         Args:
             W: Weight tensor [out_features, in_features]
@@ -162,7 +164,6 @@ class HeuristicGroupWiseAWQQuantizer:
 
         # Reshape to [out_features, n_groups, group_size]
         W_g = W_padded.reshape(out_features, n_groups, self.group_size)
-        X_g = act_padded.reshape(1, n_groups, self.group_size)  # Broadcast over out_features
 
         # Compute min/max per group
         w_min = W_g.min(dim=2, keepdim=True)[0]  # [out_features, n_groups, 1]
@@ -174,63 +175,78 @@ class HeuristicGroupWiseAWQQuantizer:
         scale = scale.clamp(min=1e-8)
         zp = torch.round(-w_min / scale).clamp(0, max_int)
 
+        # Flatten scale and zp for easier indexing: [out_features, padded_in_features]
+        scale_flat = scale.repeat(1, 1, self.group_size).reshape(out_features, padded_in_features)
+        zp_flat = zp.repeat(1, 1, self.group_size).reshape(out_features, padded_in_features)
+
         # Initial quantization (nearest rounding)
-        W_div = W_g / scale
-        W_int = torch.round(W_div + zp).clamp(0, max_int)
+        W_div = W_padded / scale_flat
+        W_int = torch.round(W_div + zp_flat).clamp(0, max_int)
+        W_quant = (W_int - zp_flat) * scale_flat
 
-        # === VECTORIZED HEURISTIC REFINEMENT ===
+        # === GLOBAL GREEDY HEURISTIC ===
         if apply_heuristic:
-            # Current quantized weights
-            W_quant_g = (W_int - zp) * scale
+            # Process each output channel independently
+            for out_idx in range(out_features):
+                w = W_padded[out_idx]  # [padded_in_features]
+                w_int_row = W_int[out_idx]  # [padded_in_features]
+                w_quant_row = W_quant[out_idx]  # [padded_in_features]
+                x = act_padded  # [padded_in_features]
+                scale_row = scale_flat[out_idx]  # [padded_in_features]
+                zp_row = zp_flat[out_idx]  # [padded_in_features]
+                w_div_row = W_div[out_idx]  # [padded_in_features]
 
-            # Current error per group: sum((W - Wq) * X)
-            # Shape: [out_features, n_groups, 1]
-            diff = W_g - W_quant_g
-            current_error = (diff * X_g).sum(dim=2, keepdim=True)
+                # Current error: dot(x, w - w_quant)
+                current_error = torch.dot(x, w - w_quant_row)
 
-            # Target: reduce |error|
-            # If error > 0, we want correction < 0 → flip_impact should be < 0
-            # If error < 0, we want correction > 0 → flip_impact should be > 0
-            target_sign = torch.sign(current_error)  # [out_features, n_groups, 1]
+                if abs(current_error) < 1e-6:
+                    continue
 
-            # Determine flip direction based on rounding error
-            round_err = W_div + zp - W_int
-            flip_dir = torch.sign(round_err)
-            flip_dir[flip_dir == 0] = 1.0
+                # Target sign
+                target_sign = torch.sign(current_error)
 
-            # Check validity: bits in range [0, max_int]
-            w_flipped = W_int + flip_dir
-            valid_range_mask = (w_flipped >= 0) & (w_flipped <= max_int)
+                # Flip direction
+                flip_dir = torch.sign(w_div_row - w_int_row)
+                flip_dir[flip_dir == 0] = 1.0
 
-            # Check if flip helps: sign(flip_dir * X) == target_sign
-            flip_impact = flip_dir * X_g * scale
-            beneficial_mask = (torch.sign(flip_dir * X_g) == target_sign)
+                # Flip impact
+                flip_impacts = x * flip_dir * scale_row
 
-            # Combined mask
-            valid_mask = valid_range_mask & beneficial_mask
+                # Valid mask: flip helps reduce error
+                valid_mask = (torch.sign(flip_impacts) == target_sign)
 
-            # Score candidates by impact magnitude
-            candidate_scores = torch.abs(flip_impact) * valid_mask.float()
-            candidate_scores[~valid_mask] = -1.0  # Invalid candidates get -1
+                # Range check
+                w_int_proposed = w_int_row + flip_dir
+                in_range = (w_int_proposed >= 0) & (w_int_proposed <= max_int)
+                valid_mask = valid_mask & in_range
 
-            # Select top-3 per group
-            k = min(3, self.group_size)
-            _, top_k_indices = torch.topk(candidate_scores, k, dim=2)
+                if not valid_mask.any():
+                    continue
 
-            # Create mask for top-k
-            top_k_mask = torch.zeros_like(valid_mask, dtype=torch.bool)
-            top_k_mask.scatter_(2, top_k_indices, True)
+                valid_indices = torch.nonzero(valid_mask).squeeze()
+                if valid_indices.ndim == 0:
+                    valid_indices = valid_indices.unsqueeze(0)
 
-            # Only apply if valid
-            final_mask = top_k_mask & valid_mask
+                # GLOBAL GREEDY: Sort by rounding cost (distance to boundary)
+                rounding_costs = (w_div_row - w_int_row).abs()[valid_indices]
+                sorted_indices = torch.argsort(rounding_costs, descending=True)
+                sorted_impacts = flip_impacts[valid_indices][sorted_indices]
 
-            # Apply flips (preserve dtype)
-            W_int = W_int + (flip_dir * final_mask.to(W.dtype))
-            W_int = W_int.clamp(0, max_int)
+                # Find optimal k by minimizing |error - cumsum|
+                cumsum_impacts = torch.cumsum(sorted_impacts, dim=0)
+                residuals = torch.abs(current_error - cumsum_impacts)
+                all_residuals = torch.cat([torch.abs(current_error).unsqueeze(0), residuals])
+                best_k_idx = torch.argmin(all_residuals)
 
-        # Dequantize
-        W_dequant_g = (W_int - zp) * scale
-        W_dequant = W_dequant_g.reshape(out_features, padded_in_features)
+                if best_k_idx == 0:
+                    continue
+
+                # Apply flips
+                indices_to_flip = valid_indices[sorted_indices][:best_k_idx]
+                W_int[out_idx, indices_to_flip] += flip_dir[indices_to_flip].long()
+
+        # Dequantize with updated integer values
+        W_dequant = (W_int - zp_flat) * scale_flat
 
         # Remove padding
         if padded_in_features > in_features:
