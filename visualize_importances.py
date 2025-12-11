@@ -174,8 +174,8 @@ class ImportanceVisualizer:
         assert len(mean_importance) == n_channels, f"E[X] length mismatch: {len(mean_importance)} != {n_channels}"
         assert len(l2_importance) == n_channels, f"E[X²] length mismatch: {len(l2_importance)} != {n_channels}"
 
-        # Sort by importance (use absolute value for E[X] if there are negatives)
-        mean_sorted_idx = np.argsort(np.abs(mean_importance))[::-1]  # Descending by absolute value
+        # Sort by importance (use ORIGINAL values, not absolute)
+        mean_sorted_idx = np.argsort(mean_importance)[::-1]  # Descending by original value
         l2_sorted_idx = np.argsort(l2_importance)[::-1]
 
         mean_sorted = mean_importance[mean_sorted_idx]
@@ -211,18 +211,19 @@ class ImportanceVisualizer:
         # Check if there are negative values
         has_negative = (mean_sorted < 0).any()
         if has_negative:
-            # Plot absolute values on log scale
-            ax2.plot(x_sorted, np.abs(mean_sorted), linewidth=0.8, color='blue')
-            ax2.set_ylabel('|E[X[:,j]]|')
-            ax2.set_title(f'Mean Activation - Sorted (Descending, |value|, {(mean_sorted < 0).sum()} negative)')
-            ax2.set_yscale('log')
+            # Plot on linear scale to show negative values
+            ax2.plot(x_sorted, mean_sorted, linewidth=0.8, color='blue')
+            ax2.axhline(0, color='black', linestyle='--', linewidth=1, alpha=0.5)
+            ax2.set_ylabel('E[X[:,j]]')
+            ax2.set_title(f'Mean Activation - Sorted (Descending, {(mean_sorted < 0).sum()} negative)')
+            # Don't use log scale if there are negatives
         else:
-            # Normal log scale plot
+            # Normal log scale plot if all positive
             ax2.plot(x_sorted, mean_sorted, linewidth=0.8, color='blue')
             ax2.set_ylabel('E[X[:,j]]')
             ax2.set_title('Mean Activation - Sorted (Descending)')
             ax2.set_yscale('log')
-        ax2.set_xlabel('Channel Rank (sorted by |E[X[:,j]]|)')
+        ax2.set_xlabel('Channel Rank (sorted by E[X[:,j]])')
         ax2.set_xlim(0, n_channels - 1)
         ax2.grid(True, alpha=0.3)
 
@@ -284,19 +285,19 @@ class ImportanceVisualizer:
 
         # 7. Cumulative importance (normalized)
         ax7 = plt.subplot(3, 3, 7)
-        # Use absolute values for E[X] cumulative sum
+        # For cumulative, use absolute values (makes sense for importance magnitude)
         mean_cumsum = np.cumsum(np.abs(mean_sorted)) / np.sum(np.abs(mean_sorted))
         l2_cumsum = np.cumsum(l2_sorted) / np.sum(l2_sorted)
 
         x_percent = np.arange(n_channels) / n_channels * 100
-        ax7.plot(x_percent, mean_cumsum * 100, label='|E[X[:,j]]|', linewidth=2, color='blue')
-        ax7.plot(x_percent, l2_cumsum * 100, label='E[X[:,j]²]', linewidth=2, color='red')
+        ax7.plot(x_percent, mean_cumsum * 100, label='E[X] (by magnitude)', linewidth=2, color='blue')
+        ax7.plot(x_percent, l2_cumsum * 100, label='E[X²]', linewidth=2, color='red')
         ax7.axhline(50, color='black', linestyle='--', linewidth=1, alpha=0.5, label='50%')
         ax7.axhline(80, color='gray', linestyle='--', linewidth=1, alpha=0.5, label='80%')
         ax7.axhline(95, color='lightgray', linestyle='--', linewidth=1, alpha=0.5, label='95%')
-        ax7.set_xlabel('Top % of Channels (sorted by absolute value)')
-        ax7.set_ylabel('Cumulative % of Total Importance')
-        ax7.set_title('Cumulative Importance Distribution (using |E[X]|)')
+        ax7.set_xlabel('Top % of Channels (sorted by E[X] original value)')
+        ax7.set_ylabel('Cumulative % of Total Magnitude')
+        ax7.set_title('Cumulative Importance (sorted by E[X], magnitude measured)')
         ax7.legend(loc='lower right')
         ax7.grid(True, alpha=0.3)
 
@@ -317,11 +318,11 @@ class ImportanceVisualizer:
         x_pos = np.arange(len(k_values))
         width = 0.35
 
-        ax8.bar(x_pos - width/2, mean_top_k, width, label='|E[X[:,j]]|', color='blue', alpha=0.7)
-        ax8.bar(x_pos + width/2, l2_top_k, width, label='E[X[:,j]²]', color='red', alpha=0.7)
-        ax8.set_xlabel('Top-k Channels (by absolute value)')
-        ax8.set_ylabel('% of Total Importance')
-        ax8.set_title('Importance Concentration in Top-k Channels (using |E[X]|)')
+        ax8.bar(x_pos - width/2, mean_top_k, width, label='E[X] (magnitude)', color='blue', alpha=0.7)
+        ax8.bar(x_pos + width/2, l2_top_k, width, label='E[X²]', color='red', alpha=0.7)
+        ax8.set_xlabel('Top-k Channels (sorted by E[X] original)')
+        ax8.set_ylabel('% of Total Magnitude')
+        ax8.set_title('Importance Concentration (sorted by E[X], magnitude measured)')
         ax8.set_xticks(x_pos)
         ax8.set_xticklabels([f'Top-{k}' for k in k_values], rotation=45)
         ax8.legend(loc='upper left')
