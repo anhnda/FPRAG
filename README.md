@@ -101,29 +101,6 @@ Standard quantization methods (like AWQ) can fail when encountering channels wit
 
 **Expected Compression:** In a real hardware implementation, you would achieve ~4× memory reduction (16-bit → 4-bit) and potential inference speedup. This project measures **quality retention** only.
 
-## Project Structure
-
-### Core Quantization Scripts
-
-- **`quantize_minicpm_full_awq.py`** - FullAWQ implementation (pre-activation importance)
-- **`quantize_minicpm_full_praq.py`** - FullPRAQ implementation (post-activation importance)
-- **`quantize_minicpm_robust_praq.py`** - Robust-PRAQ implementation (PRAQ + noise augmentation)
-- **`compare_full_quantization.py`** - Compare FullAWQ vs FullPRAQ
-- **`compare_robust_praq.py`** - Compare Robust-PRAQ vs FullPRAQ vs Original
-
-### Analysis & Visualization
-
-- **`visualize_preactivations.py`** - Multi-layer distribution analysis
-- **`visualize_layer_focused.py`** - Single-layer deep dive with AWQ vs PRAQ comparison
-- **`check_mse_layer.py`** - Layer-level MSE comparison between methods
-- **`awq_vs_fprpa.py`** - Synthetic benchmark demonstrating the "loud silence" problem
-
-### Utilities
-
-- **`convert_to_safetensors.py`** - Convert model to safetensors format (for AutoAWQ library)
-- **`quantize_minicpm_awq.py`** - AWQ baseline using AutoAWQ library
-- **`quantize_minicpm_AWQ.py`** - Custom AWQ implementation (library-free)
-- **`quantize_minicpm_PRAQ.py`** - Hybrid PRAQ (mixed-precision variant)
 
 ## Installation
 
@@ -148,20 +125,18 @@ pip install autoawq  # Optional: for AWQ baseline
 Quantize the model using both methods (run these in sequence or parallel):
 
 ```bash
-# Quantize with FullAWQ (pre-activation importance)
-python quantize_minicpm_full_awq.py
+python gw_awq_asym_l2.py
 
 # Quantize with FullPRAQ (post-activation importance)
-python quantize_minicpm_full_praq.py
+python awq_op_ref.py
 ```
 
 **Optional parameters:**
 ```bash
 # Custom calibration samples and grid search points
-python quantize_minicpm_full_awq.py --n-calib 500 --n-grid 20
+python compare_awq_heuristics.py
 
 # Custom output directory
-python quantize_minicpm_full_praq.py --output-dir ./my_models/praq
 ```
 
 **What happens:**
