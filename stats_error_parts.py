@@ -258,37 +258,59 @@ class MSEErrorAnalyzer:
         W_error_important[:, ~important_mask] = 0  # Zero out non-important channels
         output_error_important = torch.matmul(X_device, W_error_important.T)
         mse_important = output_error_important.pow(2).mean().item()
+        mean_error_important = output_error_important.mean().item()  # Signed mean
 
         # Compute contribution to output error from non-important channels
         W_error_non_important = W_error.clone()
         W_error_non_important[:, important_mask] = 0  # Zero out important channels
         output_error_non_important = torch.matmul(X_device, W_error_non_important.T)
         mse_non_important = output_error_non_important.pow(2).mean().item()
+        mean_error_non_important = output_error_non_important.mean().item()  # Signed mean
 
-        # Per-channel MSE contribution
-        # For each input channel, compute its contribution to output MSE
+        # Collect all signed errors for distribution analysis
+        signed_errors_important = output_error_important.flatten().float().cpu().numpy()
+        signed_errors_non_important = output_error_non_important.flatten().float().cpu().numpy()
+
+        # Per-channel MSE and signed mean error contribution
+        # For each input channel, compute its contribution to output error
         per_channel_mse = torch.zeros(in_features)
+        per_channel_mean_error = torch.zeros(in_features)
 
-        for ch_idx in tqdm(range(in_features), desc="Computing per-channel MSE"):
+        for ch_idx in tqdm(range(in_features), desc="Computing per-channel errors"):
             W_error_ch = W_error.clone()
             W_error_ch[:, torch.arange(in_features) != ch_idx] = 0
             output_error_ch = torch.matmul(X_device, W_error_ch.T)
             per_channel_mse[ch_idx] = output_error_ch.pow(2).mean().item()
+            per_channel_mean_error[ch_idx] = output_error_ch.mean().item()  # Signed mean
 
-        # Overall MSE
+        # Overall MSE and mean error
         total_mse = squared_error.mean().item()
+        total_mean_error = (output_original - output_quantized).mean().item()
 
-        # Separate per-channel MSE by importance
+        # Separate per-channel statistics by importance
         per_channel_mse_important = per_channel_mse[important_mask].float().cpu().numpy()
         per_channel_mse_non_important = per_channel_mse[~important_mask].float().cpu().numpy()
+        per_channel_mean_error_important = per_channel_mean_error[important_mask].float().cpu().numpy()
+        per_channel_mean_error_non_important = per_channel_mean_error[~important_mask].float().cpu().numpy()
 
         results = {
+            # MSE statistics
             'mse_important': mse_important,
             'mse_non_important': mse_non_important,
             'total_mse': total_mse,
             'per_channel_mse': per_channel_mse.float().cpu().numpy(),
             'per_channel_mse_important': per_channel_mse_important,
             'per_channel_mse_non_important': per_channel_mse_non_important,
+            # Signed error statistics
+            'mean_error_important': mean_error_important,
+            'mean_error_non_important': mean_error_non_important,
+            'total_mean_error': total_mean_error,
+            'signed_errors_important': signed_errors_important,
+            'signed_errors_non_important': signed_errors_non_important,
+            'per_channel_mean_error': per_channel_mean_error.float().cpu().numpy(),
+            'per_channel_mean_error_important': per_channel_mean_error_important,
+            'per_channel_mean_error_non_important': per_channel_mean_error_non_important,
+            # Other
             'importance_scores': importance_scores.float().cpu().numpy(),
             'important_mask': important_mask.cpu().numpy(),
             'n_important': important_mask.sum().item(),
@@ -298,108 +320,152 @@ class MSEErrorAnalyzer:
         return results
 
     def visualize_mse_errors(self, results, layer_name, output_dir):
-        """Create comprehensive visualization of MSE errors"""
+        """Create comprehensive visualization of MSE and signed errors"""
 
         per_channel_mse_imp = results['per_channel_mse_important']
         per_channel_mse_non = results['per_channel_mse_non_important']
         per_channel_mse_all = results['per_channel_mse']
+        per_channel_mean_error_imp = results['per_channel_mean_error_important']
+        per_channel_mean_error_non = results['per_channel_mean_error_non_important']
+        per_channel_mean_error_all = results['per_channel_mean_error']
+        signed_errors_imp = results['signed_errors_important']
+        signed_errors_non = results['signed_errors_non_important']
         importance_scores = results['importance_scores']
         important_mask = results['important_mask']
 
-        # Create figure
-        fig = plt.figure(figsize=(20, 12))
+        # Create figure with 3x3 layout
+        fig = plt.figure(figsize=(24, 18))
 
-        # 1. Per-channel MSE distribution
-        ax1 = plt.subplot(2, 3, 1)
-        ax1.hist(per_channel_mse_imp, bins=50, alpha=0.6,
-                 label=f'Important channels (top 50%, n={len(per_channel_mse_imp)})',
+        # 1. Signed error distribution (all output values)
+        ax1 = plt.subplot(3, 3, 1)
+        ax1.hist(signed_errors_imp, bins=100, alpha=0.6,
+                 label=f'Important channels (n={len(signed_errors_imp)})',
                  color='red', density=True)
-        ax1.hist(per_channel_mse_non, bins=50, alpha=0.6,
-                 label=f'Non-important channels (bottom 50%, n={len(per_channel_mse_non)})',
+        ax1.hist(signed_errors_non, bins=100, alpha=0.6,
+                 label=f'Non-important channels (n={len(signed_errors_non)})',
                  color='blue', density=True)
-        ax1.set_xlabel('Per-Channel MSE Contribution')
+        ax1.axvline(0, color='black', linestyle='--', linewidth=1, alpha=0.5)
+        ax1.set_xlabel('Output Error (signed)')
         ax1.set_ylabel('Density')
-        ax1.set_title(f'{layer_name}\nPer-Channel MSE Distribution')
+        ax1.set_title(f'{layer_name}\nOutput Error Distribution (Signed)')
         ax1.legend(loc='upper right')
         ax1.grid(True, alpha=0.3)
 
-        # 2. Log-scale MSE distribution
-        ax2 = plt.subplot(2, 3, 2)
-        # Filter out zeros for log scale
-        imp_nonzero = per_channel_mse_imp[per_channel_mse_imp > 0]
-        non_nonzero = per_channel_mse_non[per_channel_mse_non > 0]
-
-        ax2.hist(np.log10(imp_nonzero + 1e-10), bins=50, alpha=0.6,
+        # 2. Per-channel mean error (signed)
+        ax2 = plt.subplot(3, 3, 2)
+        ax2.hist(per_channel_mean_error_imp, bins=50, alpha=0.6,
                  label='Important channels', color='red', density=True)
-        ax2.hist(np.log10(non_nonzero + 1e-10), bins=50, alpha=0.6,
+        ax2.hist(per_channel_mean_error_non, bins=50, alpha=0.6,
                  label='Non-important channels', color='blue', density=True)
-        ax2.set_xlabel('log10(Per-Channel MSE)')
+        ax2.axvline(0, color='black', linestyle='--', linewidth=1, alpha=0.5)
+        ax2.set_xlabel('Per-Channel Mean Error (signed)')
         ax2.set_ylabel('Density')
-        ax2.set_title('MSE Distribution (Log Scale)')
+        ax2.set_title('Per-Channel Mean Error Distribution')
         ax2.legend(loc='upper right')
         ax2.grid(True, alpha=0.3)
 
-        # 3. Cumulative MSE distribution
-        ax3 = plt.subplot(2, 3, 3)
-        sorted_imp = np.sort(per_channel_mse_imp)
-        sorted_non = np.sort(per_channel_mse_non)
-        ax3.plot(sorted_imp, np.linspace(0, 1, len(sorted_imp)),
-                 label='Important', linewidth=2, color='red')
-        ax3.plot(sorted_non, np.linspace(0, 1, len(sorted_non)),
-                 label='Non-important', linewidth=2, color='blue')
-        ax3.set_xlabel('Per-Channel MSE Contribution')
-        ax3.set_ylabel('Cumulative Probability')
-        ax3.set_title('CDF of Per-Channel MSE')
-        ax3.legend(loc='lower right')
-        ax3.grid(True, alpha=0.3)
-
-        # 4. MSE vs Importance scatter
-        ax4 = plt.subplot(2, 3, 4)
+        # 3. Mean error vs Importance scatter
+        ax3 = plt.subplot(3, 3, 3)
         colors = ['red' if m else 'blue' for m in important_mask]
-        ax4.scatter(importance_scores, per_channel_mse_all, alpha=0.5, s=10, c=colors)
-        ax4.set_xlabel('Channel Importance (L2 salience)')
-        ax4.set_ylabel('MSE Contribution')
-        ax4.set_title('MSE vs Importance')
-        ax4.set_xscale('log')
-        ax4.set_yscale('log')
-        ax4.grid(True, alpha=0.3)
+        ax3.scatter(importance_scores, per_channel_mean_error_all, alpha=0.5, s=10, c=colors)
+        ax3.axhline(0, color='black', linestyle='--', linewidth=1, alpha=0.5)
+        ax3.set_xlabel('Channel Importance (L2 salience)')
+        ax3.set_ylabel('Mean Error (signed, per channel)')
+        ax3.set_title('Mean Error vs Importance')
+        ax3.set_xscale('log')
+        ax3.grid(True, alpha=0.3)
 
         from matplotlib.patches import Patch
         legend_elements = [
             Patch(facecolor='red', alpha=0.5, label='Important (top 50%)'),
             Patch(facecolor='blue', alpha=0.5, label='Non-important (bottom 50%)')
         ]
-        ax4.legend(handles=legend_elements, loc='upper left')
+        ax3.legend(handles=legend_elements, loc='upper left')
 
-        # 5. Bar chart comparison
-        ax5 = plt.subplot(2, 3, 5)
+        # 4. Per-channel MSE distribution
+        ax4 = plt.subplot(3, 3, 4)
+        ax4.hist(per_channel_mse_imp, bins=50, alpha=0.6,
+                 label='Important channels',
+                 color='red', density=True)
+        ax4.hist(per_channel_mse_non, bins=50, alpha=0.6,
+                 label='Non-important channels',
+                 color='blue', density=True)
+        ax4.set_xlabel('Per-Channel MSE Contribution')
+        ax4.set_ylabel('Density')
+        ax4.set_title('Per-Channel MSE Distribution')
+        ax4.legend(loc='upper right')
+        ax4.grid(True, alpha=0.3)
+
+        # 5. Log-scale MSE distribution
+        ax5 = plt.subplot(3, 3, 5)
+        # Filter out zeros for log scale
+        imp_nonzero = per_channel_mse_imp[per_channel_mse_imp > 0]
+        non_nonzero = per_channel_mse_non[per_channel_mse_non > 0]
+
+        ax5.hist(np.log10(imp_nonzero + 1e-10), bins=50, alpha=0.6,
+                 label='Important channels', color='red', density=True)
+        ax5.hist(np.log10(non_nonzero + 1e-10), bins=50, alpha=0.6,
+                 label='Non-important channels', color='blue', density=True)
+        ax5.set_xlabel('log10(Per-Channel MSE)')
+        ax5.set_ylabel('Density')
+        ax5.set_title('MSE Distribution (Log Scale)')
+        ax5.legend(loc='upper right')
+        ax5.grid(True, alpha=0.3)
+
+        # 6. Cumulative MSE distribution
+        ax6 = plt.subplot(3, 3, 6)
+        sorted_imp = np.sort(per_channel_mse_imp)
+        sorted_non = np.sort(per_channel_mse_non)
+        ax6.plot(sorted_imp, np.linspace(0, 1, len(sorted_imp)),
+                 label='Important', linewidth=2, color='red')
+        ax6.plot(sorted_non, np.linspace(0, 1, len(sorted_non)),
+                 label='Non-important', linewidth=2, color='blue')
+        ax6.set_xlabel('Per-Channel MSE Contribution')
+        ax6.set_ylabel('Cumulative Probability')
+        ax6.set_title('CDF of Per-Channel MSE')
+        ax6.legend(loc='lower right')
+        ax6.grid(True, alpha=0.3)
+
+        # 7. MSE vs Importance scatter
+        ax7 = plt.subplot(3, 3, 7)
+        ax7.scatter(importance_scores, per_channel_mse_all, alpha=0.5, s=10, c=colors)
+        ax7.set_xlabel('Channel Importance (L2 salience)')
+        ax7.set_ylabel('MSE Contribution')
+        ax7.set_title('MSE vs Importance')
+        ax7.set_xscale('log')
+        ax7.set_yscale('log')
+        ax7.grid(True, alpha=0.3)
+        ax7.legend(handles=legend_elements, loc='upper left')
+
+        # 8. Bar chart comparison
+        ax8 = plt.subplot(3, 3, 8)
         categories = ['Important\nChannels', 'Non-important\nChannels']
         mse_values = [results['mse_important'], results['mse_non_important']]
         colors_bar = ['red', 'blue']
 
-        bars = ax5.bar(categories, mse_values, color=colors_bar, alpha=0.6, edgecolor='black')
-        ax5.set_ylabel('Mean Squared Error')
-        ax5.set_title('Total MSE Contribution by Channel Group')
-        ax5.grid(True, alpha=0.3, axis='y')
+        bars = ax8.bar(categories, mse_values, color=colors_bar, alpha=0.6, edgecolor='black')
+        ax8.set_ylabel('Mean Squared Error')
+        ax8.set_title('Total MSE Contribution by Channel Group')
+        ax8.grid(True, alpha=0.3, axis='y')
 
         # Add value labels on bars
         for bar, val in zip(bars, mse_values):
             height = bar.get_height()
-            ax5.text(bar.get_x() + bar.get_width()/2., height,
-                    f'{val:.6f}', ha='center', va='bottom', fontsize=10)
+            ax8.text(bar.get_x() + bar.get_width()/2., height,
+                    f'{val:.6e}', ha='center', va='bottom', fontsize=9)
 
-        # 6. Box plot comparison
-        ax6 = plt.subplot(2, 3, 6)
+        # 9. Box plot comparison
+        ax9 = plt.subplot(3, 3, 9)
         data_to_plot = [per_channel_mse_imp, per_channel_mse_non]
-        bp = ax6.boxplot(data_to_plot, labels=['Important', 'Non-important'],
+        bp = ax9.boxplot(data_to_plot, labels=['Important', 'Non-important'],
                          patch_artist=True, showfliers=False)
         bp['boxes'][0].set_facecolor('red')
         bp['boxes'][0].set_alpha(0.6)
         bp['boxes'][1].set_facecolor('blue')
         bp['boxes'][1].set_alpha(0.6)
-        ax6.set_ylabel('Per-Channel MSE Contribution')
-        ax6.set_title('MSE Distribution Comparison (Box Plot)')
-        ax6.grid(True, alpha=0.3, axis='y')
+        ax9.set_ylabel('Per-Channel MSE Contribution')
+        ax9.set_title('MSE Distribution Comparison (Box Plot)')
+        ax9.grid(True, alpha=0.3, axis='y')
 
         plt.tight_layout()
 
@@ -424,6 +490,28 @@ class MSEErrorAnalyzer:
         print(f"  Important channels (top 50%): {results['n_important']}")
         print(f"  Non-important channels (bottom 50%): {results['n_non_important']}")
 
+        print(f"\n--- SIGNED ERROR STATISTICS ---")
+        print(f"\nTotal Mean Error (signed):")
+        print(f"  Important channels: {results['mean_error_important']:.6e}")
+        print(f"  Non-important channels: {results['mean_error_non_important']:.6e}")
+        print(f"  Overall: {results['total_mean_error']:.6e}")
+
+        print(f"\nPer-Channel Mean Error (signed):")
+        print(f"\nImportant Channels:")
+        imp_mean_err = results['per_channel_mean_error_important']
+        print(f"  Mean: {imp_mean_err.mean():.6e}")
+        print(f"  Std: {imp_mean_err.std():.6e}")
+        print(f"  Min: {imp_mean_err.min():.6e}")
+        print(f"  Max: {imp_mean_err.max():.6e}")
+
+        print(f"\nNon-important Channels:")
+        non_mean_err = results['per_channel_mean_error_non_important']
+        print(f"  Mean: {non_mean_err.mean():.6e}")
+        print(f"  Std: {non_mean_err.std():.6e}")
+        print(f"  Min: {non_mean_err.min():.6e}")
+        print(f"  Max: {non_mean_err.max():.6e}")
+
+        print(f"\n--- MSE STATISTICS ---")
         print(f"\nTotal MSE Contribution:")
         print(f"  Important channels: {results['mse_important']:.6e}")
         print(f"  Non-important channels: {results['mse_non_important']:.6e}")
