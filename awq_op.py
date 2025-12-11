@@ -255,8 +255,9 @@ class HeuristicGroupWiseAWQQuantizer:
             in_features = module.weight.shape[1]
             return torch.ones(in_features).to(self.device), 0.0, 0.0
 
-        activation_salience = activation_salience.to(self.device)
-        raw_mean = raw_mean.to(self.device)
+        # Move to device and convert to model's dtype for consistency
+        activation_salience = activation_salience.to(self.device).to(module.weight.dtype)
+        raw_mean = raw_mean.to(self.device).to(module.weight.dtype)
 
         # Prepare calibration data subsample
         X_list = self.activation_data[name]
@@ -272,6 +273,10 @@ class HeuristicGroupWiseAWQQuantizer:
         X_search = torch.cat(X_cpu, dim=0)[:2048].to(self.device)
 
         W = module.weight.data
+
+        # Ensure consistent dtype (convert X to match W's dtype)
+        if X_search.dtype != W.dtype:
+            X_search = X_search.to(W.dtype)
 
         # Compute original output
         Y_orig = torch.matmul(X_search, W.t())
@@ -333,9 +338,9 @@ class HeuristicGroupWiseAWQQuantizer:
         # Get scaled activation mean: E[X/s] = E[X] / s
         _, raw_mean = self.get_activation_stats(name)
         if raw_mean is not None:
-            scaled_act_mean = (raw_mean.to(self.device) / best_scales)
+            scaled_act_mean = (raw_mean.to(self.device).to(W.dtype) / best_scales)
         else:
-            scaled_act_mean = torch.zeros(W.shape[1], device=W.device)
+            scaled_act_mean = torch.zeros(W.shape[1], device=W.device, dtype=W.dtype)
 
         # Quantize with vectorized heuristic
         W_quant = self.quantize_weight_heuristic_groupwise(
