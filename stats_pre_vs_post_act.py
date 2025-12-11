@@ -103,7 +103,7 @@ def visualize_pre_post_activation(pre_activation, post_activation, layer_name, o
     ax1.set_xlabel('Activation Value')
     ax1.set_ylabel('Density')
     ax1.set_title(f'{layer_name}\nOverall Distribution Comparison')
-    ax1.legend()
+    ax1.legend(loc='upper right')
     ax1.grid(True, alpha=0.3)
 
     # 2. Log-scale histogram to see tails
@@ -114,7 +114,7 @@ def visualize_pre_post_activation(pre_activation, post_activation, layer_name, o
     ax2.set_xlabel('Activation Value')
     ax2.set_ylabel('Count (log scale)')
     ax2.set_title('Distribution (Log Scale)')
-    ax2.legend()
+    ax2.legend(loc='upper right')
     ax2.grid(True, alpha=0.3)
 
     # 3. Cumulative distribution
@@ -127,7 +127,7 @@ def visualize_pre_post_activation(pre_activation, post_activation, layer_name, o
     ax3.set_xlabel('Activation Value')
     ax3.set_ylabel('Cumulative Probability')
     ax3.set_title('Cumulative Distribution Function')
-    ax3.legend()
+    ax3.legend(loc='upper left')
     ax3.grid(True, alpha=0.3)
 
     # 4. Per-channel mean comparison
@@ -145,7 +145,7 @@ def visualize_pre_post_activation(pre_activation, post_activation, layer_name, o
     ax4.set_xlabel('Pre-activation Mean')
     ax4.set_ylabel('Post-activation Mean')
     ax4.set_title('Per-Channel Mean: Pre vs Post')
-    ax4.legend()
+    ax4.legend(loc='upper left')
     ax4.grid(True, alpha=0.3)
 
     # 5. Effect of SiLU on negative values
@@ -162,7 +162,7 @@ def visualize_pre_post_activation(pre_activation, post_activation, layer_name, o
     ax5.set_xlabel('Pre-activation (x)')
     ax5.set_ylabel('Post-activation (SiLU(x))')
     ax5.set_title('SiLU Activation Function')
-    ax5.legend()
+    ax5.legend(loc='upper left')
     ax5.grid(True, alpha=0.3)
     ax5.set_xlim(-10, 10)
     ax5.set_ylim(-2, 10)
@@ -184,7 +184,7 @@ def visualize_pre_post_activation(pre_activation, post_activation, layer_name, o
         ax6.set_xlabel('Pre-activation Mean (negative channels)')
         ax6.set_ylabel('Post/Pre Ratio (suppression)')
         ax6.set_title('SiLU Suppression Effect on Negative Channels')
-        ax6.legend()
+        ax6.legend(loc='upper right')
         ax6.grid(True, alpha=0.3)
 
     plt.tight_layout()
