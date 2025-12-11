@@ -174,8 +174,8 @@ class ImportanceVisualizer:
         assert len(mean_importance) == n_channels, f"E[X] length mismatch: {len(mean_importance)} != {n_channels}"
         assert len(l2_importance) == n_channels, f"E[X²] length mismatch: {len(l2_importance)} != {n_channels}"
 
-        # Sort by importance
-        mean_sorted_idx = np.argsort(mean_importance)[::-1]  # Descending
+        # Sort by importance (use absolute value for E[X] if there are negatives)
+        mean_sorted_idx = np.argsort(np.abs(mean_importance))[::-1]  # Descending by absolute value
         l2_sorted_idx = np.argsort(l2_importance)[::-1]
 
         mean_sorted = mean_importance[mean_sorted_idx]
@@ -208,20 +208,44 @@ class ImportanceVisualizer:
 
         # 2. Sorted order - E[X[:,j]]
         ax2 = plt.subplot(3, 3, 2)
-        ax2.plot(x_sorted, mean_sorted, linewidth=0.8, color='blue')
-        ax2.set_xlabel('Channel Rank (sorted by E[X[:,j]])')
-        ax2.set_ylabel('E[X[:,j]]')
-        ax2.set_title('Mean Activation - Sorted (Descending)')
+        # Check if there are negative values
+        has_negative = (mean_sorted < 0).any()
+        if has_negative:
+            # Plot absolute values on log scale
+            ax2.plot(x_sorted, np.abs(mean_sorted), linewidth=0.8, color='blue')
+            ax2.set_ylabel('|E[X[:,j]]|')
+            ax2.set_title(f'Mean Activation - Sorted (Descending, |value|, {(mean_sorted < 0).sum()} negative)')
+            ax2.set_yscale('log')
+        else:
+            # Normal log scale plot
+            ax2.plot(x_sorted, mean_sorted, linewidth=0.8, color='blue')
+            ax2.set_ylabel('E[X[:,j]]')
+            ax2.set_title('Mean Activation - Sorted (Descending)')
+            ax2.set_yscale('log')
+        ax2.set_xlabel('Channel Rank (sorted by |E[X[:,j]]|)')
         ax2.set_xlim(0, n_channels - 1)
         ax2.grid(True, alpha=0.3)
-        ax2.set_yscale('log')
 
         # 3. Distribution histogram - E[X[:,j]]
         ax3 = plt.subplot(3, 3, 3)
-        ax3.hist(mean_importance, bins=100, alpha=0.7, color='blue', edgecolor='black')
-        ax3.set_xlabel('E[X[:,j]]')
+        # For histogram, if there are negative values, show both positive and negative sides
+        if has_negative:
+            # Split into positive and negative
+            positive_vals = mean_importance[mean_importance >= 0]
+            negative_vals = np.abs(mean_importance[mean_importance < 0])
+
+            ax3.hist(positive_vals, bins=50, alpha=0.6, color='green', edgecolor='black',
+                    label=f'Positive (n={len(positive_vals)})')
+            ax3.hist(negative_vals, bins=50, alpha=0.6, color='red', edgecolor='black',
+                    label=f'|Negative| (n={len(negative_vals)})')
+            ax3.set_xlabel('|E[X[:,j]]|')
+            ax3.set_title('Distribution of Mean Activations (absolute values)')
+            ax3.legend(loc='upper right')
+        else:
+            ax3.hist(mean_importance, bins=100, alpha=0.7, color='blue', edgecolor='black')
+            ax3.set_xlabel('E[X[:,j]]')
+            ax3.set_title('Distribution of Mean Activations')
         ax3.set_ylabel('Count')
-        ax3.set_title('Distribution of Mean Activations')
         ax3.grid(True, alpha=0.3, axis='y')
         ax3.set_xscale('log')
 
@@ -260,18 +284,19 @@ class ImportanceVisualizer:
 
         # 7. Cumulative importance (normalized)
         ax7 = plt.subplot(3, 3, 7)
-        mean_cumsum = np.cumsum(mean_sorted) / np.sum(mean_sorted)
+        # Use absolute values for E[X] cumulative sum
+        mean_cumsum = np.cumsum(np.abs(mean_sorted)) / np.sum(np.abs(mean_sorted))
         l2_cumsum = np.cumsum(l2_sorted) / np.sum(l2_sorted)
 
         x_percent = np.arange(n_channels) / n_channels * 100
-        ax7.plot(x_percent, mean_cumsum * 100, label='E[X[:,j]]', linewidth=2, color='blue')
+        ax7.plot(x_percent, mean_cumsum * 100, label='|E[X[:,j]]|', linewidth=2, color='blue')
         ax7.plot(x_percent, l2_cumsum * 100, label='E[X[:,j]²]', linewidth=2, color='red')
         ax7.axhline(50, color='black', linestyle='--', linewidth=1, alpha=0.5, label='50%')
         ax7.axhline(80, color='gray', linestyle='--', linewidth=1, alpha=0.5, label='80%')
         ax7.axhline(95, color='lightgray', linestyle='--', linewidth=1, alpha=0.5, label='95%')
-        ax7.set_xlabel('Top % of Channels')
+        ax7.set_xlabel('Top % of Channels (sorted by absolute value)')
         ax7.set_ylabel('Cumulative % of Total Importance')
-        ax7.set_title('Cumulative Importance Distribution')
+        ax7.set_title('Cumulative Importance Distribution (using |E[X]|)')
         ax7.legend(loc='lower right')
         ax7.grid(True, alpha=0.3)
 
@@ -283,7 +308,7 @@ class ImportanceVisualizer:
 
         for k in k_values:
             if k <= n_channels:
-                mean_top_k.append(np.sum(mean_sorted[:k]) / np.sum(mean_sorted) * 100)
+                mean_top_k.append(np.sum(np.abs(mean_sorted[:k])) / np.sum(np.abs(mean_sorted)) * 100)
                 l2_top_k.append(np.sum(l2_sorted[:k]) / np.sum(l2_sorted) * 100)
             else:
                 mean_top_k.append(100)
@@ -292,11 +317,11 @@ class ImportanceVisualizer:
         x_pos = np.arange(len(k_values))
         width = 0.35
 
-        ax8.bar(x_pos - width/2, mean_top_k, width, label='E[X[:,j]]', color='blue', alpha=0.7)
+        ax8.bar(x_pos - width/2, mean_top_k, width, label='|E[X[:,j]]|', color='blue', alpha=0.7)
         ax8.bar(x_pos + width/2, l2_top_k, width, label='E[X[:,j]²]', color='red', alpha=0.7)
-        ax8.set_xlabel('Top-k Channels')
+        ax8.set_xlabel('Top-k Channels (by absolute value)')
         ax8.set_ylabel('% of Total Importance')
-        ax8.set_title('Importance Concentration in Top-k Channels')
+        ax8.set_title('Importance Concentration in Top-k Channels (using |E[X]|)')
         ax8.set_xticks(x_pos)
         ax8.set_xticklabels([f'Top-{k}' for k in k_values], rotation=45)
         ax8.legend(loc='upper left')
@@ -304,17 +329,18 @@ class ImportanceVisualizer:
 
         # 9. Correlation between E[X] and E[X²]
         ax9 = plt.subplot(3, 3, 9)
-        ax9.scatter(mean_importance, l2_importance, alpha=0.3, s=5)
-        ax9.set_xlabel('E[X[:,j]]')
+        # Use absolute values for E[X] on log scale
+        ax9.scatter(np.abs(mean_importance), l2_importance, alpha=0.3, s=5)
+        ax9.set_xlabel('|E[X[:,j]]|')
         ax9.set_ylabel('E[X[:,j]²]')
-        ax9.set_title('Correlation: Mean vs L2 Salience')
+        ax9.set_title('Correlation: |Mean| vs L2 Salience')
         ax9.set_xscale('log')
         ax9.set_yscale('log')
         ax9.grid(True, alpha=0.3)
 
-        # Add correlation coefficient
+        # Add correlation coefficient (using absolute values)
         from scipy.stats import spearmanr
-        corr, p_value = spearmanr(mean_importance, l2_importance)
+        corr, p_value = spearmanr(np.abs(mean_importance), l2_importance)
         ax9.text(0.05, 0.95, f'Spearman ρ = {corr:.4f}\np = {p_value:.2e}',
                 transform=ax9.transAxes, fontsize=10,
                 verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
