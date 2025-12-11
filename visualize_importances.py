@@ -136,9 +136,24 @@ class ImportanceVisualizer:
         importance_mean = mean_sum / total_samples  # E[X[:,j]]
         importance_l2 = l2_sum / total_samples      # E[X[:,j]²]
 
+        # Convert to numpy
+        importance_mean_np = importance_mean.float().cpu().numpy()
+        importance_l2_np = importance_l2.float().cpu().numpy()
+
+        # Debug: Check for NaN/Inf and print shapes
+        print(f"\nDebug - Array shapes:")
+        print(f"  E[X[:,j]] shape: {importance_mean_np.shape}")
+        print(f"  E[X[:,j]²] shape: {importance_l2_np.shape}")
+        print(f"  E[X[:,j]] - NaN count: {np.isnan(importance_mean_np).sum()}")
+        print(f"  E[X[:,j]] - Inf count: {np.isinf(importance_mean_np).sum()}")
+        print(f"  E[X[:,j]²] - NaN count: {np.isnan(importance_l2_np).sum()}")
+        print(f"  E[X[:,j]²] - Inf count: {np.isinf(importance_l2_np).sum()}")
+        print(f"  E[X[:,j]] range: [{importance_mean_np.min():.6e}, {importance_mean_np.max():.6e}]")
+        print(f"  E[X[:,j]²] range: [{importance_l2_np.min():.6e}, {importance_l2_np.max():.6e}]")
+
         return {
-            'mean': importance_mean.float().cpu().numpy(),
-            'l2': importance_l2.float().cpu().numpy(),
+            'mean': importance_mean_np,
+            'l2': importance_l2_np,
             'n_channels': in_features,
             'n_samples': total_samples
         }
@@ -150,6 +165,15 @@ class ImportanceVisualizer:
         l2_importance = importances['l2']
         n_channels = importances['n_channels']
 
+        # Verify array lengths match n_channels
+        print(f"\nVerifying data for visualization:")
+        print(f"  Expected n_channels: {n_channels}")
+        print(f"  Actual E[X[:,j]] length: {len(mean_importance)}")
+        print(f"  Actual E[X[:,j]²] length: {len(l2_importance)}")
+
+        assert len(mean_importance) == n_channels, f"E[X] length mismatch: {len(mean_importance)} != {n_channels}"
+        assert len(l2_importance) == n_channels, f"E[X²] length mismatch: {len(l2_importance)} != {n_channels}"
+
         # Sort by importance
         mean_sorted_idx = np.argsort(mean_importance)[::-1]  # Descending
         l2_sorted_idx = np.argsort(l2_importance)[::-1]
@@ -157,9 +181,15 @@ class ImportanceVisualizer:
         mean_sorted = mean_importance[mean_sorted_idx]
         l2_sorted = l2_importance[l2_sorted_idx]
 
+        print(f"  Sorted E[X[:,j]] length: {len(mean_sorted)}")
+        print(f"  Sorted E[X[:,j]²] length: {len(l2_sorted)}")
+
         # Create explicit x-axis arrays
         x_original = np.arange(n_channels)
         x_sorted = np.arange(n_channels)
+
+        print(f"  x_original range: [0, {len(x_original)-1}] (length={len(x_original)})")
+        print(f"  x_sorted range: [0, {len(x_sorted)-1}] (length={len(x_sorted)})")
 
         # Create figure with 3x3 layout
         fig = plt.figure(figsize=(24, 18))
@@ -168,10 +198,11 @@ class ImportanceVisualizer:
 
         # 1. Original order - E[X[:,j]]
         ax1 = plt.subplot(3, 3, 1)
+        print(f"\nPlotting E[X] original: x from {x_original[0]} to {x_original[-1]}, y has {len(mean_importance)} points")
         ax1.plot(x_original, mean_importance, linewidth=0.5, alpha=0.7)
         ax1.set_xlabel('Channel Index (original order)')
         ax1.set_ylabel('E[X[:,j]]')
-        ax1.set_title(f'{layer_name}\nMean Activation - Original Order')
+        ax1.set_title(f'{layer_name}\nMean Activation - Original Order (n={n_channels})')
         ax1.set_xlim(0, n_channels - 1)
         ax1.grid(True, alpha=0.3)
 
@@ -198,10 +229,11 @@ class ImportanceVisualizer:
 
         # 4. Original order - E[X[:,j]²]
         ax4 = plt.subplot(3, 3, 4)
+        print(f"Plotting E[X²] original: x from {x_original[0]} to {x_original[-1]}, y has {len(l2_importance)} points")
         ax4.plot(x_original, l2_importance, linewidth=0.5, alpha=0.7, color='red')
         ax4.set_xlabel('Channel Index (original order)')
         ax4.set_ylabel('E[X[:,j]²]')
-        ax4.set_title('L2 Salience - Original Order')
+        ax4.set_title(f'L2 Salience - Original Order (n={n_channels})')
         ax4.set_xlim(0, n_channels - 1)
         ax4.grid(True, alpha=0.3)
 
