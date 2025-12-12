@@ -339,7 +339,7 @@ class HeuristicGroupWiseAWQQuantizer:
                 best_alpha = alpha
                 best_scales = scales.clone()
 
-            del W_scaled, W_quant, W_recon, Y_quant, scales
+            del W_scaled, W_quant, X_compensated, Y_quant, scales
 
         del X_search, Y_orig
         torch.cuda.empty_cache()
