@@ -11,6 +11,8 @@ Changes from awq_op_ref.py:
 6. FIXED Line 327-333: Use same order of operations as gw_awq_asym_l2.py (X/s @ W.t() vs X @ (W/s).t())
 7. FIXED Line 375-384: Use identical quantization function (quantize_weight_groupwise_asymmetric)
    ← CRITICAL! Different implementation structure caused floating-point precision differences
+8. FIXED Line 514-515: Added CUDA random seed (torch.cuda.manual_seed_all)
+   ← CRITICAL! Missing CUDA seed caused torch.randperm() to use different random state
 
 With use_heuristic=False, this should now produce identical results to gw_awq_asym_l2.py
 """
@@ -511,6 +513,8 @@ def main():
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
 
     model_name = "openbmb/MiniCPM-2B-sft-bf16"
     device = "cuda" if torch.cuda.is_available() else "cpu"
