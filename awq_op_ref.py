@@ -435,7 +435,8 @@ def main():
         bits=4,
         n_grid=args.n_grid,
         group_size=args.group_size,
-        outlier_percent=args.outlier_percent
+        outlier_percent=args.outlier_percent,
+        use_heuristic=False
     )
 
     quantizer.calibrate(calib_texts, n_samples=args.n_calib)
