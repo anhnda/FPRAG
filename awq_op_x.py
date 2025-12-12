@@ -324,12 +324,13 @@ class HeuristicGroupWiseAWQQuantizer:
                 apply_heuristic=self.use_heuristic
             )
 
-            W_recon = W_quant / scales.unsqueeze(0)
-            # FIXED: Include bias in quantized output computation
+            # FIXED: Use same order of operations as gw_awq_asym_l2.py (line 243)
+            # This avoids floating-point precision differences
+            X_compensated = X_search / scales.unsqueeze(0)
             if b is not None:
-                Y_quant = torch.matmul(X_search, W_recon.t()) + b
+                Y_quant = torch.matmul(X_compensated, W_quant.t()) + b
             else:
-                Y_quant = torch.matmul(X_search, W_recon.t())
+                Y_quant = torch.matmul(X_compensated, W_quant.t())
 
             error = (Y_orig - Y_quant).pow(2).mean().item()
 
