@@ -54,7 +54,7 @@ class AWQHeuristicValidator:
         random.seed(self.seed)
 
         dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="validation")
-        texts = [item['text'] for item in dataset if len(item['text'].strip()) > 10]
+        texts = [item['text'] for item in dataset if len(item['text'].strip()) > 1]
 
         random.seed(self.seed)
         if n_samples < len(texts):
