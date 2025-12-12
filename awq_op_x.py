@@ -7,7 +7,10 @@ Changes from awq_op_ref.py:
 3. FIXED Line 287-288: Include bias in grid search Y_orig computation
 4. FIXED Line 312: Include bias in grid search Y_quant computation
 5. FIXED Line 279-290: Use RANDOM sampling for grid search (not sequential)
-   ← THIS WAS THE MAIN BUG! Sequential sampling caused different alpha selection
+   ← MAJOR BUG! Sequential sampling caused different alpha selection (reduced gap from 0.31 to 0.11)
+6. FIXED Line 327-333: Use same order of operations as gw_awq_asym_l2.py (X/s @ W.t() vs X @ (W/s).t())
+7. FIXED Line 375-384: Use identical quantization function (quantize_weight_groupwise_asymmetric)
+   ← CRITICAL! Different implementation structure caused floating-point precision differences
 
 With use_heuristic=False, this should now produce identical results to gw_awq_asym_l2.py
 """
@@ -108,6 +111,60 @@ class HeuristicGroupWiseAWQQuantizer:
         raw_mean = (mean_sum / total_samples).float()
 
         return salience, raw_mean
+
+    @torch.no_grad()
+    def quantize_weight_groupwise_asymmetric(self, W):
+        """
+        Group-wise ASYMMETRIC quantization (simple version from gw_awq_asym_l2.py).
+        Uses full INT4 range [0, 15] with computed zero_point.
+
+        This function is identical to gw_awq_asym_l2.py to ensure exact same behavior
+        when use_heuristic=False.
+
+        Args:
+            W: Weight tensor [out_features, in_features]
+
+        Returns:
+            W_quant: Quantized and dequantized weights
+        """
+        out_features, in_features = W.shape
+
+        # Pad to make in_features divisible by group_size
+        n_groups = (in_features + self.group_size - 1) // self.group_size
+        padded_in_features = n_groups * self.group_size
+
+        if padded_in_features > in_features:
+            W_padded = torch.zeros(out_features, padded_in_features, device=W.device, dtype=W.dtype)
+            W_padded[:, :in_features] = W
+        else:
+            W_padded = W
+
+        # Reshape to [out_features, n_groups, group_size]
+        W_grouped = W_padded.reshape(out_features, n_groups, self.group_size)
+
+        # Compute min and max per group
+        W_min = W_grouped.min(dim=2, keepdim=True)[0]
+        W_max = W_grouped.max(dim=2, keepdim=True)[0]
+
+        # Asymmetric quantization parameters
+        scale = (W_max - W_min) / 15.0
+        scale = scale.clamp(min=1e-8)
+        zero_point = torch.round(-W_min / scale).clamp(0, 15)
+
+        # Quantize to [0, 15]
+        W_int = torch.round(W_grouped / scale + zero_point).clamp(0, 15)
+
+        # Dequantize
+        W_dequant_grouped = (W_int - zero_point) * scale
+
+        # Reshape back
+        W_dequant = W_dequant_grouped.reshape(out_features, padded_in_features)
+
+        # Remove padding if added
+        if padded_in_features > in_features:
+            W_dequant = W_dequant[:, :in_features]
+
+        return W_dequant
 
     @torch.no_grad()
     def quantize_weight_heuristic_groupwise(self, W, group_activation_means, apply_heuristic=True):
@@ -316,13 +373,18 @@ class HeuristicGroupWiseAWQQuantizer:
             scales = activation_salience.pow(alpha).clamp(min=1e-5)
 
             W_scaled = W * scales.unsqueeze(0)
-            scaled_act_mean = raw_mean / scales
 
-            W_quant = self.quantize_weight_heuristic_groupwise(
-                W_scaled,
-                scaled_act_mean,
-                apply_heuristic=self.use_heuristic
-            )
+            # FIXED: Use same quantization function as gw_awq_asym_l2.py when heuristic disabled
+            # This ensures identical code path and avoids floating-point precision differences
+            if self.use_heuristic:
+                scaled_act_mean = raw_mean / scales
+                W_quant = self.quantize_weight_heuristic_groupwise(
+                    W_scaled,
+                    scaled_act_mean,
+                    apply_heuristic=True
+                )
+            else:
+                W_quant = self.quantize_weight_groupwise_asymmetric(W_scaled)
 
             # FIXED: Use same order of operations as gw_awq_asym_l2.py (line 243)
             # This avoids floating-point precision differences
