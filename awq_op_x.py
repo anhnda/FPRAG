@@ -6,6 +6,8 @@ Changes from awq_op_ref.py:
 2. FIXED Line 300: Added clamp(min=1e-5) instead of bias
 3. FIXED Line 287-288: Include bias in grid search Y_orig computation
 4. FIXED Line 312: Include bias in grid search Y_quant computation
+5. FIXED Line 279-290: Use RANDOM sampling for grid search (not sequential)
+   ← THIS WAS THE MAIN BUG! Sequential sampling caused different alpha selection
 
 With use_heuristic=False, this should now produce identical results to gw_awq_asym_l2.py
 """
@@ -30,9 +32,11 @@ class HeuristicGroupWiseAWQQuantizer:
     - Global Candidate Sorting based on Rounding Cost
     - Vectorized implementation of the reference quantize_groupwise_global_greedy
 
-    FIXED ISSUES:
-    - Removed salience bias in grid search
-    - Added bias handling in grid search
+    FIXED ISSUES (5 bugs fixed):
+    - Removed salience bias in grid search (+1e-6 before pow)
+    - Added bias handling in grid search (Y_orig and Y_quant)
+    - Fixed sampling: RANDOM instead of sequential (MAIN BUG!)
+    - Added safety check for outlier_percent
     - Now matches gw_awq_asym_l2.py when use_heuristic=False
     """
 
@@ -276,20 +280,22 @@ class HeuristicGroupWiseAWQQuantizer:
         activation_salience = activation_salience.to(self.device).to(module.weight.dtype)
         raw_mean = raw_mean.to(self.device).to(module.weight.dtype)
 
-        # Subsample for speed
+        # FIXED: Use random sampling like gw_awq_asym_l2.py (lines 202-210)
+        # This ensures same alpha selection behavior
         X_list = self.activation_data[name]
-        X_cpu = []
-        curr_len = 0
-        for x in X_list:
-            x_f = x.reshape(-1, x.shape[-1])
-            X_cpu.append(x_f)
-            curr_len += x_f.shape[0]
-            if curr_len >= 2048:
-                break
+        X_cpu = torch.cat([x.reshape(-1, x.shape[-1]) for x in X_list], dim=0)
 
-        X_search = torch.cat(X_cpu, dim=0)[:2048].to(self.device)
+        max_samples = min(2048, X_cpu.shape[0])
+        if X_cpu.shape[0] > max_samples:
+            indices = torch.randperm(X_cpu.shape[0])[:max_samples]
+            X_search = X_cpu[indices].to(self.device)
+        else:
+            X_search = X_cpu.to(self.device)
+
         if X_search.dtype != module.weight.dtype:
             X_search = X_search.to(module.weight.dtype)
+
+        del X_cpu
 
         W = module.weight.data
         # FIXED: Include bias in original output computation
