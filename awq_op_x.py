@@ -9,10 +9,12 @@ Changes from awq_op_ref.py:
 5. FIXED Line 279-290: Use RANDOM sampling for grid search (not sequential)
    ← MAJOR BUG! Sequential sampling caused different alpha selection (reduced gap from 0.31 to 0.11)
 6. FIXED Line 327-333: Use same order of operations as gw_awq_asym_l2.py (X/s @ W.t() vs X @ (W/s).t())
-7. FIXED Line 375-384: Use identical quantization function (quantize_weight_groupwise_asymmetric)
+7. FIXED Line 375-384: Use identical quantization function in GRID SEARCH (quantize_weight_groupwise_asymmetric)
    ← CRITICAL! Different implementation structure caused floating-point precision differences
 8. FIXED Line 514-515: Added CUDA random seed (torch.cuda.manual_seed_all)
    ← CRITICAL! Missing CUDA seed caused torch.randperm() to use different random state
+9. FIXED Line 422-435: Use identical quantization function in FINAL QUANTIZATION
+   ← CRITICAL! Fixed grid search (bug #7) but forgot to fix final quantization!
 
 With use_heuristic=False, this should now produce identical results to gw_awq_asym_l2.py
 """
@@ -418,17 +420,21 @@ class HeuristicGroupWiseAWQQuantizer:
         W = module.weight.data
         W_scaled = W * best_scales.unsqueeze(0)
 
-        _, raw_mean = self.get_activation_stats(name)
-        if raw_mean is not None:
-            scaled_act_mean = (raw_mean.to(self.device).to(W.dtype) / best_scales)
-        else:
-            scaled_act_mean = torch.zeros(W.shape[1], device=W.device, dtype=W.dtype)
+        # FIXED: Use same quantization function as gw_awq_asym_l2.py
+        if self.use_heuristic:
+            _, raw_mean = self.get_activation_stats(name)
+            if raw_mean is not None:
+                scaled_act_mean = (raw_mean.to(self.device).to(W.dtype) / best_scales)
+            else:
+                scaled_act_mean = torch.zeros(W.shape[1], device=W.device, dtype=W.dtype)
 
-        W_quant = self.quantize_weight_heuristic_groupwise(
-            W_scaled,
-            scaled_act_mean,
-            apply_heuristic=self.use_heuristic
-        )
+            W_quant = self.quantize_weight_heuristic_groupwise(
+                W_scaled,
+                scaled_act_mean,
+                apply_heuristic=True
+            )
+        else:
+            W_quant = self.quantize_weight_groupwise_asymmetric(W_scaled)
 
         W_final = W_quant / best_scales.unsqueeze(0)
         module.weight.data = W_final
