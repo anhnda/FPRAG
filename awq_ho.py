@@ -92,7 +92,7 @@ class AWQHeuristicOptionQuantizer:
         self.hooks = []
 
     @torch.no_grad()
-    def get_activation_stats(self, name):
+    def get_activation_stats(self, name, debug=False):
         """
         Compute L2 salience (E[X²]) and raw mean (E[X]) in one pass.
 
@@ -108,16 +108,23 @@ class AWQHeuristicOptionQuantizer:
         in_features = X_list[0].shape[-1]
 
         # Accumulate statistics on CPU (use float32 to match gw_awq_asym_l2.py)
-        l2_sum = torch.zeros(in_features)
-        mean_sum = torch.zeros(in_features)
-
+        # Compute L2 salience EXACTLY as gw_awq_asym_l2.py does
+        salience_sum = torch.zeros(in_features)
         for x in X_list:
             x_flat = x.reshape(-1, x.shape[-1])
-            l2_sum += x_flat.pow(2).sum(dim=0)
-            mean_sum += x_flat.sum(dim=0)
+            salience_sum += x_flat.pow(2).sum(dim=0)
+        salience = salience_sum / total_samples
 
-        salience = l2_sum / total_samples
+        # Compute mean separately
+        mean_sum = torch.zeros(in_features)
+        for x in X_list:
+            x_flat = x.reshape(-1, x.shape[-1])
+            mean_sum += x_flat.sum(dim=0)
         raw_mean = mean_sum / total_samples
+
+        if debug:
+            print(f"DEBUG [{name}]: total_samples={total_samples}, in_features={in_features}")
+            print(f"  L2 salience stats: min={salience.min():.6f}, max={salience.max():.6f}, mean={salience.mean():.6f}")
 
         return salience, raw_mean
 
@@ -297,7 +304,8 @@ class AWQHeuristicOptionQuantizer:
             return torch.ones(in_features).to(self.device), 0.0, 0.0
 
         # Get L2 activation salience and raw mean
-        activation_salience, raw_mean = self.get_activation_stats(name)
+        debug_first = name == list(self.activation_data.keys())[0] if self.activation_data else False
+        activation_salience, raw_mean = self.get_activation_stats(name, debug=debug_first)
         if activation_salience is None:
             in_features = module.weight.shape[1]
             return torch.ones(in_features).to(self.device), 0.0, 0.0
@@ -515,6 +523,11 @@ class AWQHeuristicOptionQuantizer:
             print(f"  Median: {np.median(alphas):.3f}")
             print(f"  Min: {np.min(alphas):.3f}")
             print(f"  Max: {np.max(alphas):.3f}")
+
+            # Debug: Print first 5 layers for comparison
+            print(f"\nDEBUG - First 5 layer alphas:")
+            for i, (name, info) in enumerate(list(self.layer_scales.items())[:5]):
+                print(f"  {name}: α={info['alpha']:.4f}, error={info['error']:.8f}")
 
         self.activation_data = {}
         if torch.cuda.is_available():

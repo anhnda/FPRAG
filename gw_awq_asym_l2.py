@@ -384,6 +384,11 @@ class GroupWiseAWQAsymmetricL2Quantizer:
             print(f"  Min: {np.min(alphas):.3f}")
             print(f"  Max: {np.max(alphas):.3f}")
 
+            # Debug: Print first 5 layers for comparison
+            print(f"\nDEBUG - First 5 layer alphas:")
+            for i, (name, info) in enumerate(list(self.layer_scales.items())[:5]):
+                print(f"  {name}: α={info['alpha']:.4f}, error={info['error']:.8f}")
+
         self.activation_data = {}
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
