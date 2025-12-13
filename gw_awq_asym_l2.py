@@ -306,7 +306,7 @@ class GroupWiseAWQAsymmetricL2Quantizer:
         for i, text in enumerate(tqdm(calibration_data[:n_samples], desc="Calibration")):
             try:
                 inputs = self.tokenizer(text, return_tensors="pt",
-                                       truncation=True, max_length=512)
+                                       truncation=True, max_length=2048)
                 inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
                 with torch.no_grad():
@@ -394,14 +394,90 @@ class GroupWiseAWQAsymmetricL2Quantizer:
             torch.cuda.empty_cache()
 
 
-def load_wikitext2(split="train", n_samples=None):
-    """Load WikiText-2 dataset."""
-    print(f"Loading WikiText-2 {split} dataset...")
-    dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split=split)
-    texts = [item['text'] for item in dataset if len(item['text'].strip()) > 0]
-    if n_samples:
-        texts = texts[:n_samples]
-    return texts
+def load_c4_calibration(tokenizer, n_samples=128, seq_len=2048, seed=42):
+    """
+    Load C4 calibration data with fixed-length sequences.
+
+    Process:
+    1. Download a random portion of C4 validation set
+    2. Tokenize text continuously
+    3. Slice into chunks of exactly seq_len tokens
+    4. Select n_samples chunks randomly
+
+    Args:
+        tokenizer: HuggingFace tokenizer
+        n_samples: Number of sequences (default: 128)
+        seq_len: Sequence length in tokens (default: 2048)
+        seed: Random seed
+
+    Returns:
+        List of text strings (each tokenizes to ~seq_len tokens)
+    """
+    print(f"Loading C4 calibration data ({n_samples} samples, {seq_len} tokens each)...")
+
+    # Set seed for reproducibility
+    random.seed(seed)
+
+    # Load C4 validation set (streaming mode for efficiency)
+    dataset = load_dataset('allenai/c4', 'en', split='validation', streaming=True)
+
+    # Collect text until we have enough tokens
+    # We need: n_samples * seq_len * 2 (2x buffer for safety)
+    required_tokens = n_samples * seq_len * 2
+
+    print("  Collecting text from C4...")
+    all_text = []
+    total_chars = 0
+
+    for example in dataset:
+        text = example['text']
+        all_text.append(text)
+        total_chars += len(text)
+
+        # Heuristic: ~4 characters per token on average
+        if total_chars > required_tokens * 4:
+            break
+
+    # Concatenate all text
+    print(f"  Collected {len(all_text)} documents ({total_chars} characters)")
+    concatenated_text = ' '.join(all_text)
+
+    # Tokenize continuously
+    print("  Tokenizing...")
+    all_tokens = tokenizer(
+        concatenated_text,
+        return_tensors='pt',
+        add_special_tokens=False,
+        truncation=False
+    )['input_ids'][0]  # [total_tokens]
+
+    print(f"  Total tokens: {len(all_tokens)}")
+
+    # Split into seq_len chunks
+    num_chunks = len(all_tokens) // seq_len
+    print(f"  Creating {num_chunks} chunks of {seq_len} tokens...")
+
+    chunks = []
+    for i in range(num_chunks):
+        chunk_tokens = all_tokens[i * seq_len : (i + 1) * seq_len]
+        chunks.append(chunk_tokens)
+
+    # Randomly sample n_samples chunks
+    if len(chunks) < n_samples:
+        raise ValueError(f"Not enough chunks! Got {len(chunks)}, need {n_samples}")
+
+    print(f"  Randomly selecting {n_samples} chunks...")
+    selected_indices = random.sample(range(len(chunks)), n_samples)
+    selected_chunks = [chunks[i] for i in selected_indices]
+
+    # Decode back to text (for compatibility with existing calibration code)
+    calibration_texts = []
+    for chunk in selected_chunks:
+        text = tokenizer.decode(chunk, skip_special_tokens=True)
+        calibration_texts.append(text)
+
+    print(f"  ✓ Loaded {len(calibration_texts)} calibration samples")
+    return calibration_texts
 
 
 def main():
@@ -466,7 +542,7 @@ def main():
     print(f"Model size before quantization: {size_mb_before:.2f} MB")
 
     # Load calibration data
-    calib_texts = load_wikitext2(split="train", n_samples=args.n_calib)
+    calib_texts = load_c4_calibration(tokenizer, n_samples=args.n_calib, seq_len=2048, seed=args.seed)
 
     # Initialize quantizer
     quantizer = GroupWiseAWQAsymmetricL2Quantizer(
