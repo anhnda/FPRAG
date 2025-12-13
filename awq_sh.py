@@ -30,7 +30,8 @@ class StandardHeuristicAWQQuantizer:
     """
 
     def __init__(self, model, tokenizer, device="cuda", bits=4, n_grid=20,
-                 group_size=128, use_heuristic=True, outlier_percent=0.05, max_tokens_per_sample=512):
+                 group_size=128, use_heuristic=True, outlier_percent=0.05, max_tokens_per_sample=512,
+                 layer_batch_size=50):
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
@@ -40,6 +41,7 @@ class StandardHeuristicAWQQuantizer:
         self.use_heuristic = use_heuristic
         self.outlier_percent = outlier_percent
         self.max_tokens_per_sample = max_tokens_per_sample  # Subsample to save memory
+        self.layer_batch_size = layer_batch_size  # Batched sequential quantization
 
         # Storage for activations
         self.activation_data = {}
@@ -50,6 +52,7 @@ class StandardHeuristicAWQQuantizer:
         print(f"  Target bits: {bits}")
         print(f"  Group size: {group_size}")
         print(f"  Token subsampling: {max_tokens_per_sample} tokens/sample (memory optimization)")
+        print(f"  Layer batch size: {layer_batch_size} (batched sequential quantization)")
         print(f"  Use heuristic: {use_heuristic}")
         if use_heuristic:
             print(f"  Outlier protection: Top {outlier_percent*100:.1f}% ignored")
@@ -57,32 +60,34 @@ class StandardHeuristicAWQQuantizer:
         else:
             print(f"  Quantization: STANDARD GROUP-WISE ASYMMETRIC [0, {2**bits - 1}]")
 
+    def get_hook(self, name):
+        """Create a hook function for a specific layer."""
+        def hook(_module, input, _output):
+            if name not in self.activation_data:
+                self.activation_data[name] = []
+            if isinstance(input, tuple):
+                inp = input[0]
+            else:
+                inp = input
+
+            # Subsample tokens if sequence is too long (memory optimization)
+            # inp shape: [batch, seq_len, hidden_dim]
+            if inp.dim() == 3 and inp.shape[1] > self.max_tokens_per_sample:
+                # Randomly sample max_tokens_per_sample from seq_len
+                seq_len = inp.shape[1]
+                indices = torch.randperm(seq_len)[:self.max_tokens_per_sample]
+                indices = indices.sort()[0]  # Keep temporal order
+                inp = inp[:, indices, :]
+
+            # Store on CPU to save GPU memory, keep as float16
+            self.activation_data[name].append(inp.detach().cpu())
+        return hook
+
     def register_hooks(self):
         """Register forward hooks to capture activations (with subsampling to save memory)."""
-        def get_hook(name):
-            def hook(module, input, output):
-                if name not in self.activation_data:
-                    self.activation_data[name] = []
-                if isinstance(input, tuple):
-                    inp = input[0].detach().cpu()
-                else:
-                    inp = input.detach().cpu()
-
-                # Subsample tokens if sequence is too long (memory optimization)
-                # inp shape: [batch, seq_len, hidden_dim]
-                if inp.dim() == 3 and inp.shape[1] > self.max_tokens_per_sample:
-                    # Randomly sample max_tokens_per_sample from seq_len
-                    seq_len = inp.shape[1]
-                    indices = torch.randperm(seq_len)[:self.max_tokens_per_sample]
-                    indices = indices.sort()[0]  # Keep temporal order
-                    inp = inp[:, indices, :]
-
-                self.activation_data[name].append(inp)
-            return hook
-
         for name, module in self.model.named_modules():
             if isinstance(module, nn.Linear):
-                handle = module.register_forward_hook(get_hook(name))
+                handle = module.register_forward_hook(self.get_hook(name))
                 self.hooks.append(handle)
 
     def remove_hooks(self):
@@ -352,6 +357,7 @@ class StandardHeuristicAWQQuantizer:
         best_scales, best_alpha, best_error = self.search_best_scale(name, module)
 
         W = module.weight.data
+        original_dtype = W.dtype  # CRITICAL: Preserve dtype for sequential quantization
         W_scaled = W * best_scales.unsqueeze(0)
 
         _, raw_mean = self.get_activation_stats(name)
@@ -366,7 +372,7 @@ class StandardHeuristicAWQQuantizer:
             apply_heuristic=self.use_heuristic
         )
 
-        W_final = W_quant / best_scales.unsqueeze(0)
+        W_final = (W_quant / best_scales.unsqueeze(0)).to(original_dtype)  # Restore dtype
         module.weight.data = W_final
 
         self.layer_scales[name] = {
@@ -403,8 +409,10 @@ class StandardHeuristicAWQQuantizer:
         gc.collect()
 
     def quantize_model(self):
+        """Legacy batch quantization (may OOM with large models/samples)."""
         print("\n" + "=" * 80)
-        print("Quantizing with Standard Heuristic AWQ")
+        print("Quantizing with Standard Heuristic AWQ (OLD BATCH MODE)")
+        print("⚠️  Warning: This may cause OOM. Use quantize_model_sequential() instead.")
         print("=" * 80)
 
         layer_names = [(name, module) for name, module in self.model.named_modules()
@@ -416,6 +424,111 @@ class StandardHeuristicAWQQuantizer:
             except Exception as e:
                 print(f"\n⚠️  Error quantizing {name}: {e}")
                 continue
+
+    def calibrate_layer_batch(self, layer_names_batch, calibration_data, n_samples=500):
+        """Calibrate a batch of layers simultaneously."""
+        print(f"  Calibrating {len(layer_names_batch)} layers...")
+
+        self.model.eval()
+        handles = []
+
+        # Register hooks for all layers in this batch
+        for name, module in layer_names_batch:
+            handle = module.register_forward_hook(self.get_hook(name))
+            handles.append((name, handle))
+
+        # Run calibration
+        successful = 0
+        with torch.no_grad():
+            for text in tqdm(calibration_data[:n_samples], desc="  Calibration", leave=False):
+                try:
+                    inputs = self.tokenizer(text, return_tensors="pt",
+                                           truncation=True, max_length=512)
+                    inputs = {k: v.to(self.device) for k, v in inputs.items()}
+                    self.model(**inputs, use_cache=False, return_dict=True)
+                    successful += 1
+
+                    # Periodic cache clearing
+                    if (successful + 1) % 32 == 0:
+                        torch.cuda.empty_cache()
+                except Exception:
+                    continue
+
+        # Remove hooks
+        for _, handle in handles:
+            handle.remove()
+
+        # Verify activations were captured
+        for name, _ in layer_names_batch:
+            if name not in self.activation_data or len(self.activation_data[name]) == 0:
+                print(f"⚠️  WARNING: No activations captured for {name}")
+
+        torch.cuda.empty_cache()
+        gc.collect()
+
+    def quantize_model_sequential(self, calibration_data, n_samples=500):
+        """
+        Batched sequential quantization: optimal memory/speed balance.
+
+        Process layers in batches (default: 50 layers at a time):
+        - Batch 1: Calibrate layers 0-49, quantize, clear
+        - Batch 2: Calibrate layers 50-99, quantize, clear
+        - ...
+
+        Memory: ~batch_size × 280MB (e.g., 50 layers = ~14GB)
+        Speed: ~ceil(num_layers / batch_size) calibration runs
+        """
+        print("\n" + "=" * 80)
+        print("Batched Sequential Quantization")
+        print("=" * 80)
+        print(f"  Strategy: Process {self.layer_batch_size} layers per batch")
+        print(f"  Memory: ~{self.layer_batch_size * 0.28:.1f} GB per batch")
+
+        # Get all linear layers
+        layer_names = [(name, module) for name, module in self.model.named_modules()
+                       if isinstance(module, nn.Linear)]
+
+        num_layers = len(layer_names)
+        num_batches = (num_layers + self.layer_batch_size - 1) // self.layer_batch_size
+
+        print(f"  Total layers: {num_layers}")
+        print(f"  Total batches: {num_batches}")
+        print("=" * 80)
+
+        # Process in batches
+        for batch_idx in range(num_batches):
+            batch_start = batch_idx * self.layer_batch_size
+            batch_end = min(batch_start + self.layer_batch_size, num_layers)
+            batch_layers = layer_names[batch_start:batch_end]
+
+            print(f"\n[Batch {batch_idx + 1}/{num_batches}] Layers {batch_start}-{batch_end-1}")
+
+            # Calibrate this batch of layers
+            self.calibrate_layer_batch(batch_layers, calibration_data, n_samples)
+
+            # Quantize all layers in this batch
+            print(f"  Quantizing {len(batch_layers)} layers...")
+            for name, module in tqdm(batch_layers, desc="  Quantization", leave=False):
+                try:
+                    self.quantize_layer(name, module)
+                except Exception as e:
+                    print(f"\n⚠️  Error quantizing {name}: {e}")
+                    continue
+
+            # Clear activations for this batch
+            self.activation_data = {}
+            torch.cuda.empty_cache()
+            gc.collect()
+
+            # Memory monitoring
+            if torch.cuda.is_available():
+                mem_allocated = torch.cuda.memory_allocated() / 1024**3
+                mem_reserved = torch.cuda.memory_reserved() / 1024**3
+                print(f"  [Batch {batch_idx + 1}/{num_batches}] GPU: {mem_allocated:.2f}GB allocated, {mem_reserved:.2f}GB reserved")
+
+        print("\n" + "=" * 80)
+        print("✓ Batched Sequential Quantization Complete")
+        print("=" * 80)
 
 def load_c4_calibration(tokenizer, n_samples=128, seq_len=2048, seed=42):
     """
@@ -438,10 +551,12 @@ def main():
                        help="Percent of outliers to ignore (default: 0.05)")
     parser.add_argument("--max-tokens-per-sample", type=int, default=512,
                        help="Max tokens to store per sample (subsampling for memory, default: 512)")
+    parser.add_argument("--layer-batch-size", type=int, default=50,
+                       help="Number of layers to process per batch (default: 50, ~14GB memory)")
     parser.add_argument("--output-dir", type=str, default="./quantized_models/minicpm_awq_sh")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--calib-dataset", type=str, default="c4",
-                       choices=["c4", "wikitext2"],
+                       choices=["c4", "wikitext2", "wikitext2-simple"],
                        help="Calibration dataset (default: c4)")
     args = parser.parse_args()
 
@@ -466,9 +581,13 @@ def main():
     # Load calibration data
     print(f"\nLoading calibration dataset: {args.calib_dataset}")
     if args.calib_dataset == "c4":
-        calib_texts = get_c4_calibration_data(tokenizer, n_samples=args.n_calib, seqlen=2048, seed=args.seed)
+        calib_texts = get_c4_calibration_data(tokenizer, n_samples=args.n_calib, seqlen=512, seed=args.seed)
+    elif args.calib_dataset == "wikitext2-simple":
+        # Simple WikiText-2: Load and use raw texts (variable length, memory-efficient)
+        dataset = load_dataset('wikitext', 'wikitext-2-raw-v1', split='train')
+        calib_texts = [item['text'] for item in dataset if len(item['text'].strip()) > 100][:args.n_calib]
     else:
-        calib_texts = get_wikitext2_calibration_data(tokenizer, n_samples=args.n_calib, seqlen=2048, seed=args.seed)
+        calib_texts = get_wikitext2_calibration_data(tokenizer, n_samples=args.n_calib, seqlen=512, seed=args.seed)
 
     quantizer = StandardHeuristicAWQQuantizer(
         model=model,
@@ -479,11 +598,12 @@ def main():
         group_size=args.group_size,
         use_heuristic=args.use_heuristic,
         outlier_percent=args.outlier_percent,
-        max_tokens_per_sample=args.max_tokens_per_sample
+        max_tokens_per_sample=args.max_tokens_per_sample,
+        layer_batch_size=args.layer_batch_size
     )
 
-    quantizer.calibrate(calib_texts, n_samples=args.n_calib)
-    quantizer.quantize_model()
+    # Use batched sequential quantization (optimal memory/speed balance)
+    quantizer.quantize_model_sequential(calib_texts, n_samples=args.n_calib)
 
     os.makedirs(args.output_dir, exist_ok=True)
     model.save_pretrained(args.output_dir)
