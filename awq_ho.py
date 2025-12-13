@@ -126,7 +126,7 @@ class AWQHeuristicOptionQuantizer:
         """
         Group-wise asymmetric quantization with optional heuristic rounding.
 
-        When apply_heuristic=False: Standard nearest rounding
+        When apply_heuristic=False: Standard nearest rounding (EXACT same as gw_awq_asym_l2.py)
         When apply_heuristic=True: Global greedy rounding correction
 
         Args:
@@ -153,35 +153,44 @@ class AWQHeuristicOptionQuantizer:
             W_padded = W
             act_padded = group_activation_means
 
-        # Reshape to groups for scaling
-        W_g = W_padded.reshape(out_features, n_groups, self.group_size)
+        # Reshape to groups
+        W_grouped = W_padded.reshape(out_features, n_groups, self.group_size)
 
         # Asymmetric Quantization Setup
-        w_min = W_g.min(dim=2, keepdim=True)[0]
-        w_max = W_g.max(dim=2, keepdim=True)[0]
+        W_min = W_grouped.min(dim=2, keepdim=True)[0]
+        W_max = W_grouped.max(dim=2, keepdim=True)[0]
         max_int = 2**self.bits - 1
 
-        scale = (w_max - w_min) / max_int
+        scale = (W_max - W_min) / max_int
         scale = scale.clamp(min=1e-8)
-        zp = torch.round(-w_min / scale).clamp(0, max_int)
-
-        # Expand to full size [out, padded_in]
-        scale_flat = scale.repeat(1, 1, self.group_size).reshape(out_features, padded_in_features)
-        zp_flat = zp.repeat(1, 1, self.group_size).reshape(out_features, padded_in_features)
-
-        # --- 2. Initial Quantization ---
-        W_div = W_padded / scale_flat
-        W_int = torch.round(W_div + zp_flat).clamp(0, max_int)
+        zero_point = torch.round(-W_min / scale).clamp(0, max_int)
 
         if not apply_heuristic:
-            # Standard rounding - same as gw_awq_asym_l2.py
-            W_dequant = (W_int - zp_flat) * scale_flat
+            # Standard rounding - EXACT same computation as gw_awq_asym_l2.py
+            # Quantize to [0, max_int]
+            W_int = torch.round(W_grouped / scale + zero_point).clamp(0, max_int)
+
+            # Dequantize
+            W_dequant_grouped = (W_int - zero_point) * scale
+
+            # Reshape back
+            W_dequant = W_dequant_grouped.reshape(out_features, padded_in_features)
+
+            # Remove padding if added
             if padded_in_features > in_features:
                 W_dequant = W_dequant[:, :in_features]
-            return W_dequant.to(W.dtype)
+
+            return W_dequant
 
         # --- 3. Global Greedy Heuristic (Vectorized) ---
 
+        # Expand to full size [out, padded_in] for heuristic computation
+        scale_flat = scale.repeat(1, 1, self.group_size).reshape(out_features, padded_in_features)
+        zp_flat = zero_point.repeat(1, 1, self.group_size).reshape(out_features, padded_in_features)
+
+        # Initial Quantization
+        W_div = W_padded / scale_flat
+        W_int = torch.round(W_div + zp_flat).clamp(0, max_int)
         W_quant = (W_int - zp_flat) * scale_flat
 
         # A. Calculate Current Error
