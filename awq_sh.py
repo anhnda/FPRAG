@@ -581,13 +581,13 @@ def main():
     # Load calibration data
     print(f"\nLoading calibration dataset: {args.calib_dataset}")
     if args.calib_dataset == "c4":
-        calib_texts = get_c4_calibration_data(tokenizer, n_samples=args.n_calib, seqlen=512, seed=args.seed)
+        calib_texts = get_c4_calibration_data(tokenizer, n_samples=args.n_calib, seqlen=2048, seed=args.seed)
     elif args.calib_dataset == "wikitext2-simple":
         # Simple WikiText-2: Load and use raw texts (variable length, memory-efficient)
         dataset = load_dataset('wikitext', 'wikitext-2-raw-v1', split='train')
         calib_texts = [item['text'] for item in dataset if len(item['text'].strip()) > 100][:args.n_calib]
     else:
-        calib_texts = get_wikitext2_calibration_data(tokenizer, n_samples=args.n_calib, seqlen=512, seed=args.seed)
+        calib_texts = get_wikitext2_calibration_data(tokenizer, n_samples=args.n_calib, seqlen=2048, seed=args.seed)
 
     quantizer = StandardHeuristicAWQQuantizer(
         model=model,
