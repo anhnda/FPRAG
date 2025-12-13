@@ -297,65 +297,67 @@ class GroupWiseAWQAsymmetricL2Quantizer:
             'error': best_error
         }
 
-    def calibrate_single_layer(self, layer_name, calibration_data, n_samples=500):
+    def calibrate_layer_batch(self, layer_names_batch, calibration_data, n_samples=500):
         """
-        Calibrate a SINGLE layer (memory efficient approach).
+        Calibrate a BATCH of layers simultaneously (smart memory usage).
 
-        Only stores activations for ONE layer, then quantizes it immediately.
-        This uses constant memory regardless of number of layers.
+        Instead of 1 layer at a time, calibrate N layers together:
+        - Faster: Only run calibration data once for N layers
+        - Memory efficient: Still uses predictable memory (N × 280MB)
+        - Optimal: Balance between speed and memory
+
+        Args:
+            layer_names_batch: List of (name, module) tuples to calibrate together
+            calibration_data: Calibration texts
+            n_samples: Number of calibration samples
         """
         # Clear any previous activation data
         self.activation_data = {}
 
-        # Register hook for THIS layer only
-        hook_registered = False
-        for name, module in self.model.named_modules():
-            if name == layer_name and isinstance(module, nn.Linear):
-                handle = module.register_forward_hook(self.get_hook(layer_name))
-                hook_registered = True
+        # Register hooks for ALL layers in this batch
+        handles = []
+        for name, module in layer_names_batch:
+            handle = module.register_forward_hook(self.get_hook(name))
+            handles.append((name, handle))
 
-                # Run calibration data through model
-                successful_passes = 0
-                with torch.no_grad():
-                    for i, text in enumerate(calibration_data[:n_samples]):
-                        try:
-                            inputs = self.tokenizer(text, return_tensors="pt",
-                                                   truncation=True, max_length=512)
-                            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        # Run calibration data through model ONCE for all layers in batch
+        successful_passes = 0
+        with torch.no_grad():
+            for i, text in enumerate(calibration_data[:n_samples]):
+                try:
+                    inputs = self.tokenizer(text, return_tensors="pt",
+                                           truncation=True, max_length=512)
+                    inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
-                            _ = self.model(**inputs, use_cache=False, return_dict=True)
-                            successful_passes += 1
-                            del inputs
+                    _ = self.model(**inputs, use_cache=False, return_dict=True)
+                    successful_passes += 1
+                    del inputs
 
-                            # Cleanup every 16 samples
-                            if (i + 1) % 16 == 0:
-                                if torch.cuda.is_available():
-                                    torch.cuda.empty_cache()
-                                gc.collect()
-                        except Exception as e:
-                            # Don't silently ignore errors!
-                            if i == 0:  # Print first error
-                                print(f"\n⚠️  Forward pass error on sample {i}: {str(e)[:100]}")
-                            continue
+                    # Cleanup every 16 samples
+                    if (i + 1) % 16 == 0:
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        gc.collect()
+                except Exception as e:
+                    if i == 0:
+                        print(f"\n⚠️  Forward pass error: {str(e)[:100]}")
+                    continue
 
-                if successful_passes == 0:
-                    print(f"\n❌ FATAL: No successful forward passes for {layer_name}!")
+        # Remove all hooks
+        for name, handle in handles:
+            handle.remove()
 
-                # Remove hook
-                handle.remove()
-                break
+        if successful_passes == 0:
+            print(f"\n❌ FATAL: No successful forward passes for batch!")
 
-        # Debug: Check if activations were captured
-        if layer_name in self.activation_data:
-            num_captured = len(self.activation_data[layer_name])
-            if num_captured < n_samples * 0.5:  # Less than 50% captured
-                print(f"⚠️  WARNING: Only {num_captured}/{n_samples} activations captured for {layer_name}")
-        else:
-            print(f"❌ ERROR: NO activations captured for {layer_name}! Hook registered: {hook_registered}")
+        # Verify activations were captured for all layers
+        for name, _ in layer_names_batch:
+            if name not in self.activation_data or len(self.activation_data[name]) == 0:
+                print(f"⚠️  WARNING: No activations captured for {name}")
 
     def get_hook(self, name):
         """Create a hook function for a specific layer."""
-        def hook(module, input, output):
+        def hook(_module, input, _output):
             if name not in self.activation_data:
                 self.activation_data[name] = []
             if isinstance(input, tuple):
@@ -376,34 +378,39 @@ class GroupWiseAWQAsymmetricL2Quantizer:
             del inp
         return hook
 
-    def quantize_model_sequential(self, calibration_data, n_samples=500):
+    def quantize_model_sequential(self, calibration_data, n_samples=500, layer_batch_size=50):
         """
-        SEQUENTIAL LAYER-BY-LAYER QUANTIZATION (Memory Efficient).
+        BATCHED SEQUENTIAL QUANTIZATION (Smart Memory + Speed Balance).
 
         Strategy:
-        1. For each layer:
-           - Calibrate ONLY this layer (store activations for 1 layer)
-           - Quantize this layer immediately
-           - Clear activations
-           - Move to next layer
+        1. For each BATCH of N layers (default: 50):
+           - Calibrate all N layers simultaneously (register N hooks)
+           - Quantize each layer in the batch
+           - Clear activations for the batch
+           - Move to next batch
 
         Benefits:
-        - Constant memory usage (~280MB per layer vs ~75GB for all layers)
-        - Better accuracy (accounts for error propagation)
-        - Can handle 128+ samples with <10GB RAM
+        - Smart memory usage (~14GB for 50 layers vs ~75GB for all 281)
+        - Much faster (6 batches vs 281 individual calibrations)
+        - Still accounts for error propagation
+        - Can handle 128+ samples easily
+
+        Args:
+            layer_batch_size: Number of layers to calibrate simultaneously (default: 50)
+                             50 layers × 280MB = ~14GB (safe for 30GB RAM systems)
         """
         print("\n" + "=" * 80)
-        print("SEQUENTIAL Layer-by-Layer Quantization (Memory Efficient)")
+        print("BATCHED SEQUENTIAL QUANTIZATION (Smart Memory + Speed)")
         print("=" * 80)
         print("Strategy:")
-        print("  1. Calibrate ONE layer at a time")
-        print("  2. Quantize that layer immediately")
-        print("  3. Clear activations and move to next layer")
-        print("  4. Constant memory usage regardless of total layers")
+        print(f"  1. Calibrate {layer_batch_size} layers simultaneously per batch")
+        print("  2. Quantize each layer in the batch")
+        print("  3. Clear activations and move to next batch")
+        print("  4. Much faster than 1-by-1, uses less memory than all-at-once")
         print("\nBenefits:")
-        print("  ✓ Memory: ~280MB per layer (vs ~75GB for all layers)")
-        print("  ✓ Can handle 128+ samples with <10GB RAM")
-        print("  ✓ Better accuracy (accounts for error propagation)")
+        print(f"  ✓ Memory: ~{layer_batch_size * 0.28:.1f}GB per batch (vs ~75GB for all layers)")
+        print(f"  ✓ Speed: ~{281 // layer_batch_size + 1}x faster than sequential")
+        print("  ✓ Can handle 128+ samples with <20GB RAM")
         print("=" * 80)
 
         if HAS_PSUTIL:
@@ -415,26 +422,44 @@ class GroupWiseAWQAsymmetricL2Quantizer:
                        if isinstance(module, nn.Linear)]
 
         print(f"\nFound {len(layer_names)} linear layers to quantize")
+        print(f"Batch size: {layer_batch_size} layers per batch")
+        num_batches = (len(layer_names) + layer_batch_size - 1) // layer_batch_size
+        print(f"Total batches: {num_batches}")
 
         quantized_count = 0
         skipped_count = 0
 
-        for idx, (name, module) in enumerate(tqdm(layer_names, desc="Sequential Quantization")):
-            try:
-                # STEP 1: Calibrate THIS layer only
-                self.calibrate_single_layer(name, calibration_data, n_samples)
+        # Process layers in batches
+        for batch_idx in range(num_batches):
+            batch_start = batch_idx * layer_batch_size
+            batch_end = min(batch_start + layer_batch_size, len(layer_names))
+            batch_layers = layer_names[batch_start:batch_end]
 
-                # STEP 2: Quantize THIS layer (enable debug for first 3 layers)
-                if idx < 3:
-                    print(f"\nDEBUG Layer {idx}: {name}")
-                    best_scales, best_alpha, best_error = self.search_best_scale(name, module, debug=True)
-                    print(f"  → α={best_alpha:.4f}, error={best_error:.8f}")
+            print(f"\n{'='*60}")
+            print(f"Batch {batch_idx + 1}/{num_batches}: Layers {batch_start}-{batch_end-1}")
+            print(f"{'='*60}")
+
+            # STEP 1: Calibrate this BATCH of layers simultaneously
+            self.calibrate_layer_batch(batch_layers, calibration_data, n_samples)
+
+            # STEP 2: Quantize each layer in the batch
+            for idx_in_batch, (name, module) in enumerate(tqdm(batch_layers, desc=f"Quantizing Batch {batch_idx+1}")):
+                try:
+                    global_idx = batch_start + idx_in_batch
+
+                    # Debug output for first 3 layers
+                    if global_idx < 3:
+                        print(f"\nDEBUG Layer {global_idx}: {name}")
+                        best_scales, best_alpha, best_error = self.search_best_scale(name, module, debug=True)
+                        print(f"  → α={best_alpha:.4f}, error={best_error:.8f}")
+                    else:
+                        best_scales, best_alpha, best_error = self.search_best_scale(name, module)
 
                     W = module.weight.data
-                    original_dtype = W.dtype  # Remember dtype!
+                    original_dtype = W.dtype
                     W_scaled = W * best_scales.unsqueeze(0)
                     W_quant = self.quantize_weight_groupwise_asymmetric(W_scaled)
-                    W_final = (W_quant / best_scales.unsqueeze(0)).to(original_dtype)  # Fix dtype!
+                    W_final = (W_quant / best_scales.unsqueeze(0)).to(original_dtype)
                     module.weight.data = W_final
 
                     self.layer_scales[name] = {
@@ -442,31 +467,26 @@ class GroupWiseAWQAsymmetricL2Quantizer:
                         'alpha': best_alpha,
                         'error': best_error
                     }
-                else:
-                    self.quantize_layer(name, module)
 
-                # STEP 3: Clear activations for this layer
-                if name in self.activation_data:
-                    del self.activation_data[name]
-                self.activation_data = {}
+                    quantized_count += 1
 
-                quantized_count += 1
+                except Exception as e:
+                    print(f"\n⚠️  Error quantizing {name}: {e}")
+                    skipped_count += 1
+                    continue
 
-                # Show progress every 10 layers
-                if quantized_count % 10 == 0:
-                    if HAS_PSUTIL:
-                        ram_pct = psutil.virtual_memory().percent
-                        ram_gb = psutil.virtual_memory().used / (1024**3)
-                        print(f"\n  [{quantized_count}/{len(layer_names)}] RAM: {ram_pct:.1f}% ({ram_gb:.1f} GB)")
+            # STEP 3: Clear activations for this batch
+            self.activation_data = {}
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
 
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    gc.collect()
-
-            except Exception as e:
-                print(f"\n⚠️  Error quantizing layer {name}: {e}")
-                skipped_count += 1
-                continue
+            # Show memory stats after each batch
+            if HAS_PSUTIL:
+                ram_pct = psutil.virtual_memory().percent
+                ram_gb = psutil.virtual_memory().used / (1024**3)
+                print(f"\nBatch {batch_idx+1} complete. RAM: {ram_pct:.1f}% ({ram_gb:.1f} GB)")
+                print(f"Progress: {quantized_count}/{len(layer_names)} layers quantized")
 
         print(f"\n✅ Sequential Quantization Complete!")
         print(f"   Total layers quantized: {quantized_count}/{len(layer_names)}")
@@ -534,6 +554,9 @@ def main():
     parser.add_argument("--calib-dataset", type=str, default="c4",
                        choices=["c4", "wikitext2", "wikitext2-simple"],
                        help="Calibration dataset (default: c4). Use 'wikitext2-simple' for lowest memory usage")
+    parser.add_argument("--layer-batch-size", type=int, default=50,
+                       help="Number of layers to calibrate simultaneously (default: 50). "
+                            "Higher = faster but more memory. 50 layers ≈ 14GB RAM")
     args = parser.parse_args()
 
     # Set random seeds
@@ -607,8 +630,9 @@ def main():
         max_tokens_per_sample=args.max_tokens_per_sample
     )
 
-    # Sequential layer-by-layer quantization (memory efficient)
-    quantizer.quantize_model_sequential(calib_texts, n_samples=args.n_calib)
+    # Batched sequential quantization (smart balance of speed and memory)
+    quantizer.quantize_model_sequential(calib_texts, n_samples=args.n_calib,
+                                       layer_batch_size=args.layer_batch_size)
 
     # Get model size after
     param_size = sum(p.nelement() * p.element_size() for p in model.parameters())
