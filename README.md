@@ -18,57 +18,63 @@ pip install autoawq  # Optional: for AWQ baseline
 
 ### Step 1: Run Quantization
 
-Quantize the model using both methods (run these in sequence or parallel):
+Quantize the model using both methods (batched sequential quantization for optimal memory/speed):
 
 ```bash
-python gw_awq_asym_l2.py
+# Standard Group-Wise AWQ with L2 Salience (default: C4 calibration, 50 layers/batch)
+python gw_awq_asym_l2.py --n-calib 128 --layer-batch-size 50
 
-# Quantize with FullPRAQ (post-activation importance)
-python awq_op_ref.py
-```
-
-**Optional parameters:**
-```bash
-# Custom calibration samples and grid search points
-python compare_awq_heuristics.py
-
-# Custom output directory
+# Heuristic AWQ with Global Greedy Rounding (adds heuristic correction on top)
+python awq_sh.py --n-calib 128 --layer-batch-size 50
 ```
 
 **What happens:**
 - Downloads MiniCPM-2B model (if not cached)
-- Loads 500 WikiText-2 training samples for calibration
-- Collects activation statistics by running forward passes
-- Grid search for optimal scaling exponent α (21 points: 0.0, 0.05, ..., 1.0)
-- Quantizes all linear layers to simulated INT4
+- Loads 128 C4 samples for calibration (default dataset)
+- **Batched sequential processing:** Processes 50 layers at a time (~14GB memory)
+- Collects activation statistics via forward passes for each batch
+- Grid search for optimal scaling exponent α (20 points: 0.0, 0.05, ..., 1.0)
+- Quantizes all 281 linear layers to INT4 (asymmetric, group-wise)
 - Saves quantized model to `./quantized_models/`
 
-**Expected time:** 30-60 minutes per method on a modern GPU
+**Memory usage:** ~14GB peak (configurable via `--layer-batch-size`)
+**Expected time:** 6-12 minutes per method on modern GPU
+
+**Optional parameters:**
+```bash
+# Fast iteration (lower memory, WikiText-2 Simple)
+python gw_awq_asym_l2.py --calib-dataset wikitext2-simple --n-calib 128 --layer-batch-size 50
+
+# Limited memory (8GB system)
+python gw_awq_asym_l2.py --calib-dataset wikitext2-simple --n-calib 64 --layer-batch-size 20
+
+# Maximum quality (30GB+ system)
+python gw_awq_asym_l2.py --n-calib 256 --layer-batch-size 100
+```
 
 ### Step 2: Run Comparison
 
-After both models are quantized, evaluate them:
+After both models are quantized, evaluate them across multiple datasets:
 
 ```bash
-# Compare Original FP16, FullAWQ, and FullPRAQ
-python compare_full_quantization.py
-
-# With visualization
-python compare_full_quantization.py --visualize
-
-# Custom evaluation samples
-python compare_full_quantization.py --n-eval 2000
+# Compare Standard AWQ vs Heuristic AWQ
+python compare_awq_heuristic.py \
+    --heuristic-path ./quantized_models/minicpm_awq_sh \
+    --standard-path ./quantized_models/minicpm_gw_awq_asym_l2 \
+    --n-samples 2000
 ```
 
 **What happens:**
-- Loads Original FP16 (baseline)
-- Loads FullAWQ quantized model
-- Loads FullPRAQ quantized model
-- Evaluates perplexity on WikiText-2 validation set (2000 samples)
-- Generates comparison table and analysis
-- (Optional) Creates visualization plots
+- Loads both quantized models
+- Evaluates perplexity on 3 datasets:
+  - WikiText-2 **test** (in-distribution, Wikipedia)
+  - C4 validation (cross-dataset, web crawl)
+  - AG News test (cross-dataset, news)
+- Generates comparison table with statistical analysis
+- Determines winner based on cross-dataset performance
+- Saves results to JSON with detailed metrics
 
-**Expected time:** 15-30 minutes on a modern GPU
+**Expected time:** 10-20 minutes on modern GPU
 
 ### Step 3 (Optional): Robust-PRAQ with Noise Augmentation
 
@@ -110,39 +116,57 @@ python compare_robust_praq.py --visualize
 
 ### Comparison Table
 
-```
-Metric                         Original             Full-AWQ             Full-PRAQ
-------------------------------------------------------------------------------------
-Perplexity                        12.34                13.21                12.98
-Avg Loss                          2.51                 2.58                 2.56
-Model Size (MB)                 4824.32              4824.32              4824.32
-Throughput (tok/s)               1234.56              1245.67              1238.90
-```
+The comparison script evaluates both models on 3 datasets:
 
-**Note:** Model size appears the same because weights are stored as FP16 for simulation. Real INT4 deployment would show ~4× size reduction.
+```
+Dataset       Heuristic AWQ    Standard AWQ     Delta       Winner
+------------------------------------------------------------------------
+WikiText-2         13.45            13.52       -0.5%      Heuristic
+C4                 14.21            14.18       +0.2%      Standard
+AG News            15.67            15.89       -1.4%      Heuristic
+------------------------------------------------------------------------
+Average            14.44            14.53       -0.6%      Heuristic
+```
 
 ### Analysis Metrics
 
 - **Perplexity:** Lower is better (measures prediction quality)
-- **Delta (Δ):** Perplexity increase from FP16 baseline
-  - Δ < 5%: ✅ Excellent quality retention
-  - Δ < 10%: 🟢 Good quality retention
-  - Δ < 20%: 🟡 Acceptable quality retention
-  - Δ ≥ 20%: ❌ Poor quality retention
+- **Delta:** Percentage difference between methods
+  - Negative (−): Heuristic AWQ is better
+  - Positive (+): Standard AWQ is better
+  - Close to 0: Methods are equivalent
+- **Winner:** Determined by cross-dataset performance
+
+### What the Results Tell You
+
+**1. Does Heuristic Rounding Improve Quality?**
+- If Heuristic wins on 2+ datasets: Global greedy rounding is effective
+- If Standard wins: Simple nearest rounding is sufficient
+- If tied: Heuristic adds complexity without clear benefit
+
+**2. Cross-Dataset Robustness**
+- **WikiText-2 test:** In-distribution performance
+- **C4:** Generalization to web content
+- **AG News:** Generalization to news domain
+
+**3. Quality vs Complexity Trade-off**
+- Standard AWQ: O(n), simple and fast
+- Heuristic AWQ: O(n²), slower but may be more accurate
 
 ### Key Questions Answered
 
-1. **Does FullPRAQ outperform FullAWQ?**
-   - If yes: Post-activation importance is more accurate
-   - If no: Pre-activation magnitude is sufficient
+1. **Is the heuristic worth the complexity?**
+   - Check the average delta and win count
+   - If improvement < 1%: Standard AWQ is sufficient
+   - If improvement > 2%: Heuristic AWQ is beneficial
 
-2. **How much quality is lost with uniform INT4?**
-   - Typical range: 5-15% perplexity increase
-   - Acceptable for many deployment scenarios
+2. **How much quality is lost with INT4?**
+   - Compare against FP16 baseline (typically ~5-15% increase)
+   - Both methods should be within acceptable range
 
-3. **Are "risky dead neurons" a real problem?**
-   - Check `visualize_layer_focused.py` output for empirical evidence
-   - Look for channels with negative mean but high risk scores
+3. **Does the heuristic generalize?**
+   - Check if it wins consistently across all 3 datasets
+   - Or only on specific domains (e.g., WikiText-2)
 
 ## Advanced Usage
 
@@ -189,162 +213,189 @@ python awq_vs_fprpa.py
 
 ### Quantization Parameters
 
-Located in `quantize_minicpm_full_praq.py` and `quantize_minicpm_full_awq.py`:
+**Common parameters (gw_awq_asym_l2.py, awq_sh.py):**
 
-```python
---n-calib 500      # Calibration samples (more = better but slower)
---n-grid 20        # Grid search points (more = finer but slower)
---bits 4           # Target bit width (default: 4)
---seed 42          # Random seed for reproducibility
+```bash
+--n-calib 128              # Calibration samples (default: 128, range: 50-500)
+--n-grid 20                # Grid search points for α (default: 20)
+--group-size 128           # Quantization group size (default: 128)
+--bits 4                   # Target bit width (default: 4)
+--seed 42                  # Random seed for reproducibility
+--calib-dataset c4         # Calibration dataset (default: c4)
+                          # Choices: c4, wikitext2, wikitext2-simple
+--layer-batch-size 50      # Layers per batch (default: 50, ~14GB memory)
 ```
 
-### PRAQ-specific Parameters
+**Memory formula:** `batch_size × 280 MB`
+- Example: 50 layers = ~14 GB peak memory
 
-Located in `quantize_minicpm_full_praq.py`:
+**Calibration dataset options:**
+- `c4`: High quality, cross-dataset robustness (~10GB) **[DEFAULT]**
+- `wikitext2-simple`: Fast, memory-efficient (~6GB)
+- `wikitext2`: Balanced, chunked sequences
 
-```python
---beta 3.0           # Temperature for probability calculation
---tau -3.0           # Activation threshold for SiLU
---noise-factor 0.2   # Estimated INT4 quantization noise ratio (20%)
+### Heuristic-specific Parameters (awq_sh.py)
+
+```bash
+--use-heuristic           # Enable heuristic rounding (default: True)
+--no-heuristic            # Disable heuristic (standard AWQ mode)
+--outlier-percent 0.05    # Top X% activations to ignore (default: 0.05)
+--max-tokens-per-sample 512  # Token subsampling for memory
 ```
 
-### Robust-PRAQ Parameters
+### Evaluation Parameters (compare_awq_heuristic.py)
 
-Located in `quantize_minicpm_robust_praq.py` (includes all PRAQ parameters plus):
-
-```python
---noise-std 0.01          # Gaussian noise std (relative to input std)
-                          # Typical range: 0.005 - 0.05
-                          # Higher = more regularization, lower = closer to FullPRAQ
-
---n-noise-samples 3       # Number of noise samples to average
-                          # Typical range: 2 - 5
-                          # Higher = more stable but slower
-```
-
-**Noise Parameter Guidelines:**
-
-| Calibration Size | Recommended noise_std | Recommended n_noise_samples |
-|------------------|----------------------|----------------------------|
-| < 200 samples    | 0.02 - 0.03          | 4 - 5                      |
-| 200-500 samples  | 0.01 - 0.02          | 3 - 4                      |
-| 500-1000 samples | 0.005 - 0.01         | 2 - 3                      |
-| > 1000 samples   | Use FullPRAQ         | N/A                        |
-
-### Evaluation Parameters
-
-Located in `compare_full_quantization.py`:
-
-```python
---n-eval 2000                                    # Evaluation samples
---original-model openbmb/MiniCPM-2B-sft-bf16    # Baseline model
---full-awq-path ./quantized_models/minicpm_full_awq
---full-praq-path ./quantized_models/minicpm_full_praq
---visualize                                      # Generate plots
+```bash
+--heuristic-path ./quantized_models/minicpm_awq_sh
+--standard-path ./quantized_models/minicpm_gw_awq_asym_l2
+--n-samples 2000          # Samples per dataset (default: 2000)
+--seed 42                 # Random seed
+--save-results            # Save detailed results to JSON
 ```
 
 ## Hardware Requirements
 
-- **GPU:** CUDA-compatible, 16GB+ VRAM recommended
-  - MiniCPM-2B in FP16 requires ~5GB
-  - Calibration activations require additional memory
-- **CPU fallback:** Supported but significantly slower
-- **Storage:** ~10GB for model weights and cached datasets
+### Batched Sequential Quantization (Recommended)
+
+- **GPU:** CUDA-compatible (configurable memory usage)
+  - **16GB+ VRAM:** Default settings (50 layers/batch, C4)
+  - **8-16GB VRAM:** Use `--layer-batch-size 20 --calib-dataset wikitext2-simple`
+  - **8GB VRAM:** Use `--layer-batch-size 10 --calib-dataset wikitext2-simple --n-calib 64`
+
+**Memory breakdown:**
+- MiniCPM-2B model: ~5GB
+- Calibration activations: `batch_size × 280MB` (e.g., 50 layers = 14GB)
+- Total peak: ~19GB (with default settings)
+
+**Memory optimization:**
+1. Use `--calib-dataset wikitext2-simple` (saves ~4GB vs C4)
+2. Reduce `--layer-batch-size` (most effective control)
+3. Reduce `--n-calib` samples
+4. Reduce `--n-grid` points
+
+- **CPU fallback:** Supported but 10-20× slower
+- **Storage:** ~15GB for models and cached datasets
 
 ## Expected Outputs
 
 ### Quantized Models
 ```
 ./quantized_models/
-├── minicpm_full_awq/      # FullAWQ quantized model
+├── minicpm_gw_awq_asym_l2/    # Standard Group-Wise AWQ with L2 Salience
 │   ├── config.json
-│   ├── model.safetensors  # Weights (FP16 storage, INT4 precision)
+│   ├── pytorch_model.bin       # Weights (FP16 storage for research)
 │   └── tokenizer files
-├── minicpm_full_praq/     # FullPRAQ quantized model
-│   ├── config.json
-│   ├── model.safetensors
-│   └── tokenizer files
-└── minicpm_robust_praq/   # Robust-PRAQ quantized model
+└── minicpm_awq_sh/             # Heuristic AWQ with Global Greedy Rounding
     ├── config.json
-    ├── model.safetensors
+    ├── pytorch_model.bin
     └── tokenizer files
+```
+
+### Evaluation Results
+```
+./results/
+├── awq_heuristic_validation_YYYYMMDD_HHMMSS.json  # Detailed results
+└── AWQ_HEURISTIC_SUMMARY.md                        # Human-readable summary
 ```
 
 ### Visualizations
 ```
 ./visualizations/
-├── full_quantization/
-│   └── full_quantization_comparison.png  # AWQ vs PRAQ comparison
-├── robust_praq/
-│   └── robust_praq_comparison.png        # Robust-PRAQ vs PRAQ comparison
-├── preactivation_analysis/
-│   ├── layer_0_analysis.png
-│   ├── layer_1_analysis.png
-│   └── ...
-└── layer_X_focused/
-    ├── channel_statistics.csv
-    ├── correlation_awq_praq.png
-    └── negative_channels_detailed.png
+├── importance_distributions/      # Channel importance analysis
+├── pre_post_activation/          # Activation analysis
+├── rounding_error/               # Quantization error statistics
+└── scaling_analysis/             # AWQ scaling effects
 ```
 
 ## Research Context
 
-### Hypothesis
+### Project Focus
 
-Standard quantization methods (like AWQ) fail to account for the risk of quantization noise "resurrecting" dead neurons. Channels with:
-- Large negative pre-activation (appear "dead")
-- High variance (risky, can cross activation threshold)
-- Large weights (quantization noise proportional to weight magnitude)
+This project compares quantization methods for LLM compression, specifically:
 
-...are dangerous and should be preserved in higher precision.
+1. **Standard Group-Wise AWQ** (gw_awq_asym_l2.py)
+   - Uses L2 salience (E[X²]) for activation-aware scaling
+   - Asymmetric INT4 quantization [0,15] per group
+   - Standard nearest rounding
 
-### Key Insight
+2. **Heuristic-Guided AWQ** (awq_sh.py)
+   - Same base as Standard AWQ
+   - Adds global greedy rounding correction using E[Xs] statistics
+   - Outlier masking for stability
 
-**Quantization noise is proportional to weight magnitude:**
-```
-noise ≈ input_magnitude × weight_magnitude × noise_factor
-```
+### Core Research Questions
 
-So a channel with `mean = -10, std = 4, |W| = 5` has:
-```
-risk_upper = mean + 3×std + noise
-           = -10 + 12 + 1.0
-           = 3.0  (above SiLU threshold of 0!)
-```
+1. **L2 vs L1 Salience:** Does E[X²] improve upon E[|X|] for identifying important channels?
+2. **Heuristic Rounding:** Does global greedy rounding reduce quantization error?
+3. **Asymmetric vs Symmetric:** Does asymmetric [0,15] outperform symmetric [-7,7]?
+4. **Group-wise Quantization:** What's the optimal group size for hardware efficiency vs quality?
 
-AWQ would see this as "dead" (mean = -10). PRAQ identifies it as "risky" (can activate post-quantization).
+### Key Innovation: Batched Sequential Quantization
 
-### Validation
+**Problem:** Processing all 281 layers simultaneously requires ~75GB memory
 
-Use the analysis tools to empirically test:
-1. Do such "risky dead neurons" exist in MiniCPM-2B? (check `visualize_preactivations.py`)
-2. Does PRAQ's post-activation importance correlate with reconstruction error? (check `check_mse_layer.py`)
-3. Does PRAQ outperform AWQ in perplexity? (check `compare_full_quantization.py`)
+**Solution:** Process layers in batches (default: 50 at a time)
+- Memory: ~14GB per batch (vs 75GB for all layers)
+- Speed: 6 calibration runs (vs 281 for pure sequential)
+- Error propagation aware: Layer N+1 sees quantized outputs from layer N
+
+### Validation Methodology
+
+**Cross-dataset evaluation** on 3 datasets:
+1. **WikiText-2 test:** In-distribution (Wikipedia, formal)
+2. **C4 validation:** Cross-dataset (web crawl, diverse)
+3. **AG News test:** Cross-dataset (news, journalistic)
+
+This prevents overfitting to calibration distribution and tests robustness across domains.
 
 ## Comparison to Other Methods
 
-### FullAWQ vs Mixed-Precision AWQ
+### Standard AWQ vs Heuristic AWQ
 
-- **FullAWQ:** ALL weights in INT4, protected via per-channel scaling
-- **Mixed-Precision AWQ:** Top-k channels in FP16, rest in INT4
-- **Tradeoff:** Full uniform quantization is simpler for hardware but may sacrifice quality
+**Standard AWQ (gw_awq_asym_l2.py):**
+- Salience: E[X²] for activation-aware scaling
+- Quantization: Min/max asymmetric per group
+- Rounding: Nearest (standard approach)
+- Complexity: O(n) - simple and fast
+- Speed: 6-12 minutes on modern GPU
 
-### FullPRAQ vs Hybrid PRAQ
+**Heuristic AWQ (awq_sh.py):**
+- Salience: E[X²] for activation-aware scaling (same as Standard)
+- Quantization: E[Xs]-guided greedy refinement
+- Rounding: Global greedy with outlier masking
+- Complexity: O(n²) - iterative flip selection
+- Speed: Similar (6-12 minutes) - heuristic overhead is minimal
+- Innovation: Minimizes output error dot(Xs, W-W_quant)
 
-- **FullPRAQ:** Uniform INT4 with post-activation importance
-- **Hybrid PRAQ:** Mixed-precision with risk-aware channel selection
-- **This project:** Focuses on FullPRAQ for fair comparison with FullAWQ
+### Batched Sequential vs Batch Quantization
 
-### Robust-PRAQ vs FullPRAQ
+**Old Batch Approach:**
+- Register hooks on ALL 281 layers
+- Run calibration → Store activations for ALL layers (~75GB)
+- Quantize each layer
+- Result: OOM on most systems
 
-- **FullPRAQ:** Standard post-activation importance computation
-- **Robust-PRAQ:** Noise-augmented importance with multi-sample averaging
-- **Key Difference:** Robust-PRAQ adds Gaussian noise during importance estimation
-- **Tradeoff:** Robust-PRAQ is slightly slower but more stable with limited calibration data
-- **Use Case:** Robust-PRAQ is particularly beneficial when:
-  - Calibration budget is tight (< 500 samples)
-  - Calibration set may not be representative of deployment distribution
-  - Maximum robustness is required
+**Batched Sequential (Current):**
+- Process 50 layers at a time
+- Memory: ~14GB per batch (constant)
+- Speed: 6 calibration runs (fast enough)
+- Error propagation aware (more realistic)
+- Result: Practical on consumer hardware
+
+### This Implementation vs AutoAWQ
+
+**AutoAWQ (official library):**
+- Production-optimized, fast kernels
+- Symmetric quantization
+- Requires safetensors format
+- True INT4 storage
+
+**This Implementation (research):**
+- Asymmetric quantization [0,15]
+- Batched sequential for memory efficiency
+- FP16 storage for easy analysis
+- Heuristic rounding experimentation
+- Focus: Quality comparison and research
 
 ## Citation
 
@@ -376,19 +427,61 @@ Contributions welcome! Areas for improvement:
 
 ### CUDA Out of Memory
 
+**Solution 1: Use WikiText-2 Simple (instead of default C4)**
 ```bash
-# Reduce calibration samples
-python quantize_minicpm_full_awq.py --n-calib 250
-
-# Use CPU (slower)
-# Set device="cpu" in the scripts
+python gw_awq_asym_l2.py --calib-dataset wikitext2-simple --n-calib 128
 ```
+Saves ~4GB by using variable-length sequences.
+
+**Solution 2: Reduce layer batch size**
+```bash
+# 6GB instead of 14GB
+python gw_awq_asym_l2.py --layer-batch-size 20
+
+# 3GB for very limited memory
+python gw_awq_asym_l2.py --layer-batch-size 10
+```
+
+**Solution 3: Reduce calibration samples**
+```bash
+python gw_awq_asym_l2.py --n-calib 64
+```
+
+**Solution 4: Combine all optimizations**
+```bash
+python gw_awq_asym_l2.py \
+    --calib-dataset wikitext2-simple \
+    --n-calib 64 \
+    --layer-batch-size 10 \
+    --n-grid 10
+```
+Uses only ~3GB memory.
+
+**Solution 5: Use CPU (10-20× slower)**
+```bash
+CUDA_VISIBLE_DEVICES="" python gw_awq_asym_l2.py
+```
+
+### All α Values are 0.0 (Sequential Quantization Bug)
+
+**Symptom:** Grid search shows α=0.0 for all layers, "no activations captured" warnings
+
+**Cause:** Dtype mismatch after quantizing previous layers (weights became float32 but model is float16)
+
+**Solution:** This is fixed in the current version. The code now preserves original dtype:
+```python
+original_dtype = W.dtype
+W_final = (W_quant / scales).to(original_dtype)
+```
+
+If you still encounter this, ensure you're using the latest version of the scripts.
 
 ### Model Not Found
 
+**For AutoAWQ baseline:**
 ```bash
-# For AutoAWQ baseline, convert to safetensors first:
-python convert_to_safetensors.py
+python convert_to_safetensors.py  # If needed
+python quantize_autoawq_library.py
 ```
 
 ### Perplexity is Infinity
@@ -396,6 +489,7 @@ python convert_to_safetensors.py
 - Check for NaN values in weights after quantization
 - Reduce grid search range or use smaller α values
 - Verify calibration data is not empty
+- Ensure `use_cache=False` in all forward passes
 
 ## Contact
 

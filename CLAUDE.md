@@ -19,10 +19,33 @@ This is a research project comparing quantization methods for Large Language Mod
 
 ## Architecture
 
+### Batched Sequential Quantization Strategy
+
+**Problem:** Processing all 281 layers simultaneously requires ~75GB memory (OOM on most systems)
+
+**Solution:** Process layers in batches (default: 50 layers at a time)
+
+```
+For each batch of 50 layers:
+  1. Register hooks on these 50 layers
+  2. Run calibration once → Store activations for 50 layers (~14GB)
+  3. Quantize all 50 layers using stored activations
+  4. Clear activations and move to next batch
+```
+
+**Benefits:**
+- **Constant memory:** ~14GB per batch (vs 75GB for all layers)
+- **Error propagation aware:** Layer N+1 sees quantized outputs from layer N
+- **Configurable:** Adjust `--layer-batch-size` based on available RAM
+- **Speed:** 6 calibration runs (batches) vs 281 (pure sequential)
+
+**Memory formula:** `model_size + (batch_size × 280MB)`
+- Example: 5GB model + (50 × 0.28GB) = ~19GB peak
+
 ### Quantization Pipeline
 
 **Group-Wise AWQ (gw_awq_asym_l2.py):**
-1. Capture activations from calibration data (WikiText-2 train)
+1. Capture activations from calibration data (default: C4, alternative: WikiText-2)
 2. Compute per-input-channel L2 salience: `s[j] = E[X[:,j]²]`
 3. Grid search for optimal scaling exponent α ∈ [0, 1]
 4. Scale weight columns: `W[:,j] *= s[j]^α`
@@ -30,6 +53,7 @@ This is a research project comparing quantization methods for Large Language Mod
    - Per group (default: 128 channels): `scale = (max - min) / 15`
    - Zero point: `z = round(-min / scale)`
 6. Divide by input scales: `W_final = Q(W×s) / s`
+7. **Preserve dtype:** Convert back to original dtype (critical for sequential)
 
 **Heuristic-Guided Quantization (awq_op_ref.py):**
 - All AWQ steps above, PLUS:
@@ -48,7 +72,16 @@ This is a research project comparing quantization methods for Large Language Mod
 - Asymmetric quantization using full [0,15] range
 - Group-wise scales with per-group zero points
 - Grid search for optimal α (default: 20 points from 0.0 to 1.0)
+- **Batched sequential quantization** for optimal memory/speed balance
 - Output: `./quantized_models/minicpm_gw_awq_asym_l2/`
+
+**awq_sh.py** - Standard Heuristic AWQ:
+- Same base as gw_awq_asym_l2.py with heuristic rounding
+- Heuristic-guided global greedy rounding correction
+- Outlier masking (default: top 5% activations ignored)
+- Float16 precision (vs bfloat16 in gw_awq_asym_l2.py)
+- **Batched sequential quantization** for optimal memory/speed balance
+- Output: `./quantized_models/minicpm_awq_sh/`
 
 **awq_op_ref.py** - Heuristic-Guided Quantization:
 - Extends gw_awq_asym_l2.py with global greedy rounding
@@ -62,12 +95,19 @@ This is a research project comparing quantization methods for Large Language Mod
 - Includes outlier protection
 - Used as reference for awq_op_ref.py
 
+**calibration_utils.py** - Calibration Data Utilities:
+- Optimized C4 loading via direct URL (bypasses trust_remote_code)
+- Fast character-length filtering before tokenization (~50x faster)
+- Random slicing within documents (standard GPTQ/AWQ practice)
+- WikiText-2 simple and chunked modes
+- Supports both text and tensor return modes
+
 ### Evaluation & Comparison
 
 **compare_awq_heuristic.py** - Cross-Dataset Validation:
 - Compares Standard AWQ vs Heuristic-Guided AWQ
 - Evaluates on 3 datasets:
-  - WikiText-2 validation (in-distribution)
+  - WikiText-2 **test** (in-distribution, Wikipedia)
   - C4 validation (cross-dataset, web crawl)
   - AG News test (cross-dataset, news)
 - Computes perplexity, loss, and statistical significance
@@ -128,7 +168,7 @@ This is a research project comparing quantization methods for Large Language Mod
 - Analyzes outlier channels in importance distributions
 - Heavy-tail vs normal distribution analysis
 
-### Automation
+### Automation & Documentation
 
 **run_awq_comparison.sh** - Complete Comparison Pipeline:
 - Automated workflow from conversion to comparison
@@ -145,15 +185,58 @@ This is a research project comparing quantization methods for Large Language Mod
 - Standard symmetric quantization
 - Output: `./quantized_models/minicpm_autoawq/`
 
+**Documentation Files:**
+- `SEQUENTIAL_QUANTIZATION.md`: Batched sequential strategy details
+- `CALIBRATION_OPTIMIZATION.md`: C4 and WikiText-2 loading optimizations
+- `AWQ_SH_BATCHED_SEQUENTIAL.md`: awq_sh.py batched sequential guide
+- `CLAUDE.md`: This file (project guide for Claude Code)
+
 ## Commands
 
 ### Running Quantization
 
-```bash
-# Standard Group-Wise AWQ with L2 Salience
-python gw_awq_asym_l2.py --n-calib 128 --n-grid 20 --group-size 128
+#### Batched Sequential Quantization (Recommended)
 
-# Heuristic-Guided Quantization
+```bash
+# Standard Group-Wise AWQ with L2 Salience (default: C4, 50 layers/batch, ~14GB)
+python gw_awq_asym_l2.py \
+  --n-calib 128 \
+  --layer-batch-size 50
+
+# Heuristic AWQ (with rounding correction)
+python awq_sh.py \
+  --n-calib 128 \
+  --layer-batch-size 50
+
+# Fast iteration with WikiText-2 Simple (lower memory)
+python gw_awq_asym_l2.py \
+  --calib-dataset wikitext2-simple \
+  --n-calib 128 \
+  --layer-batch-size 50
+
+# Limited memory (8GB system)
+python gw_awq_asym_l2.py \
+  --calib-dataset wikitext2-simple \
+  --n-calib 128 \
+  --layer-batch-size 20  # ~6GB memory
+
+# Maximum quality (30GB+ system)
+python gw_awq_asym_l2.py \
+  --calib-dataset c4 \
+  --n-calib 256 \
+  --layer-batch-size 100  # ~28GB memory
+```
+
+#### Calibration Dataset Options
+
+- `c4`: Fixed 512-token sequences, high quality, cross-dataset robustness (~10GB) **[DEFAULT]**
+- `wikitext2-simple`: Variable-length sequences, fast, memory-efficient (~6GB)
+- `wikitext2`: Chunked sequences, balanced
+
+#### Legacy Methods
+
+```bash
+# Heuristic-Guided Quantization (old batch mode, may OOM)
 python awq_op_ref.py --n-calib 128 --n-grid 20 --group-size 128
 
 # AutoAWQ Library Baseline (requires safetensors)
@@ -216,10 +299,16 @@ bash run_awq_comparison.sh
 - `--group-size`: Channels per quantization group (default: 128, options: 32, 64, 128, 256)
 - `--bits`: Quantization bit width (default: 4)
 - `--seed`: Random seed for reproducibility (default: 42)
+- `--calib-dataset`: Calibration data source (default: **c4**, choices: c4, wikitext2, wikitext2-simple)
+- `--layer-batch-size`: Layers per batch for sequential quantization (default: 50)
 
-**Heuristic-specific (awq_op_ref.py):**
+**Memory formula:** `batch_size × 280 MB` (e.g., 50 layers = ~14GB)
+
+**Heuristic-specific (awq_sh.py, awq_op_ref.py):**
 - `--outlier-percent`: Top X% activations to ignore (default: 0.05)
 - `--use-heuristic`: Enable heuristic rounding (default: True)
+- `--no-heuristic`: Disable heuristic (standard AWQ mode)
+- `--max-tokens-per-sample`: Token subsampling for memory (default: 512)
 
 **AutoAWQ library (quantize_autoawq_library.py):**
 - `--w-bit`: Weight bit width (default: 4)
@@ -335,19 +424,60 @@ array = tensor.float().numpy()  # Not: tensor.numpy()
 
 ### 4. CUDA Out of Memory
 
-**Solutions:**
+**Solutions (Batched Sequential Approach):**
 ```bash
+# Use wikitext2-simple instead of default C4 (variable-length, lower memory)
+python gw_awq_asym_l2.py --calib-dataset wikitext2-simple
+
+# Reduce layer batch size (most effective for further reduction)
+python gw_awq_asym_l2.py --layer-batch-size 20  # 6GB instead of 14GB
+
 # Reduce calibration samples
 python gw_awq_asym_l2.py --n-calib 64
 
 # Reduce grid search points
 python gw_awq_asym_l2.py --n-grid 10
 
+# Combine all optimizations
+python gw_awq_asym_l2.py \
+  --calib-dataset wikitext2-simple \
+  --n-calib 64 \
+  --layer-batch-size 10 \
+  --n-grid 10  # ~3GB memory, slower
+
 # Use CPU (slower)
 CUDA_VISIBLE_DEVICES="" python gw_awq_asym_l2.py
 ```
 
-### 5. Activation Hook Best Practices
+**Memory usage guide:**
+- `layer-batch-size=10`: ~3GB
+- `layer-batch-size=20`: ~6GB
+- `layer-batch-size=50`: ~14GB (default)
+- `layer-batch-size=100`: ~28GB
+
+### 5. Sequential Quantization Dtype Mismatch
+
+**Error:**
+```
+RuntimeError: expected mat1 and mat2 to have the same dtype, but got: c10::Half != float
+```
+
+**Cause:** After quantizing layer N, weights become float32 but model is float16/bfloat16. Forward pass for layer N+1 fails.
+
+**Solution:** Preserve original dtype after quantization:
+```python
+W = module.weight.data
+original_dtype = W.dtype  # CRITICAL: Remember original dtype
+
+# ... quantization steps ...
+
+W_final = (W_quant / scales).to(original_dtype)  # Restore dtype
+module.weight.data = W_final
+```
+
+**Symptom:** All α values are 0.0, "no activations captured" warnings
+
+### 6. Activation Hook Best Practices
 
 **Correct pattern for capturing activations:**
 ```python
@@ -374,7 +504,7 @@ def awq_hook(module, input, output):
     self.inputs.append(X)
 ```
 
-### 6. Model Loading Template
+### 7. Model Loading Template
 
 **Standard pattern for MiniCPM-2B:**
 ```python
@@ -447,9 +577,9 @@ with torch.no_grad():
 ### Validation Methodology
 
 **Cross-dataset approach:**
-1. WikiText-2: In-distribution validation (model calibrated on WikiText-2 train)
-2. C4: Cross-dataset (web crawl, diverse domains)
-3. AG News: Cross-dataset (news, different style)
+1. WikiText-2 test: In-distribution validation (model calibrated on C4 by default)
+2. C4 validation: Cross-dataset (web crawl, diverse domains)
+3. AG News test: Cross-dataset (news, different style)
 
 **Why multiple datasets:**
 - Prevents overfitting to calibration distribution
@@ -484,3 +614,40 @@ pip install autoawq  # Optional: for AutoAWQ baseline comparison
 - Quantized models: `./quantized_models/minicpm_{method}/`
 - Visualizations: `./visualizations/{analysis_type}/`
 - Data exports: `./{name}.csv` or `./{name}.json` in root directory
+
+## Quick Reference
+
+### Choose the Right Script
+
+| Use Case | Script | Command |
+|----------|--------|---------|
+| **Standard AWQ (recommended)** | gw_awq_asym_l2.py | `python gw_awq_asym_l2.py --n-calib 128` (default: C4) |
+| **Fast iteration** | gw_awq_asym_l2.py | `python gw_awq_asym_l2.py --calib-dataset wikitext2-simple --n-calib 128` |
+| **Heuristic AWQ** | awq_sh.py | `python awq_sh.py --n-calib 128` (default: C4) |
+| **Compare methods** | compare_awq_heuristic.py | `python compare_awq_heuristic.py --n-samples 2000` |
+| **Low memory (8GB)** | gw_awq_asym_l2.py | `--layer-batch-size 10 --calib-dataset wikitext2-simple --n-calib 64` |
+| **Maximum quality (30GB+)** | gw_awq_asym_l2.py | `--layer-batch-size 100 --n-calib 256` (uses C4 by default) |
+
+### Memory Optimization Strategy
+
+1. **First:** Use `--calib-dataset wikitext2-simple` (instead of default C4)
+2. **Second:** Reduce `--layer-batch-size` (e.g., 20 instead of 50)
+3. **Third:** Reduce `--n-calib` (e.g., 64 instead of 128)
+4. **Fourth:** Reduce `--n-grid` (e.g., 10 instead of 20)
+
+### Speed vs Quality Trade-offs
+
+| Configuration | Time | Memory | Quality |
+|--------------|------|--------|---------|
+| Fast iteration | ~3 min | ~6 GB | Good |
+| **Recommended** | **~6-12 min** | **~14 GB** | **High** |
+| Maximum quality | ~20 min | ~28 GB | Highest |
+
+### Key Implementation Details
+
+**Always remember:**
+1. Use `use_cache=False` in all forward passes
+2. Preserve dtype when modifying weights in sequential quantization
+3. Store activations on CPU: `inp.detach().cpu()`
+4. Clear memory after each batch: `torch.cuda.empty_cache(); gc.collect()`
+5. Use WikiText-2 **test** split for evaluation (not validation)
