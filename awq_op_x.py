@@ -253,7 +253,9 @@ class HeuristicGroupWiseAWQQuantizer:
         # 3. Outlier Masking (Crucial Step from Reference)
         # We ignore the top K% activations to avoid overfitting to outliers
         k_outliers = int(padded_in_features * self.outlier_percent)
-        if k_outliers > 0 and k_outliers < padded_in_features:  # Added safety check
+        # Safety check: ensure k doesn't exceed tensor size
+        k_outliers = min(k_outliers, act_padded.numel())
+        if k_outliers > 0:
             # Find indices of top K abs activations
             _, outlier_indices = torch.topk(act_padded.abs(), k_outliers)
             # Create boolean mask [padded_in]

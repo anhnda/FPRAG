@@ -367,6 +367,8 @@ class AWQHeuristicV2Quantizer:
 
         # Outlier Masking
         k_outliers = int(padded_in_features * self.outlier_percent)
+        # Safety check: ensure k doesn't exceed tensor size
+        k_outliers = min(k_outliers, act_padded.numel())
         if k_outliers > 0:
             _, outlier_indices = torch.topk(act_padded.abs(), k_outliers)
             is_outlier = torch.zeros(padded_in_features, dtype=torch.bool, device=device)

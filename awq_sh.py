@@ -9,17 +9,26 @@ import random
 import numpy as np
 import gc
 
-class HeuristicGroupWiseAWQQuantizer:
+class StandardHeuristicAWQQuantizer:
     """
-    Group-Wise AWQ with Heuristic-Guided Asymmetric Quantization.
-    
-    Corrected to match Global Greedy logic:
-    - Includes Outlier Masking (ignores top X% activations for stability)
-    - Global Candidate Sorting based on Rounding Cost
-    - Vectorized implementation of the reference quantize_groupwise_global_greedy
+    Standard Heuristic AWQ - Fair comparison version.
+
+    This version uses the SAME base features as gw_awq_asym_l2.py, but adds
+    heuristic-guided quantization on top. This isolates the effect of heuristic alone.
+
+    Differences from awq_op_ref.py (advanced version):
+    - float32 precision (not float64)
+    - Random sampling (not sequential)
+    - float16 model loading (not bfloat16)
+    - activation_salience.clamp(min=1e-5) (not + 1e-6)
+
+    KEPT from awq_op_ref.py:
+    - Heuristic-Guided Global Greedy Rounding
+    - Outlier Masking
+    - Vectorized implementation
     """
 
-    def __init__(self, model, tokenizer, device="cuda", bits=4, n_grid=20, 
+    def __init__(self, model, tokenizer, device="cuda", bits=4, n_grid=20,
                  group_size=128, use_heuristic=True, outlier_percent=0.05):
         self.model = model
         self.tokenizer = tokenizer
@@ -35,11 +44,15 @@ class HeuristicGroupWiseAWQQuantizer:
         self.hooks = []
         self.layer_scales = {}
 
-        print(f"\n[Heuristic Group-Wise AWQ Quantizer Initialized]")
+        print(f"\n[Standard Heuristic AWQ Quantizer Initialized]")
         print(f"  Target bits: {bits}")
         print(f"  Group size: {group_size}")
-        print(f"  Outlier protection: Top {outlier_percent*100:.1f}% ignored")
-        print(f"  Quantization: HEURISTIC-GUIDED GROUP-WISE ASYMMETRIC [0, {2**bits - 1}]")
+        print(f"  Use heuristic: {use_heuristic}")
+        if use_heuristic:
+            print(f"  Outlier protection: Top {outlier_percent*100:.1f}% ignored")
+            print(f"  Quantization: HEURISTIC-GUIDED GROUP-WISE ASYMMETRIC [0, {2**bits - 1}]")
+        else:
+            print(f"  Quantization: STANDARD GROUP-WISE ASYMMETRIC [0, {2**bits - 1}]")
 
     def register_hooks(self):
         """Register forward hooks to capture activations."""
@@ -66,7 +79,7 @@ class HeuristicGroupWiseAWQQuantizer:
 
     @torch.no_grad()
     def get_activation_stats(self, name):
-        """Compute L2 salience (E[X²]) and raw mean (E[X]) in one pass."""
+        """Compute L2 salience (E[X²]) and raw mean (E[X]) using FLOAT32 precision."""
         if name not in self.activation_data or len(self.activation_data[name]) == 0:
             return None, None
 
@@ -74,16 +87,18 @@ class HeuristicGroupWiseAWQQuantizer:
         total_samples = sum(x.reshape(-1, x.shape[-1]).shape[0] for x in X_list)
         in_features = X_list[0].shape[-1]
 
-        l2_sum = torch.zeros(in_features, dtype=torch.float64)
-        mean_sum = torch.zeros(in_features, dtype=torch.float64)
+        # CHANGE 1: Use float32 (not float64)
+        l2_sum = torch.zeros(in_features, dtype=torch.float32)
+        mean_sum = torch.zeros(in_features, dtype=torch.float32)
 
         for x in X_list:
-            x_flat = x.reshape(-1, x.shape[-1]).double()
+            # CHANGE 2: Use float() instead of double()
+            x_flat = x.reshape(-1, x.shape[-1]).float()
             l2_sum += x_flat.pow(2).sum(dim=0)
             mean_sum += x_flat.sum(dim=0)
 
-        salience = (l2_sum / total_samples).float()
-        raw_mean = (mean_sum / total_samples).float()
+        salience = (l2_sum / total_samples)
+        raw_mean = (mean_sum / total_samples)
 
         return salience, raw_mean
 
@@ -91,7 +106,7 @@ class HeuristicGroupWiseAWQQuantizer:
     def quantize_weight_heuristic_groupwise(self, W, group_activation_means, apply_heuristic=True):
         """
         Vectorized implementation of 'quantize_groupwise_global_greedy'.
-        
+
         Logic matches reference:
         1. Calculate Scales (Asymmetric [min, max] logic used here to match class config).
         2. Initial Rounding.
@@ -101,7 +116,7 @@ class HeuristicGroupWiseAWQQuantizer:
         """
         out_features, in_features = W.shape
         device = W.device
-        
+
         # --- 1. Pre-processing / Padding ---
         n_groups = (in_features + self.group_size - 1) // self.group_size
         padded_in_features = n_groups * self.group_size
@@ -122,7 +137,7 @@ class HeuristicGroupWiseAWQQuantizer:
         w_min = W_g.min(dim=2, keepdim=True)[0]
         w_max = W_g.max(dim=2, keepdim=True)[0]
         max_int = 2**self.bits - 1
-        
+
         scale = (w_max - w_min) / max_int
         scale = scale.clamp(min=1e-8)
         zp = torch.round(-w_min / scale).clamp(0, max_int)
@@ -143,7 +158,7 @@ class HeuristicGroupWiseAWQQuantizer:
             return W_dequant.to(W.dtype)
 
         # --- 3. Global Greedy Heuristic (Vectorized) ---
-        
+
         # A. Calculate Current Error
         # Error = dot(X, W_orig - W_quant). We sum over input dim.
         W_diff = W_padded - W_quant
@@ -152,13 +167,6 @@ class HeuristicGroupWiseAWQQuantizer:
 
         # B. Identify Flip Candidates
         # Direction to move W_int to get closer to W_div
-        flip_dir = torch.sign(W_div - (W_int - zp_flat)) # Corrected logic: compare float val vs int val relative to 0
-        # Actually easier: sign(W_div - (W_int_current_val)) 
-        # But W_div includes ZP offset logic. 
-        # Simple logic: if W_div > W_int_unbiased, we want to go up.
-        # W_div corresponds to (W / s). W_int corresponds to Q(W/s + z).
-        # Let's use the reference logic: sign(w_div - w_int) where w_div is simply scaled w.
-        # In asymmetric: W_div_asym = W/s + z. W_int = round(W_div_asym).
         flip_dir = torch.sign(W_div + zp_flat - W_int)
         flip_dir[flip_dir == 0] = 1.0
 
@@ -190,11 +198,11 @@ class HeuristicGroupWiseAWQQuantizer:
             valid_mask = valid_mask & (~is_outlier).unsqueeze(0)
 
         # --- 4. Sorting & Optimization ---
-        
-        # Calculate Cost: Distance to rounding boundary. 
+
+        # Calculate Cost: Distance to rounding boundary.
         # Reference sorts Descending. High cost (0.49) = close to boundary = preferred flip.
         rounding_costs = (W_div + zp_flat - W_int).abs()
-        
+
         # Vectorization Trick: Set cost of INVALID candidates to -1.0.
         # Since we sort Descending, valid costs (0.0 to 0.5) will come first.
         # Invalid ones (-1.0) will go to the end.
@@ -206,45 +214,42 @@ class HeuristicGroupWiseAWQQuantizer:
 
         # Reorder impacts based on sorted indices
         sorted_impacts = torch.gather(flip_impacts, 1, sorted_indices)
-        
+
         # Determine validity in sorted order (to zero out the -1 tails)
         sorted_validity = torch.gather(valid_mask.long(), 1, sorted_indices)
         sorted_impacts = sorted_impacts * sorted_validity
 
         # Cumulative Sum of impacts
         cumsum_impacts = torch.cumsum(sorted_impacts, dim=1)
-        
+
         # Find Best K
         # minimizing |error - cumsum|
         residuals = torch.abs(current_error.unsqueeze(1) - cumsum_impacts)
-        
+
         # Prepend the "0 flips" case (original error)
         error_unsqueezed = torch.abs(current_error).unsqueeze(1)
         all_residuals = torch.cat([error_unsqueezed, residuals], dim=1) # [out, in+1]
-        
+
         # Argmin gives best k indices [out]
         best_k = torch.argmin(all_residuals, dim=1)
 
         # --- 5. Apply Flips ---
-        
+
         # Create a mask of which sorted indices to actually flip
         # indices < best_k are flipped
         idx_range = torch.arange(padded_in_features, device=device).unsqueeze(0)
         flip_mask_sorted = idx_range < best_k.unsqueeze(1)
-        
+
         # Filter valid flips within the top K
         # We must use the sorted_validity because the tail contains invalid garbage
         final_flips_sorted = flip_mask_sorted & (sorted_validity.bool())
-        
-        # We need the flip values (+1 or -1) in the *original* positions.
-        # It's easier to scatter the actual update values back.
-        
+
         # Get flip directions in sorted order
         sorted_flip_dir = torch.gather(flip_dir, 1, sorted_indices)
-        
+
         # Zero out flips we decided NOT to do
         sorted_flip_dir[~final_flips_sorted] = 0.0
-        
+
         # Scatter add back to W_int
         W_int.scatter_add_(1, sorted_indices, sorted_flip_dir)
 
@@ -271,18 +276,20 @@ class HeuristicGroupWiseAWQQuantizer:
         activation_salience = activation_salience.to(self.device).to(module.weight.dtype)
         raw_mean = raw_mean.to(self.device).to(module.weight.dtype)
 
-        # Subsampel for speed
+        # CHANGE 3: Use RANDOM sampling (not sequential)
+        # Subsample for speed - same as gw_awq_asym_l2.py
         X_list = self.activation_data[name]
-        X_cpu = []
-        curr_len = 0
-        for x in X_list:
-            x_f = x.reshape(-1, x.shape[-1])
-            X_cpu.append(x_f)
-            curr_len += x_f.shape[0]
-            if curr_len >= 2048:
-                break
-        
-        X_search = torch.cat(X_cpu, dim=0)[:2048].to(self.device)
+        X_cpu = torch.cat([x.reshape(-1, x.shape[-1]) for x in X_list], dim=0)
+
+        max_samples = min(2048, X_cpu.shape[0])
+        if X_cpu.shape[0] > max_samples:
+            indices = torch.randperm(X_cpu.shape[0])[:max_samples]
+            X_search = X_cpu[indices].to(self.device)
+        else:
+            X_search = X_cpu.to(self.device)
+
+        del X_cpu
+
         if X_search.dtype != module.weight.dtype:
             X_search = X_search.to(module.weight.dtype)
 
@@ -293,9 +300,9 @@ class HeuristicGroupWiseAWQQuantizer:
         best_alpha = 0.0
         best_scales = torch.ones(W.shape[1], device=self.device)
 
-        # Optimization: Normalize salience once
-        # Avoid division by zero
-        activation_salience = activation_salience + 1e-6
+        # CHANGE 4: Use .clamp(min=1e-5) instead of + 1e-6
+        # Normalize salience once to avoid division by zero
+        activation_salience = activation_salience.clamp(min=1e-5)
 
         for grid_idx in range(self.n_grid + 1):
             alpha = grid_idx / self.n_grid
@@ -318,9 +325,9 @@ class HeuristicGroupWiseAWQQuantizer:
                 best_error = error
                 best_alpha = alpha
                 best_scales = scales.clone()
-            
+
             del W_scaled, W_quant, W_recon, Y_quant, scales
-        
+
         del X_search, Y_orig
         torch.cuda.empty_cache()
 
@@ -328,7 +335,7 @@ class HeuristicGroupWiseAWQQuantizer:
 
     @torch.no_grad()
     def quantize_layer(self, name, module):
-        """Apply Heuristic Group-Wise AWQ Quantization."""
+        """Apply Standard Heuristic AWQ Quantization."""
         best_scales, best_alpha, best_error = self.search_best_scale(name, module)
 
         W = module.weight.data
@@ -384,9 +391,9 @@ class HeuristicGroupWiseAWQQuantizer:
 
     def quantize_model(self):
         print("\n" + "=" * 80)
-        print("Quantizing with Heuristic-Guided Group-Wise AWQ (Corrected)")
+        print("Quantizing with Standard Heuristic AWQ")
         print("=" * 80)
-        
+
         layer_names = [(name, module) for name, module in self.model.named_modules()
                        if isinstance(module, nn.Linear)]
 
@@ -410,8 +417,13 @@ def main():
     parser.add_argument("--n-calib", type=int, default=128)
     parser.add_argument("--n-grid", type=int, default=20)
     parser.add_argument("--group-size", type=int, default=128)
-    parser.add_argument("--outlier-percent", type=float, default=0.05, help="Percent of outliers to ignore")
-    parser.add_argument("--output-dir", type=str, default="./quantized_models/awq_heuristic")
+    parser.add_argument("--use-heuristic", action="store_true", default=True,
+                       help="Enable heuristic rounding (default: True)")
+    parser.add_argument("--no-heuristic", dest="use_heuristic", action="store_false",
+                       help="Disable heuristic rounding")
+    parser.add_argument("--outlier-percent", type=float, default=0.05,
+                       help="Percent of outliers to ignore (default: 0.05)")
+    parser.add_argument("--output-dir", type=str, default="./quantized_models/minicpm_awq_sh")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -425,18 +437,24 @@ def main():
     print(f"Device: {device} | Model: {model_name}")
 
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.bfloat16, 
-                                                device_map=device, trust_remote_code=True)
+    # CHANGE 5: Use float16 (not bfloat16)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype=torch.float16,  # Changed from bfloat16
+        device_map=device,
+        trust_remote_code=True
+    )
 
     calib_texts = load_wikitext2(split="train", n_samples=args.n_calib)
 
-    quantizer = HeuristicGroupWiseAWQQuantizer(
+    quantizer = StandardHeuristicAWQQuantizer(
         model=model,
         tokenizer=tokenizer,
         device=device,
         bits=4,
         n_grid=args.n_grid,
         group_size=args.group_size,
+        use_heuristic=args.use_heuristic,
         outlier_percent=args.outlier_percent
     )
 
