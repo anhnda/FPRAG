@@ -272,6 +272,7 @@ class GroupWiseAWQAsymmetricL2Quantizer:
         best_scales, best_alpha, best_error = self.search_best_scale(name, module)
 
         W = module.weight.data
+        original_dtype = W.dtype  # CRITICAL: Remember original dtype!
 
         # Scale weight COLUMNS
         W_scaled = W * best_scales.unsqueeze(0)
@@ -281,6 +282,10 @@ class GroupWiseAWQAsymmetricL2Quantizer:
 
         # Divide by scales to restore original magnitude
         W_final = W_quant / best_scales.unsqueeze(0)
+
+        # CRITICAL FIX: Convert back to original dtype!
+        # This prevents "c10::Half != float" errors in sequential quantization
+        W_final = W_final.to(original_dtype)
 
         # Update module weights
         module.weight.data = W_final
@@ -426,9 +431,10 @@ class GroupWiseAWQAsymmetricL2Quantizer:
                     print(f"  → α={best_alpha:.4f}, error={best_error:.8f}")
 
                     W = module.weight.data
+                    original_dtype = W.dtype  # Remember dtype!
                     W_scaled = W * best_scales.unsqueeze(0)
                     W_quant = self.quantize_weight_groupwise_asymmetric(W_scaled)
-                    W_final = W_quant / best_scales.unsqueeze(0)
+                    W_final = (W_quant / best_scales.unsqueeze(0)).to(original_dtype)  # Fix dtype!
                     module.weight.data = W_final
 
                     self.layer_scales[name] = {
