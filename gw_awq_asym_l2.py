@@ -541,13 +541,13 @@ def main():
     print(f"\nLoading calibration dataset: {args.calib_dataset}")
     if args.calib_dataset == "c4":
         # MEMORY OPTIMIZATION: Match seqlen with calibration max_length (512)
-        calib_texts = get_c4_calibration_data(tokenizer, n_samples=args.n_calib, seqlen=512, seed=args.seed)
+        calib_texts = get_c4_calibration_data(tokenizer, n_samples=args.n_calib, seqlen=2048, seed=args.seed)
     elif args.calib_dataset == "wikitext2-simple":
         # MEMORY EFFICIENT: Original simple approach (fastest, lowest memory)
         calib_texts = load_wikitext2_simple(n_samples=args.n_calib)
     else:
         # MEMORY OPTIMIZATION: Match seqlen with calibration max_length (512)
-        calib_texts = get_wikitext2_calibration_data(tokenizer, n_samples=args.n_calib, seqlen=512, seed=args.seed)
+        calib_texts = get_wikitext2_calibration_data(tokenizer, n_samples=args.n_calib, seqlen=2048, seed=args.seed)
 
     # Initialize quantizer
     quantizer = GroupWiseAWQAsymmetricL2Quantizer(
