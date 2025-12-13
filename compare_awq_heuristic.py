@@ -5,7 +5,7 @@ Comprehensive evaluation across multiple datasets to determine if the heuristic
 quantization approach improves over standard AWQ.
 
 Datasets tested:
-1. WikiText-2 validation - In-distribution (Wikipedia, formal)
+1. WikiText-2 test - In-distribution (Wikipedia, formal)
 2. C4 validation - Cross-dataset (Web crawl, diverse)
 3. AG News test - Cross-dataset (News, journalistic)
 
@@ -48,12 +48,12 @@ class AWQHeuristicValidator:
         print(f"Random seed: {seed}")
         print("="*80)
 
-    def load_wikitext2_validation(self, n_samples=2000):
-        """Load WikiText-2 validation set."""
-        print("\n[1/3] Loading WikiText-2 validation...")
+    def load_wikitext2_test(self, n_samples=2000):
+        """Load WikiText-2 test set."""
+        print("\n[1/3] Loading WikiText-2 test...")
         random.seed(self.seed)
 
-        dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="validation")
+        dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
         texts = [item['text'] for item in dataset if len(item['text'].strip()) > 100]
 
         random.seed(self.seed)
@@ -180,7 +180,7 @@ class AWQHeuristicValidator:
         print("="*80)
 
         datasets = {
-            'WikiText-2': self.load_wikitext2_validation(n_samples),
+            'WikiText-2': self.load_wikitext2_test(n_samples),
             'C4': self.load_c4_validation(n_samples),
             'AG News': self.load_ag_news_test(n_samples)
         }
@@ -224,7 +224,7 @@ class AWQHeuristicValidator:
 
         # Results for each dataset
         dataset_results = []
-        for dataset_name in ['WikiText-2', 'C4', 'AG News']:
+        for dataset_name in ['WikiText-2']:#, 'C4', 'AG News']:
             if dataset_name in self.results:
                 heur_ppl = self.results[dataset_name]['Heuristic AWQ']['perplexity']
                 std_ppl = self.results[dataset_name]['Standard AWQ']['perplexity']
@@ -319,7 +319,7 @@ class AWQHeuristicValidator:
         print("DATASET CHARACTERISTICS")
         print("="*80)
 
-        print("\nWikiText-2:")
+        print("\nWikiText-2 (Test):")
         print("  Source: Wikipedia articles")
         print("  Style:  Formal, encyclopedic")
         print("  Domain: General knowledge")
