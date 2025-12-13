@@ -396,13 +396,14 @@ class GroupWiseAWQAsymmetricL2Quantizer:
 
 def load_c4_calibration(tokenizer, n_samples=128, seq_len=2048, seed=42):
     """
-    Load C4 calibration data with fixed-length sequences.
+    Load C4 calibration data with fixed-length sequences (MEMORY-EFFICIENT).
 
     Process:
-    1. Download a random portion of C4 validation set
-    2. Tokenize text continuously
-    3. Slice into chunks of exactly seq_len tokens
-    4. Select n_samples chunks randomly
+    1. Stream C4 validation set
+    2. Tokenize documents incrementally (no huge concatenation)
+    3. Accumulate tokens until we have enough chunks
+    4. Slice into chunks of exactly seq_len tokens
+    5. Select n_samples chunks randomly
 
     Args:
         tokenizer: HuggingFace tokenizer
@@ -418,44 +419,51 @@ def load_c4_calibration(tokenizer, n_samples=128, seq_len=2048, seed=42):
     # Set seed for reproducibility
     random.seed(seed)
 
-    # Load C4 validation set (streaming mode for efficiency)
+    # Load C4 validation set (streaming mode)
     dataset = load_dataset('allenai/c4', 'en', split='validation', streaming=True)
 
-    # Collect text until we have enough tokens
-    # We need: n_samples * seq_len * 2 (2x buffer for safety)
-    required_tokens = n_samples * seq_len * 2
+    # We need slightly more chunks than n_samples for random selection
+    target_chunks = n_samples + 50  # Extra buffer for random selection
+    required_tokens = target_chunks * seq_len
 
-    print("  Collecting text from C4...")
-    all_text = []
-    total_chars = 0
+    print(f"  Streaming and tokenizing C4 (target: {required_tokens} tokens)...")
+
+    # Accumulate tokens incrementally (memory-efficient)
+    all_tokens = []
+    total_tokens = 0
+    doc_count = 0
 
     for example in dataset:
-        text = example['text']
-        all_text.append(text)
-        total_chars += len(text)
+        # Tokenize each document separately (memory-efficient)
+        tokens = tokenizer(
+            example['text'],
+            return_tensors='pt',
+            add_special_tokens=False,
+            truncation=False
+        )['input_ids'][0]
 
-        # Heuristic: ~4 characters per token on average
-        if total_chars > required_tokens * 4:
+        all_tokens.append(tokens)
+        total_tokens += len(tokens)
+        doc_count += 1
+
+        # Stop when we have enough tokens
+        if total_tokens >= required_tokens:
             break
 
-    # Concatenate all text
-    print(f"  Collected {len(all_text)} documents ({total_chars} characters)")
-    concatenated_text = ' '.join(all_text)
+        # Progress indicator every 100 documents
+        if doc_count % 100 == 0:
+            print(f"    Processed {doc_count} documents, {total_tokens} tokens...")
 
-    # Tokenize continuously
-    print("  Tokenizing...")
-    all_tokens = tokenizer(
-        concatenated_text,
-        return_tensors='pt',
-        add_special_tokens=False,
-        truncation=False
-    )['input_ids'][0]  # [total_tokens]
-
-    print(f"  Total tokens: {len(all_tokens)}")
+    # Concatenate tokens (more efficient than concatenating text)
+    print(f"  Concatenating {doc_count} documents ({total_tokens} tokens)...")
+    all_tokens = torch.cat(all_tokens, dim=0)
 
     # Split into seq_len chunks
     num_chunks = len(all_tokens) // seq_len
     print(f"  Creating {num_chunks} chunks of {seq_len} tokens...")
+
+    if num_chunks < n_samples:
+        raise ValueError(f"Not enough chunks! Got {num_chunks}, need {n_samples}")
 
     chunks = []
     for i in range(num_chunks):
@@ -463,20 +471,17 @@ def load_c4_calibration(tokenizer, n_samples=128, seq_len=2048, seed=42):
         chunks.append(chunk_tokens)
 
     # Randomly sample n_samples chunks
-    if len(chunks) < n_samples:
-        raise ValueError(f"Not enough chunks! Got {len(chunks)}, need {n_samples}")
-
     print(f"  Randomly selecting {n_samples} chunks...")
     selected_indices = random.sample(range(len(chunks)), n_samples)
     selected_chunks = [chunks[i] for i in selected_indices]
 
-    # Decode back to text (for compatibility with existing calibration code)
+    # Decode to text (for compatibility with existing calibration code)
     calibration_texts = []
     for chunk in selected_chunks:
         text = tokenizer.decode(chunk, skip_special_tokens=True)
         calibration_texts.append(text)
 
-    print(f"  ✓ Loaded {len(calibration_texts)} calibration samples")
+    print(f"  ✓ Loaded {len(calibration_texts)} calibration samples from C4")
     return calibration_texts
 
 
