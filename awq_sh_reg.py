@@ -284,7 +284,7 @@ class StandardHeuristicAWQQuantizerWithRegularization:
         return W_dequant.to(W.dtype)
 
     @torch.no_grad()
-    def search_best_scale(self, name, module):
+    def search_best_scale(self, name, module, use_heuristic=None):
         """Grid search for optimal per-input-channel scaling factor."""
         if name not in self.activation_data or len(self.activation_data[name]) == 0:
             in_features = module.weight.shape[1]
@@ -297,6 +297,10 @@ class StandardHeuristicAWQQuantizerWithRegularization:
 
         activation_salience = activation_salience.to(self.device).to(module.weight.dtype)
         raw_mean = raw_mean.to(self.device).to(module.weight.dtype)
+
+        # Allow override of use_heuristic (for OOM protection)
+        if use_heuristic is None:
+            use_heuristic = self.use_heuristic
 
         # CHANGE 3: Use RANDOM sampling (not sequential)
         # Subsample for speed - same as gw_awq_asym_l2.py
@@ -336,7 +340,7 @@ class StandardHeuristicAWQQuantizerWithRegularization:
             W_quant = self.quantize_weight_heuristic_groupwise(
                 W_scaled,
                 scaled_act_mean,
-                apply_heuristic=self.use_heuristic
+                apply_heuristic=use_heuristic
             )
 
             W_recon = W_quant / scales.unsqueeze(0)
@@ -358,18 +362,8 @@ class StandardHeuristicAWQQuantizerWithRegularization:
     @torch.no_grad()
     def quantize_layer(self, name, module):
         """Apply Standard Heuristic AWQ Quantization with OOM protection."""
-        best_scales, best_alpha, best_error = self.search_best_scale(name, module)
-
+        # OOM Protection: Check layer size FIRST, before any computation
         W = module.weight.data
-        W_scaled = W * best_scales.unsqueeze(0)
-
-        _, raw_mean = self.get_activation_stats(name)
-        if raw_mean is not None:
-            scaled_act_mean = (raw_mean.to(self.device).to(W.dtype) / best_scales)
-        else:
-            scaled_act_mean = torch.zeros(W.shape[1], device=W.device, dtype=W.dtype)
-
-        # OOM Protection: Skip heuristic for very large layers
         layer_size_gb = (W.shape[0] * W.shape[1] * 4) / (1024**3)
         max_layer_size_gb = 0.5  # 500MB threshold
 
@@ -377,6 +371,19 @@ class StandardHeuristicAWQQuantizerWithRegularization:
         if self.use_heuristic and layer_size_gb > max_layer_size_gb:
             print(f"\n⚠️  Layer {name} too large ({layer_size_gb:.2f} GB), skipping heuristic to avoid OOM")
             apply_heuristic_this_layer = False
+
+        # Grid search with heuristic control
+        best_scales, best_alpha, best_error = self.search_best_scale(
+            name, module, use_heuristic=apply_heuristic_this_layer
+        )
+
+        W_scaled = W * best_scales.unsqueeze(0)
+
+        _, raw_mean = self.get_activation_stats(name)
+        if raw_mean is not None:
+            scaled_act_mean = (raw_mean.to(self.device).to(W.dtype) / best_scales)
+        else:
+            scaled_act_mean = torch.zeros(W.shape[1], device=W.device, dtype=W.dtype)
 
         W_quant = self.quantize_weight_heuristic_groupwise(
             W_scaled,
