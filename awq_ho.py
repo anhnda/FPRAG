@@ -70,7 +70,7 @@ class AWQHeuristicOptionQuantizer:
     def register_hooks(self):
         """Register forward hooks to capture activations."""
         def get_hook(name):
-            def hook(module, input, output):
+            def hook(module, input, output):  # noqa: ARG001
                 if name not in self.activation_data:
                     self.activation_data[name] = []
                 if isinstance(input, tuple):
@@ -107,17 +107,17 @@ class AWQHeuristicOptionQuantizer:
         total_samples = sum(x.reshape(-1, x.shape[-1]).shape[0] for x in X_list)
         in_features = X_list[0].shape[-1]
 
-        # Accumulate statistics on CPU
-        l2_sum = torch.zeros(in_features, dtype=torch.float64)
-        mean_sum = torch.zeros(in_features, dtype=torch.float64)
+        # Accumulate statistics on CPU (use float32 to match gw_awq_asym_l2.py)
+        l2_sum = torch.zeros(in_features)
+        mean_sum = torch.zeros(in_features)
 
         for x in X_list:
-            x_flat = x.reshape(-1, x.shape[-1]).double()
+            x_flat = x.reshape(-1, x.shape[-1])
             l2_sum += x_flat.pow(2).sum(dim=0)
             mean_sum += x_flat.sum(dim=0)
 
-        salience = (l2_sum / total_samples).float()
-        raw_mean = (mean_sum / total_samples).float()
+        salience = l2_sum / total_samples
+        raw_mean = mean_sum / total_samples
 
         return salience, raw_mean
 
@@ -297,18 +297,19 @@ class AWQHeuristicOptionQuantizer:
         activation_salience = activation_salience.to(self.device).to(module.weight.dtype)
         raw_mean = raw_mean.to(self.device).to(module.weight.dtype)
 
-        # Prepare calibration data (subsample for speed)
+        # Prepare calibration data (use RANDOM sampling to match gw_awq_asym_l2.py)
         X_list = self.activation_data[name]
-        X_cpu = []
-        curr_len = 0
-        for x in X_list:
-            x_f = x.reshape(-1, x.shape[-1])
-            X_cpu.append(x_f)
-            curr_len += x_f.shape[0]
-            if curr_len >= 2048:
-                break
+        X_cpu = torch.cat([x.reshape(-1, x.shape[-1]) for x in X_list], dim=0)
 
-        X_search = torch.cat(X_cpu, dim=0)[:2048].to(self.device)
+        max_samples = min(2048, X_cpu.shape[0])
+        if X_cpu.shape[0] > max_samples:
+            indices = torch.randperm(X_cpu.shape[0])[:max_samples]
+            X_search = X_cpu[indices].to(self.device)
+        else:
+            X_search = X_cpu.to(self.device)
+
+        del X_cpu
+
         if X_search.dtype != module.weight.dtype:
             X_search = X_search.to(module.weight.dtype)
 
@@ -324,9 +325,6 @@ class AWQHeuristicOptionQuantizer:
         best_error = float('inf')
         best_alpha = 0.0
         best_scales = torch.ones(W.shape[1], device=self.device)
-
-        # Avoid division by zero
-        activation_salience = activation_salience.clamp(min=1e-6)
 
         # Grid search over α
         for grid_idx in range(self.n_grid + 1):
@@ -438,7 +436,7 @@ class AWQHeuristicOptionQuantizer:
                     inputs = {k: v.to(self.device) for k, v in inputs.items()}
                     self.model(**inputs, use_cache=False, return_dict=True)
                     successful += 1
-                except Exception as e:
+                except Exception:
                     if i % 100 == 0 and i > 0:
                         print(f"\nNote: Some samples skipped due to errors")
                     continue
