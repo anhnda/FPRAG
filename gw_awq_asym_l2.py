@@ -162,7 +162,7 @@ class GroupWiseAWQAsymmetricL2Quantizer:
         return W_dequant
 
     @torch.no_grad()
-    def search_best_scale(self, name, module):
+    def search_best_scale(self, name, module, debug=False):
         """
         Grid search for optimal per-input-channel scaling factor using L2 salience.
 
@@ -185,8 +185,14 @@ class GroupWiseAWQAsymmetricL2Quantizer:
         # Get L2 activation salience
         activation_salience = self.get_activation_salience_l2(name)
         if activation_salience is None:
+            if debug:
+                print(f"  DEBUG: No activation salience for {name}, using default scales")
             in_features = module.weight.shape[1]
             return torch.ones(in_features).to(self.device), 0.0, 0.0
+
+        if debug:
+            print(f"  DEBUG: Got salience for {name}, shape={activation_salience.shape}, "
+                  f"mean={activation_salience.mean():.6f}, max={activation_salience.max():.6f}")
 
         # Prepare calibration data
         X_list = self.activation_data[name]
@@ -297,9 +303,11 @@ class GroupWiseAWQAsymmetricL2Quantizer:
         self.activation_data = {}
 
         # Register hook for THIS layer only
+        hook_registered = False
         for name, module in self.model.named_modules():
             if name == layer_name and isinstance(module, nn.Linear):
                 handle = module.register_forward_hook(self.get_hook(layer_name))
+                hook_registered = True
 
                 # Run calibration data through model
                 with torch.no_grad():
@@ -323,6 +331,14 @@ class GroupWiseAWQAsymmetricL2Quantizer:
                 # Remove hook
                 handle.remove()
                 break
+
+        # Debug: Check if activations were captured
+        if layer_name in self.activation_data:
+            num_captured = len(self.activation_data[layer_name])
+            if num_captured < n_samples * 0.5:  # Less than 50% captured
+                print(f"⚠️  WARNING: Only {num_captured}/{n_samples} activations captured for {layer_name}")
+        else:
+            print(f"❌ ERROR: NO activations captured for {layer_name}! Hook registered: {hook_registered}")
 
     def get_hook(self, name):
         """Create a hook function for a specific layer."""
@@ -390,13 +406,30 @@ class GroupWiseAWQAsymmetricL2Quantizer:
         quantized_count = 0
         skipped_count = 0
 
-        for name, module in tqdm(layer_names, desc="Sequential Quantization"):
+        for idx, (name, module) in enumerate(tqdm(layer_names, desc="Sequential Quantization")):
             try:
                 # STEP 1: Calibrate THIS layer only
                 self.calibrate_single_layer(name, calibration_data, n_samples)
 
-                # STEP 2: Quantize THIS layer
-                self.quantize_layer(name, module)
+                # STEP 2: Quantize THIS layer (enable debug for first 3 layers)
+                if idx < 3:
+                    print(f"\nDEBUG Layer {idx}: {name}")
+                    best_scales, best_alpha, best_error = self.search_best_scale(name, module, debug=True)
+                    print(f"  → α={best_alpha:.4f}, error={best_error:.8f}")
+
+                    W = module.weight.data
+                    W_scaled = W * best_scales.unsqueeze(0)
+                    W_quant = self.quantize_weight_groupwise_asymmetric(W_scaled)
+                    W_final = W_quant / best_scales.unsqueeze(0)
+                    module.weight.data = W_final
+
+                    self.layer_scales[name] = {
+                        'scales': best_scales.cpu(),
+                        'alpha': best_alpha,
+                        'error': best_error
+                    }
+                else:
+                    self.quantize_layer(name, module)
 
                 # STEP 3: Clear activations for this layer
                 if name in self.activation_data:
