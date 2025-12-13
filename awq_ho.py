@@ -287,6 +287,7 @@ class AWQHeuristicOptionQuantizer:
         """
         Group-wise asymmetric quantization with global greedy rounding correction.
         Only called when use_heuristic=True.
+        Memory-optimized version.
         """
         out_features, in_features = W.shape
         device = W.device
@@ -323,15 +324,21 @@ class AWQHeuristicOptionQuantizer:
         # Initial Quantization
         W_div = W_padded / scale_flat
         W_int = torch.round(W_div + zp_flat).clamp(0, max_int)
-        W_quant = (W_int - zp_flat) * scale_flat
 
-        # Global Greedy Heuristic
+        # Free memory early
+        del W_grouped, W_min, W_max, scale, zero_point
+
+        # Compute initial error
+        W_quant = (W_int - zp_flat) * scale_flat
         W_diff = W_padded - W_quant
         current_error = (W_diff * act_padded.unsqueeze(0)).sum(dim=1)
+        del W_quant, W_diff
 
+        # Compute flip direction
         flip_dir = torch.sign(W_div + zp_flat - W_int)
         flip_dir[flip_dir == 0] = 1.0
 
+        # Compute flip impacts
         flip_impacts = act_padded.unsqueeze(0) * flip_dir * scale_flat
 
         # Validity Masks
@@ -341,6 +348,7 @@ class AWQHeuristicOptionQuantizer:
         w_int_proposed = W_int + flip_dir
         in_range = (w_int_proposed >= 0) & (w_int_proposed <= max_int)
         valid_mask = valid_mask & in_range
+        del w_int_proposed, in_range
 
         # Outlier Masking
         k_outliers = int(padded_in_features * self.outlier_percent)
@@ -349,35 +357,60 @@ class AWQHeuristicOptionQuantizer:
             is_outlier = torch.zeros(padded_in_features, dtype=torch.bool, device=device)
             is_outlier[outlier_indices] = True
             valid_mask = valid_mask & (~is_outlier).unsqueeze(0)
+            del outlier_indices, is_outlier
 
         # Sorting & Optimization
         rounding_costs = (W_div + zp_flat - W_int).abs()
-        rounding_costs_masked = rounding_costs.clone()
-        rounding_costs_masked[~valid_mask] = -1.0
+        del W_div  # Free memory
 
-        sorted_indices = torch.argsort(rounding_costs_masked, dim=1, descending=True)
+        rounding_costs[~valid_mask] = -1.0  # Modify in-place instead of clone
+
+        sorted_indices = torch.argsort(rounding_costs, dim=1, descending=True)
+        del rounding_costs  # Free memory
+
         sorted_impacts = torch.gather(flip_impacts, 1, sorted_indices)
+        del flip_impacts  # Free memory
+
         sorted_validity = torch.gather(valid_mask.long(), 1, sorted_indices)
+        del valid_mask  # Free memory
+
         sorted_impacts = sorted_impacts * sorted_validity
 
         cumsum_impacts = torch.cumsum(sorted_impacts, dim=1)
+        del sorted_impacts  # Free memory
+
         residuals = torch.abs(current_error.unsqueeze(1) - cumsum_impacts)
+        del cumsum_impacts  # Free memory
 
         error_unsqueezed = torch.abs(current_error).unsqueeze(1)
+        del current_error, target_sign  # Free memory
+
         all_residuals = torch.cat([error_unsqueezed, residuals], dim=1)
+        del error_unsqueezed, residuals  # Free memory
+
         best_k = torch.argmin(all_residuals, dim=1)
+        del all_residuals  # Free memory
 
         # Apply Flips
         idx_range = torch.arange(padded_in_features, device=device).unsqueeze(0)
         flip_mask_sorted = idx_range < best_k.unsqueeze(1)
+        del idx_range, best_k  # Free memory
+
         final_flips_sorted = flip_mask_sorted & (sorted_validity.bool())
+        del flip_mask_sorted, sorted_validity  # Free memory
 
         sorted_flip_dir = torch.gather(flip_dir, 1, sorted_indices)
+        del flip_dir  # Free memory
+
         sorted_flip_dir[~final_flips_sorted] = 0.0
+        del final_flips_sorted  # Free memory
+
         W_int.scatter_add_(1, sorted_indices, sorted_flip_dir)
+        del sorted_indices, sorted_flip_dir  # Free memory
 
         # Dequantize
         W_dequant = (W_int - zp_flat) * scale_flat
+        del W_int, zp_flat, scale_flat  # Free memory
 
         if padded_in_features > in_features:
             W_dequant = W_dequant[:, :in_features]
