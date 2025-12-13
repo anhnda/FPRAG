@@ -222,7 +222,7 @@ class AWQHeuristicValidator:
         print(f"\n{'Dataset':<15} {'Heuristic AWQ':<15} {'Standard AWQ':<15} {'Delta':<12} {'Winner':<10}")
         print("-" * 80)
 
-        # Results for each dataset
+        # Results for each dataset. 
         dataset_results = []
         for dataset_name in ['WikiText-2', 'C4', 'AG News']:
             if dataset_name in self.results:
