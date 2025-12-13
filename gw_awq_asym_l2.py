@@ -318,14 +318,20 @@ class GroupWiseAWQAsymmetricL2Quantizer:
         successful = 0
         for i, text in enumerate(tqdm(calibration_data[:n_samples], desc="Calibration")):
             try:
+                # SPEED OPTIMIZATION: Reduced from 2048 to 512 (4x faster)
+                # Calibration doesn't need full context - 512 tokens is sufficient
                 inputs = self.tokenizer(text, return_tensors="pt",
-                                       truncation=True, max_length=2048)
+                                       truncation=True, max_length=512)
                 inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
                 with torch.no_grad():
                     _ = self.model(**inputs, use_cache=False, return_dict=True)
 
                 successful += 1
+
+                # MEMORY OPTIMIZATION: Clear cache periodically
+                if (i + 1) % 32 == 0:
+                    torch.cuda.empty_cache()
 
             except Exception as e:
                 if i % 100 == 0 and i > 0:
@@ -334,6 +340,9 @@ class GroupWiseAWQAsymmetricL2Quantizer:
 
         self.remove_hooks()
         print(f"Calibration complete! Successfully processed {successful}/{n_samples} samples")
+
+        # MEMORY OPTIMIZATION: Final cleanup
+        torch.cuda.empty_cache()
 
     def quantize_model(self):
         """Quantize all linear layers using Group-Wise AWQ with L2 Salience."""
@@ -416,6 +425,21 @@ def load_c4_calibration(tokenizer, n_samples=128, seq_len=2048, seed=42):
     return get_c4_calibration_data(tokenizer, n_samples, seq_len, seed)
 
 
+def load_wikitext2_simple(n_samples=128):
+    """
+    Simple WikiText-2 loader (MEMORY EFFICIENT - original approach).
+
+    Use this if you're experiencing memory issues with the new loaders.
+    This is the original approach that was fast and memory-efficient.
+    """
+    from datasets import load_dataset
+    print(f"Loading WikiText-2 (simple/fast approach)...")
+    dataset = load_dataset('wikitext', 'wikitext-2-raw-v1', split='train')
+    texts = [item['text'] for item in dataset if len(item['text'].strip()) > 0]
+    print(f"  ✓ Loaded {len(texts[:n_samples])} samples from WikiText-2")
+    return texts[:n_samples]
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Group-Wise AWQ with ASYMMETRIC quantization and L2 Salience for MiniCPM-2B",
@@ -430,8 +454,8 @@ def main():
                        help="Output directory")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--calib-dataset", type=str, default="c4",
-                       choices=["c4", "wikitext2"],
-                       help="Calibration dataset (default: c4)")
+                       choices=["c4", "wikitext2", "wikitext2-simple"],
+                       help="Calibration dataset (default: c4). Use 'wikitext2-simple' for lowest memory usage")
     args = parser.parse_args()
 
     # Set random seeds
@@ -485,9 +509,14 @@ def main():
     # Load calibration data
     print(f"\nLoading calibration dataset: {args.calib_dataset}")
     if args.calib_dataset == "c4":
-        calib_texts = get_c4_calibration_data(tokenizer, n_samples=args.n_calib, seqlen=2048, seed=args.seed)
+        # MEMORY OPTIMIZATION: Match seqlen with calibration max_length (512)
+        calib_texts = get_c4_calibration_data(tokenizer, n_samples=args.n_calib, seqlen=512, seed=args.seed)
+    elif args.calib_dataset == "wikitext2-simple":
+        # MEMORY EFFICIENT: Original simple approach (fastest, lowest memory)
+        calib_texts = load_wikitext2_simple(n_samples=args.n_calib)
     else:
-        calib_texts = get_wikitext2_calibration_data(tokenizer, n_samples=args.n_calib, seqlen=2048, seed=args.seed)
+        # MEMORY OPTIMIZATION: Match seqlen with calibration max_length (512)
+        calib_texts = get_wikitext2_calibration_data(tokenizer, n_samples=args.n_calib, seqlen=512, seed=args.seed)
 
     # Initialize quantizer
     quantizer = GroupWiseAWQAsymmetricL2Quantizer(
