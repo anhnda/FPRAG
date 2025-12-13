@@ -310,6 +310,7 @@ class GroupWiseAWQAsymmetricL2Quantizer:
                 hook_registered = True
 
                 # Run calibration data through model
+                successful_passes = 0
                 with torch.no_grad():
                     for i, text in enumerate(calibration_data[:n_samples]):
                         try:
@@ -318,6 +319,7 @@ class GroupWiseAWQAsymmetricL2Quantizer:
                             inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
                             _ = self.model(**inputs, use_cache=False, return_dict=True)
+                            successful_passes += 1
                             del inputs
 
                             # Cleanup every 16 samples
@@ -325,8 +327,14 @@ class GroupWiseAWQAsymmetricL2Quantizer:
                                 if torch.cuda.is_available():
                                     torch.cuda.empty_cache()
                                 gc.collect()
-                        except:
+                        except Exception as e:
+                            # Don't silently ignore errors!
+                            if i == 0:  # Print first error
+                                print(f"\n⚠️  Forward pass error on sample {i}: {str(e)[:100]}")
                             continue
+
+                if successful_passes == 0:
+                    print(f"\n❌ FATAL: No successful forward passes for {layer_name}!")
 
                 # Remove hook
                 handle.remove()
