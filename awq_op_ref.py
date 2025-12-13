@@ -8,6 +8,7 @@ import argparse
 import random
 import numpy as np
 import gc
+from calibration_utils import get_c4_calibration_data, get_wikitext2_calibration_data
 
 class HeuristicGroupWiseAWQQuantizer:
     """
@@ -398,6 +399,7 @@ class HeuristicGroupWiseAWQQuantizer:
                 continue
 
 def load_wikitext2(split="train", n_samples=None):
+    """DEPRECATED: Use calibration_utils.get_wikitext2_calibration_data() instead."""
     print(f"Loading WikiText-2 {split} dataset...")
     dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split=split)
     texts = [item['text'] for item in dataset if len(item['text'].strip()) > 0]
@@ -413,6 +415,9 @@ def main():
     parser.add_argument("--outlier-percent", type=float, default=0.05, help="Percent of outliers to ignore")
     parser.add_argument("--output-dir", type=str, default="./quantized_models/awq_heuristic")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--calib-dataset", type=str, default="wikitext2",
+                       choices=["c4", "wikitext2"],
+                       help="Calibration dataset (default: wikitext2)")
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -425,10 +430,15 @@ def main():
     print(f"Device: {device} | Model: {model_name}")
 
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.bfloat16, 
+    model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.bfloat16,
                                                 device_map=device, trust_remote_code=True)
 
-    calib_texts = load_wikitext2(split="train", n_samples=args.n_calib)
+    # Load calibration data
+    print(f"\nLoading calibration dataset: {args.calib_dataset}")
+    if args.calib_dataset == "c4":
+        calib_texts = get_c4_calibration_data(tokenizer, n_samples=args.n_calib, seqlen=512, seed=args.seed)
+    else:
+        calib_texts = get_wikitext2_calibration_data(tokenizer, n_samples=args.n_calib, seqlen=512, seed=args.seed)
 
     quantizer = HeuristicGroupWiseAWQQuantizer(
         model=model,

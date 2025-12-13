@@ -8,6 +8,7 @@ import argparse
 import random
 import numpy as np
 import gc
+from calibration_utils import get_c4_calibration_data, get_wikitext2_calibration_data
 
 class StandardHeuristicAWQQuantizer:
     """
@@ -418,93 +419,11 @@ class StandardHeuristicAWQQuantizer:
 
 def load_c4_calibration(tokenizer, n_samples=128, seq_len=2048, seed=42):
     """
-    Load C4 calibration data with fixed-length sequences (MEMORY-EFFICIENT).
+    DEPRECATED: Use calibration_utils.get_c4_calibration_data() instead.
 
-    Process:
-    1. Stream C4 validation set
-    2. Tokenize documents incrementally (no huge concatenation)
-    3. Accumulate tokens until we have enough chunks
-    4. Slice into chunks of exactly seq_len tokens
-    5. Select n_samples chunks randomly
-
-    Args:
-        tokenizer: HuggingFace tokenizer
-        n_samples: Number of sequences (default: 128)
-        seq_len: Sequence length in tokens (default: 2048)
-        seed: Random seed
-
-    Returns:
-        List of text strings (each tokenizes to ~seq_len tokens)
+    This wrapper is kept for backward compatibility.
     """
-    print(f"Loading C4 calibration data ({n_samples} samples, {seq_len} tokens each)...")
-
-    # Set seed for reproducibility
-    random.seed(seed)
-
-    # Load C4 validation set (streaming mode)
-    dataset = load_dataset('allenai/c4', 'en', split='validation', streaming=True)
-
-    # We need slightly more chunks than n_samples for random selection
-    target_chunks = n_samples + 50  # Extra buffer for random selection
-    required_tokens = target_chunks * seq_len
-
-    print(f"  Streaming and tokenizing C4 (target: {required_tokens} tokens)...")
-
-    # Accumulate tokens incrementally (memory-efficient)
-    all_tokens = []
-    total_tokens = 0
-    doc_count = 0
-
-    for example in dataset:
-        # Tokenize each document separately (memory-efficient)
-        tokens = tokenizer(
-            example['text'],
-            return_tensors='pt',
-            add_special_tokens=False,
-            truncation=False
-        )['input_ids'][0]
-
-        all_tokens.append(tokens)
-        total_tokens += len(tokens)
-        doc_count += 1
-
-        # Stop when we have enough tokens
-        if total_tokens >= required_tokens:
-            break
-
-        # Progress indicator every 100 documents
-        if doc_count % 100 == 0:
-            print(f"    Processed {doc_count} documents, {total_tokens} tokens...")
-
-    # Concatenate tokens (more efficient than concatenating text)
-    print(f"  Concatenating {doc_count} documents ({total_tokens} tokens)...")
-    all_tokens = torch.cat(all_tokens, dim=0)
-
-    # Split into seq_len chunks
-    num_chunks = len(all_tokens) // seq_len
-    print(f"  Creating {num_chunks} chunks of {seq_len} tokens...")
-
-    if num_chunks < n_samples:
-        raise ValueError(f"Not enough chunks! Got {num_chunks}, need {n_samples}")
-
-    chunks = []
-    for i in range(num_chunks):
-        chunk_tokens = all_tokens[i * seq_len : (i + 1) * seq_len]
-        chunks.append(chunk_tokens)
-
-    # Randomly sample n_samples chunks
-    print(f"  Randomly selecting {n_samples} chunks...")
-    selected_indices = random.sample(range(len(chunks)), n_samples)
-    selected_chunks = [chunks[i] for i in selected_indices]
-
-    # Decode to text (for compatibility with existing calibration code)
-    calibration_texts = []
-    for chunk in selected_chunks:
-        text = tokenizer.decode(chunk, skip_special_tokens=True)
-        calibration_texts.append(text)
-
-    print(f"  ✓ Loaded {len(calibration_texts)} calibration samples from C4")
-    return calibration_texts
+    return get_c4_calibration_data(tokenizer, n_samples, seq_len, seed)
 
 def main():
     parser = argparse.ArgumentParser()
@@ -521,6 +440,9 @@ def main():
                        help="Max tokens to store per sample (subsampling for memory, default: 512)")
     parser.add_argument("--output-dir", type=str, default="./quantized_models/minicpm_awq_sh")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--calib-dataset", type=str, default="c4",
+                       choices=["c4", "wikitext2"],
+                       help="Calibration dataset (default: c4)")
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -541,7 +463,12 @@ def main():
         trust_remote_code=True
     )
 
-    calib_texts = load_c4_calibration(tokenizer, n_samples=args.n_calib, seq_len=2048, seed=args.seed)
+    # Load calibration data
+    print(f"\nLoading calibration dataset: {args.calib_dataset}")
+    if args.calib_dataset == "c4":
+        calib_texts = get_c4_calibration_data(tokenizer, n_samples=args.n_calib, seqlen=2048, seed=args.seed)
+    else:
+        calib_texts = get_wikitext2_calibration_data(tokenizer, n_samples=args.n_calib, seqlen=2048, seed=args.seed)
 
     quantizer = StandardHeuristicAWQQuantizer(
         model=model,
