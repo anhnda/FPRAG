@@ -224,7 +224,7 @@ class AWQHeuristicValidator:
 
         # Results for each dataset
         dataset_results = []
-        for dataset_name in ['WikiText-2']:#, 'C4', 'AG News']:
+        for dataset_name in ['WikiText-2', 'C4', 'AG News']:
             if dataset_name in self.results:
                 heur_ppl = self.results[dataset_name]['Heuristic AWQ']['perplexity']
                 std_ppl = self.results[dataset_name]['Standard AWQ']['perplexity']
