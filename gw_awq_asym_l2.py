@@ -28,6 +28,16 @@ import os
 import argparse
 import random
 import numpy as np
+import gc
+
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
+    print("⚠️  Warning: psutil not installed. Memory monitoring disabled.")
+    print("   Install with: pip install psutil")
+
 from calibration_utils import get_c4_calibration_data, get_wikitext2_calibration_data
 
 
@@ -71,20 +81,26 @@ class GroupWiseAWQAsymmetricL2Quantizer:
                 if name not in self.activation_data:
                     self.activation_data[name] = []
                 if isinstance(input, tuple):
-                    inp = input[0].detach().cpu()
+                    inp = input[0]
                 else:
-                    inp = input.detach().cpu()
+                    inp = input
 
                 # Subsample tokens if sequence is too long (memory optimization)
                 # inp shape: [batch, seq_len, hidden_dim]
                 if inp.dim() == 3 and inp.shape[1] > self.max_tokens_per_sample:
                     # Randomly sample max_tokens_per_sample from seq_len
                     seq_len = inp.shape[1]
-                    indices = torch.randperm(seq_len)[:self.max_tokens_per_sample]
+                    indices = torch.randperm(seq_len, device=inp.device)[:self.max_tokens_per_sample]
                     indices = indices.sort()[0]  # Keep temporal order
                     inp = inp[:, indices, :]
 
-                self.activation_data[name].append(inp)
+                # CRITICAL FIX: Clone, detach, convert to float32, then move to CPU
+                # This ensures proper memory release and reduces size
+                inp_stored = inp.detach().float().cpu().clone()
+                self.activation_data[name].append(inp_stored)
+
+                # CRITICAL: Delete reference to free GPU memory
+                del inp
             return hook
 
         for name, module in self.model.named_modules():
@@ -312,6 +328,10 @@ class GroupWiseAWQAsymmetricL2Quantizer:
     def calibrate(self, calibration_data, n_samples=500):
         """Run calibration on the dataset to collect activations."""
         print(f"\nCalibrating with {min(n_samples, len(calibration_data))} samples...")
+
+        if HAS_PSUTIL:
+            print(f"Initial RAM: {psutil.virtual_memory().percent:.1f}% used")
+
         self.model.eval()
         self.register_hooks()
 
@@ -327,11 +347,22 @@ class GroupWiseAWQAsymmetricL2Quantizer:
                 with torch.no_grad():
                     _ = self.model(**inputs, use_cache=False, return_dict=True)
 
+                # CRITICAL: Delete inputs immediately to free GPU memory
+                del inputs
+
                 successful += 1
 
-                # MEMORY OPTIMIZATION: Clear cache periodically
-                if (i + 1) % 32 == 0:
-                    torch.cuda.empty_cache()
+                # MEMORY OPTIMIZATION: Aggressive cleanup every 16 samples
+                if (i + 1) % 16 == 0:
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    gc.collect()
+
+                    # Show memory usage
+                    if HAS_PSUTIL and (i + 1) % 32 == 0:
+                        ram_pct = psutil.virtual_memory().percent
+                        ram_gb = psutil.virtual_memory().used / (1024**3)
+                        print(f"\n  [{i+1}/{n_samples}] RAM: {ram_pct:.1f}% ({ram_gb:.1f} GB)")
 
             except Exception as e:
                 if i % 100 == 0 and i > 0:
@@ -339,10 +370,17 @@ class GroupWiseAWQAsymmetricL2Quantizer:
                 continue
 
         self.remove_hooks()
-        print(f"Calibration complete! Successfully processed {successful}/{n_samples} samples")
+        print(f"\nCalibration complete! Successfully processed {successful}/{n_samples} samples")
 
-        # MEMORY OPTIMIZATION: Final cleanup
-        torch.cuda.empty_cache()
+        # MEMORY OPTIMIZATION: Final aggressive cleanup
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+
+        if HAS_PSUTIL:
+            final_ram = psutil.virtual_memory().percent
+            final_gb = psutil.virtual_memory().used / (1024**3)
+            print(f"Final RAM: {final_ram:.1f}% ({final_gb:.1f} GB)")
 
     def quantize_model(self):
         """Quantize all linear layers using Group-Wise AWQ with L2 Salience."""
