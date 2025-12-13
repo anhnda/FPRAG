@@ -29,7 +29,7 @@ class StandardHeuristicAWQQuantizer:
     """
 
     def __init__(self, model, tokenizer, device="cuda", bits=4, n_grid=20,
-                 group_size=128, use_heuristic=True, outlier_percent=0.05):
+                 group_size=128, use_heuristic=True, outlier_percent=0.05, max_tokens_per_sample=512):
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
@@ -38,6 +38,7 @@ class StandardHeuristicAWQQuantizer:
         self.group_size = group_size
         self.use_heuristic = use_heuristic
         self.outlier_percent = outlier_percent
+        self.max_tokens_per_sample = max_tokens_per_sample  # Subsample to save memory
 
         # Storage for activations
         self.activation_data = {}
@@ -47,6 +48,7 @@ class StandardHeuristicAWQQuantizer:
         print(f"\n[Standard Heuristic AWQ Quantizer Initialized]")
         print(f"  Target bits: {bits}")
         print(f"  Group size: {group_size}")
+        print(f"  Token subsampling: {max_tokens_per_sample} tokens/sample (memory optimization)")
         print(f"  Use heuristic: {use_heuristic}")
         if use_heuristic:
             print(f"  Outlier protection: Top {outlier_percent*100:.1f}% ignored")
@@ -55,7 +57,7 @@ class StandardHeuristicAWQQuantizer:
             print(f"  Quantization: STANDARD GROUP-WISE ASYMMETRIC [0, {2**bits - 1}]")
 
     def register_hooks(self):
-        """Register forward hooks to capture activations."""
+        """Register forward hooks to capture activations (with subsampling to save memory)."""
         def get_hook(name):
             def hook(module, input, output):
                 if name not in self.activation_data:
@@ -64,6 +66,16 @@ class StandardHeuristicAWQQuantizer:
                     inp = input[0].detach().cpu()
                 else:
                     inp = input.detach().cpu()
+
+                # Subsample tokens if sequence is too long (memory optimization)
+                # inp shape: [batch, seq_len, hidden_dim]
+                if inp.dim() == 3 and inp.shape[1] > self.max_tokens_per_sample:
+                    # Randomly sample max_tokens_per_sample from seq_len
+                    seq_len = inp.shape[1]
+                    indices = torch.randperm(seq_len)[:self.max_tokens_per_sample]
+                    indices = indices.sort()[0]  # Keep temporal order
+                    inp = inp[:, indices, :]
+
                 self.activation_data[name].append(inp)
             return hook
 
@@ -496,7 +508,7 @@ def load_c4_calibration(tokenizer, n_samples=128, seq_len=2048, seed=42):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--n-calib", type=int, default=128)
+    parser.add_argument("--n-calib", type=int, default=128, help="Number of calibration samples")
     parser.add_argument("--n-grid", type=int, default=20)
     parser.add_argument("--group-size", type=int, default=128)
     parser.add_argument("--use-heuristic", action="store_true", default=True,
@@ -505,6 +517,8 @@ def main():
                        help="Disable heuristic rounding")
     parser.add_argument("--outlier-percent", type=float, default=0.05,
                        help="Percent of outliers to ignore (default: 0.05)")
+    parser.add_argument("--max-tokens-per-sample", type=int, default=512,
+                       help="Max tokens to store per sample (subsampling for memory, default: 512)")
     parser.add_argument("--output-dir", type=str, default="./quantized_models/minicpm_awq_sh")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
@@ -537,7 +551,8 @@ def main():
         n_grid=args.n_grid,
         group_size=args.group_size,
         use_heuristic=args.use_heuristic,
-        outlier_percent=args.outlier_percent
+        outlier_percent=args.outlier_percent,
+        max_tokens_per_sample=args.max_tokens_per_sample
     )
 
     quantizer.calibrate(calib_texts, n_samples=args.n_calib)

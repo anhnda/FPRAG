@@ -41,13 +41,14 @@ class GroupWiseAWQAsymmetricL2Quantizer:
     - Better MSE alignment through L2 norm
     """
 
-    def __init__(self, model, tokenizer, device="cuda", bits=4, n_grid=20, group_size=128):
+    def __init__(self, model, tokenizer, device="cuda", bits=4, n_grid=20, group_size=128, max_tokens_per_sample=512):
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
         self.bits = bits
         self.n_grid = n_grid
         self.group_size = group_size
+        self.max_tokens_per_sample = max_tokens_per_sample  # Subsample to save memory
 
         # Storage for activations
         self.activation_data = {}
@@ -58,11 +59,12 @@ class GroupWiseAWQAsymmetricL2Quantizer:
         print(f"  Target bits: {bits}")
         print(f"  Grid search points: {n_grid}")
         print(f"  Group size: {group_size}")
+        print(f"  Token subsampling: {max_tokens_per_sample} tokens/sample (memory optimization)")
         print(f"  Quantization: GROUP-WISE ASYMMETRIC [0, 15]")
         print(f"  Salience metric: E[X²] (L2 norm) - Better MSE alignment")
 
     def register_hooks(self):
-        """Register forward hooks to capture activations."""
+        """Register forward hooks to capture activations (with subsampling to save memory)."""
         def get_hook(name):
             def hook(module, input, output):
                 if name not in self.activation_data:
@@ -71,6 +73,16 @@ class GroupWiseAWQAsymmetricL2Quantizer:
                     inp = input[0].detach().cpu()
                 else:
                     inp = input.detach().cpu()
+
+                # Subsample tokens if sequence is too long (memory optimization)
+                # inp shape: [batch, seq_len, hidden_dim]
+                if inp.dim() == 3 and inp.shape[1] > self.max_tokens_per_sample:
+                    # Randomly sample max_tokens_per_sample from seq_len
+                    seq_len = inp.shape[1]
+                    indices = torch.randperm(seq_len)[:self.max_tokens_per_sample]
+                    indices = indices.sort()[0]  # Keep temporal order
+                    inp = inp[:, indices, :]
+
                 self.activation_data[name].append(inp)
             return hook
 
@@ -493,6 +505,8 @@ def main():
     parser.add_argument("--n-calib", type=int, default=128, help="Calibration samples")
     parser.add_argument("--n-grid", type=int, default=20, help="Grid search points")
     parser.add_argument("--group-size", type=int, default=128, help="Group size for quantization")
+    parser.add_argument("--max-tokens-per-sample", type=int, default=512,
+                       help="Max tokens to store per sample (subsampling for memory, default: 512)")
     parser.add_argument("--output-dir", type=str, default="./quantized_models/minicpm_gw_awq_asym_l2",
                        help="Output directory")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
@@ -556,7 +570,8 @@ def main():
         device=device,
         bits=4,
         n_grid=args.n_grid,
-        group_size=args.group_size
+        group_size=args.group_size,
+        max_tokens_per_sample=args.max_tokens_per_sample
     )
 
     # Calibrate and quantize
