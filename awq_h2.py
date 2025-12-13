@@ -252,16 +252,25 @@ class AWQHeuristicV2Quantizer:
 
         # Final quantization: Use heuristic if enabled
         if self.use_heuristic:
-            # Compute activation mean for heuristic
-            mean_sum = torch.zeros(W.shape[1], device='cpu')
-            for x in self.activation_data[name]:
-                x_flat = x.reshape(-1, x.shape[-1])
-                mean_sum += x_flat.sum(dim=0)
-            total_samples = sum(x.reshape(-1, x.shape[-1]).shape[0] for x in self.activation_data[name])
-            act_mean = (mean_sum / total_samples).to(self.device).to(W.dtype)
-            scaled_act_mean = act_mean / best_scales
+            # Check if layer is too large for heuristic (to avoid OOM)
+            # Skip heuristic for very large layers like lm_head
+            layer_size_gb = (W.shape[0] * W.shape[1] * 4) / (1024**3)  # Rough estimate
+            max_layer_size_gb = 0.5  # Skip heuristic if layer > 0.5GB
 
-            W_quant = self.quantize_weight_heuristic_groupwise(W_scaled, scaled_act_mean)
+            if layer_size_gb > max_layer_size_gb:
+                print(f"\n  ⚠️  Layer {name} too large ({layer_size_gb:.2f}GB), skipping heuristic")
+                W_quant = self.quantize_weight_groupwise_asymmetric(W_scaled)
+            else:
+                # Compute activation mean for heuristic
+                mean_sum = torch.zeros(W.shape[1], device='cpu')
+                for x in self.activation_data[name]:
+                    x_flat = x.reshape(-1, x.shape[-1])
+                    mean_sum += x_flat.sum(dim=0)
+                total_samples = sum(x.reshape(-1, x.shape[-1]).shape[0] for x in self.activation_data[name])
+                act_mean = (mean_sum / total_samples).to(self.device).to(W.dtype)
+                scaled_act_mean = act_mean / best_scales
+
+                W_quant = self.quantize_weight_heuristic_groupwise(W_scaled, scaled_act_mean)
         else:
             # Standard quantization
             W_quant = self.quantize_weight_groupwise_asymmetric(W_scaled)
