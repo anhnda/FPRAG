@@ -429,6 +429,8 @@ def main():
     parser.add_argument("--layer-batch-size", type=int, default=16,
                        help="Number of layers to process per batch (default: 16 for 7B models)")
     parser.add_argument("--output-dir", type=str, default="./quantized_models/mistral7b_awq_sh")
+    parser.add_argument("--model-path", type=str, default="mistralai/Mistral-7B-v0.3",
+                       help="Model name or local path")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--calib-dataset", type=str, default="c4",
                        choices=["c4", "wikitext2", "wikitext2-simple"],
@@ -439,8 +441,8 @@ def main():
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    # UPDATED MODEL ID
-    model_name = "mistralai/Mistral-7B-v0.3"
+    # Use model path from args
+    model_name = args.model_path
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     print(f"Device: {device} | Model: {model_name}")
@@ -453,10 +455,11 @@ def main():
 
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        torch_dtype=torch.float16,
-        device_map=device,
+        dtype=torch.float16,
+        device_map="auto",
         trust_remote_code=True
     )
+    model.eval()
 
     # Load calibration data
     print(f"\nLoading calibration dataset: {args.calib_dataset}")

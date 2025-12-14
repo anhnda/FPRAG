@@ -408,6 +408,8 @@ def main():
                        help="Max tokens to store per sample. Lower this if OOM.")
     parser.add_argument("--output-dir", type=str, default="./quantized_models/mistral7b_gw_awq_asym_l2",
                        help="Output directory")
+    parser.add_argument("--model-path", type=str, default="mistralai/Mistral-7B-v0.3",
+                       help="Model name or local path")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--calib-dataset", type=str, default="c4",
                        choices=["c4", "wikitext2", "wikitext2-simple"],
@@ -425,8 +427,8 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
 
-    # CHANGED MODEL ID
-    model_name = "mistralai/Mistral-7B-v0.3"
+    # Use model path from args
+    model_name = args.model_path
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     print("=" * 80)
