@@ -449,10 +449,11 @@ def main():
 
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        torch_dtype=torch.float16,
-        device_map=device,
+        dtype=torch.float16,
+        device_map="auto",
         trust_remote_code=True
     )
+    model.eval()
 
     # Load calibration data
     print(f"\nLoading calibration dataset: {args.calib_dataset}")
