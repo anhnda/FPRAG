@@ -270,6 +270,8 @@ class StandardHeuristicAWQQuantizer:
 
         # Scatter add back to W_int
         W_int.scatter_add_(1, sorted_indices, sorted_flip_dir)
+        # Safety clamp to ensure valid quantization range [0, max_int]
+        W_int.clamp_(0, max_int)
 
         # --- 6. Dequantize & Return ---
         W_dequant = (W_int - zp_flat) * scale_flat
