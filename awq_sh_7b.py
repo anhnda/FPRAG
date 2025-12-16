@@ -214,6 +214,7 @@ class StandardHeuristicAWQQuantizer:
         sorted_flip_dir[~final_flips_sorted] = 0.0
 
         W_int.scatter_add_(1, sorted_indices, sorted_flip_dir)
+        W_int.clamp_(0, max_int)
 
         # --- 6. Dequantize & Return ---
         W_dequant = (W_int - zp_flat) * scale_flat
@@ -429,7 +430,7 @@ def main():
     parser.add_argument("--layer-batch-size", type=int, default=16,
                        help="Number of layers to process per batch (default: 16 for 7B models)")
     parser.add_argument("--output-dir", type=str, default="./quantized_models/mistral7b_awq_sh")
-    parser.add_argument("--model-path", type=str, default="mistralai/Mistral-7B-v0.3",
+    parser.add_argument("--model-path", type=str, default="./models/Mistral-7B-v0.3",
                        help="Model name or local path")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--calib-dataset", type=str, default="c4",
