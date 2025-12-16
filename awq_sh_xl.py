@@ -45,7 +45,7 @@ except ImportError:
 class StandardHeuristicAWQQuantizerXL:
     def __init__(self, model, tokenizer, device="cuda", bits=4, n_grid=20,
                  group_size=128, use_heuristic=True, outlier_percent=0.05, max_tokens_per_sample=512,
-                 layer_batch_size=16):
+                 layer_batch_size=16, lmhead_chunks=4):
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
@@ -56,6 +56,7 @@ class StandardHeuristicAWQQuantizerXL:
         self.outlier_percent = outlier_percent
         self.max_tokens_per_sample = max_tokens_per_sample
         self.layer_batch_size = layer_batch_size
+        self.lmhead_chunks = lmhead_chunks
 
         # Storage for activations
         self.activation_data = {}
@@ -73,7 +74,7 @@ class StandardHeuristicAWQQuantizerXL:
             print(f"  Quantization: HEURISTIC-GUIDED GROUP-WISE ASYMMETRIC [0, {2**bits - 1}]")
         else:
             print(f"  Quantization: STANDARD GROUP-WISE ASYMMETRIC [0, {2**bits - 1}]")
-        print(f"  Special: lm_head split into halves to avoid OOM")
+        print(f"  Special: lm_head split into {lmhead_chunks} chunks to avoid OOM")
 
     def get_hook(self, name):
         """Create a hook function for a specific layer."""
@@ -390,12 +391,15 @@ class StandardHeuristicAWQQuantizerXL:
         return best_scales, best_alpha, best_error
 
     @torch.no_grad()
-    def quantize_lmhead_half_by_half(self, name, module, debug=False):
+    def quantize_lmhead_half_by_half(self, name, module, debug=False, num_chunks=4):
         """
-        Quantize lm_head by splitting it into two halves along output dimension.
-        This reduces peak memory usage.
+        Quantize lm_head by splitting it into N chunks along output dimension.
+        This reduces peak memory usage significantly.
+
+        Args:
+            num_chunks: Number of chunks to split into (default: 4 for very large lm_heads)
         """
-        print(f"\n  🔧 Special handling for {name} (split into halves)")
+        print(f"\n  🔧 Special handling for {name} (split into {num_chunks} chunks)")
 
         W = module.weight.data
         original_dtype = W.dtype
@@ -403,81 +407,81 @@ class StandardHeuristicAWQQuantizerXL:
 
         print(f"     Shape: {W.shape} ({W.numel() / 1e6:.1f}M parameters)")
 
-        # Get activation stats once for both halves
+        # Get activation stats once for all chunks
         _, raw_mean = self.get_activation_stats(name)
         if raw_mean is None:
             raw_mean = torch.zeros(in_features, device=self.device, dtype=W.dtype)
         else:
             raw_mean = raw_mean.to(self.device).to(W.dtype)
 
-        # Split into two halves
-        mid_point = out_features // 2
+        # Calculate chunk boundaries
+        chunk_size = out_features // num_chunks
+        chunk_boundaries = [(i * chunk_size,
+                            out_features if i == num_chunks - 1 else (i + 1) * chunk_size)
+                           for i in range(num_chunks)]
 
-        # Process first half
-        print(f"     Processing first half: rows 0-{mid_point}")
-        best_scales_1, best_alpha_1, best_error_1 = self.search_best_scale_lmhead_half(
-            name, module, 0, mid_point, debug=debug
-        )
+        W_final_chunks = []
+        chunk_stats = []
 
-        # Scale and quantize first half
-        W_half_1 = W[0:mid_point, :]
-        W_scaled_1 = W_half_1 * best_scales_1.unsqueeze(0)
-        scaled_act_mean_1 = raw_mean / best_scales_1
+        # Process each chunk
+        for chunk_idx, (start_idx, end_idx) in enumerate(chunk_boundaries):
+            print(f"     Processing chunk {chunk_idx + 1}/{num_chunks}: rows {start_idx}-{end_idx}")
 
-        W_quant_1 = self.quantize_weight_heuristic_groupwise(
-            W_scaled_1,
-            scaled_act_mean_1,
-            apply_heuristic=self.use_heuristic
-        )
-        W_final_1 = (W_quant_1 / best_scales_1.unsqueeze(0)).to(original_dtype)
+            # Grid search for this chunk
+            best_scales, best_alpha, best_error = self.search_best_scale_lmhead_half(
+                name, module, start_idx, end_idx, debug=(debug and chunk_idx == 0)
+            )
 
-        del W_half_1, W_scaled_1, W_quant_1, scaled_act_mean_1
-        torch.cuda.empty_cache()
+            # Scale and quantize this chunk
+            W_chunk = W[start_idx:end_idx, :]
+            W_scaled = W_chunk * best_scales.unsqueeze(0)
+            scaled_act_mean = raw_mean / best_scales
 
-        # Process second half
-        print(f"     Processing second half: rows {mid_point}-{out_features}")
-        best_scales_2, best_alpha_2, best_error_2 = self.search_best_scale_lmhead_half(
-            name, module, mid_point, out_features, debug=debug
-        )
+            W_quant = self.quantize_weight_heuristic_groupwise(
+                W_scaled,
+                scaled_act_mean,
+                apply_heuristic=self.use_heuristic
+            )
+            W_final_chunk = (W_quant / best_scales.unsqueeze(0)).to(original_dtype)
 
-        # Scale and quantize second half
-        W_half_2 = W[mid_point:out_features, :]
-        W_scaled_2 = W_half_2 * best_scales_2.unsqueeze(0)
-        scaled_act_mean_2 = raw_mean / best_scales_2
+            W_final_chunks.append(W_final_chunk)
+            chunk_stats.append({
+                'alpha': best_alpha,
+                'error': best_error,
+                'scales': best_scales
+            })
 
-        W_quant_2 = self.quantize_weight_heuristic_groupwise(
-            W_scaled_2,
-            scaled_act_mean_2,
-            apply_heuristic=self.use_heuristic
-        )
-        W_final_2 = (W_quant_2 / best_scales_2.unsqueeze(0)).to(original_dtype)
+            # Cleanup
+            del W_chunk, W_scaled, W_quant, W_final_chunk, scaled_act_mean
+            torch.cuda.empty_cache()
 
-        del W_half_2, W_scaled_2, W_quant_2, scaled_act_mean_2
-        torch.cuda.empty_cache()
-
-        # Combine halves
-        W_final = torch.cat([W_final_1, W_final_2], dim=0)
+        # Combine all chunks
+        W_final = torch.cat(W_final_chunks, dim=0)
         module.weight.data = W_final
 
         # Store average statistics
-        avg_alpha = (best_alpha_1 + best_alpha_2) / 2
-        avg_error = (best_error_1 + best_error_2) / 2
+        avg_alpha = np.mean([s['alpha'] for s in chunk_stats])
+        avg_error = np.mean([s['error'] for s in chunk_stats])
 
-        # Use scales from first half
-        self.layer_scales[name] = {
-            'scales': best_scales_1.cpu(),
+        # Build detailed stats dict
+        stats_dict = {
+            'scales': chunk_stats[0]['scales'].cpu(),  # Use first chunk's scales
             'alpha': avg_alpha,
             'error': avg_error,
-            'alpha_half1': best_alpha_1,
-            'alpha_half2': best_alpha_2,
-            'error_half1': best_error_1,
-            'error_half2': best_error_2
         }
+        for i, stat in enumerate(chunk_stats):
+            stats_dict[f'alpha_chunk{i+1}'] = stat['alpha']
+            stats_dict[f'error_chunk{i+1}'] = stat['error']
 
-        print(f"     ✓ Done: α_half1={best_alpha_1:.4f}, α_half2={best_alpha_2:.4f}, "
-              f"error_half1={best_error_1:.8f}, error_half2={best_error_2:.8f}")
+        self.layer_scales[name] = stats_dict
 
-        del W_final_1, W_final_2, W_final, raw_mean
+        # Print summary
+        alpha_str = ', '.join([f'α_{i+1}={s["alpha"]:.4f}' for i, s in enumerate(chunk_stats)])
+        error_str = ', '.join([f'err_{i+1}={s["error"]:.8f}' for i, s in enumerate(chunk_stats)])
+        print(f"     ✓ Done: {alpha_str}")
+        print(f"             {error_str}")
+
+        del W_final_chunks, chunk_stats, W_final, raw_mean
         torch.cuda.empty_cache()
 
     @torch.no_grad()
@@ -594,9 +598,9 @@ class StandardHeuristicAWQQuantizerXL:
                     is_lmhead = 'lm_head' in name.lower() or name.endswith('lm_head')
 
                     if is_lmhead:
-                        # Use half-by-half processing for lm_head
+                        # Use chunked processing for lm_head
                         debug = (quantized_count < 2)
-                        self.quantize_lmhead_half_by_half(name, module, debug=debug)
+                        self.quantize_lmhead_half_by_half(name, module, debug=debug, num_chunks=self.lmhead_chunks)
                     else:
                         # Standard processing
                         self.quantize_layer(name, module)
@@ -643,6 +647,8 @@ def main():
                        help="Max tokens to store per sample (default: 2048)")
     parser.add_argument("--layer-batch-size", type=int, default=16,
                        help="Number of layers to process per batch (default: 16)")
+    parser.add_argument("--lmhead-chunks", type=int, default=4,
+                       help="Number of chunks to split lm_head into (default: 4, higher = less memory)")
     parser.add_argument("--output-dir", type=str, default="./quantized_models/model_awq_sh_xl")
     parser.add_argument("--model-path", type=str, default="./models/Mistral-7B-v0.3",
                        help="Model name or local path")
@@ -705,7 +711,8 @@ def main():
         use_heuristic=args.use_heuristic,
         outlier_percent=args.outlier_percent,
         max_tokens_per_sample=args.max_tokens_per_sample,
-        layer_batch_size=args.layer_batch_size
+        layer_batch_size=args.layer_batch_size,
+        lmhead_chunks=args.lmhead_chunks
     )
 
     # Use batched sequential quantization (optimal memory/speed balance)
