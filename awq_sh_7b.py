@@ -85,8 +85,9 @@ class StandardHeuristicAWQQuantizer:
                 indices = indices.sort()[0]  # Keep temporal order
                 inp = inp[:, indices, :]
 
-            # Store on CPU to save GPU memory, keep as float16
-            self.activation_data[name].append(inp.detach().cpu())
+            # Store on CPU to save GPU memory, use float32 for numerical stability in L2 computation
+            # We need float32 because squaring float16 values can overflow to inf
+            self.activation_data[name].append(inp.detach().cpu().float())
         return hook
 
     @torch.no_grad()
@@ -456,7 +457,7 @@ def main():
 
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        dtype=torch.float16,
+        torch_dtype=torch.bfloat16,  # Use bfloat16 instead of float16 for better numerical stability
         device_map="auto",
         trust_remote_code=True
     )
