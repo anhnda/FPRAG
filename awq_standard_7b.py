@@ -404,11 +404,11 @@ def main():
     parser.add_argument("--n-calib", type=int, default=128, help="Calibration samples")
     parser.add_argument("--n-grid", type=int, default=20, help="Grid search points")
     parser.add_argument("--group-size", type=int, default=128, help="Group size for quantization")
-    parser.add_argument("--max-tokens-per-sample", type=int, default=512,
+    parser.add_argument("--max-tokens-per-sample", type=int, default=2048,
                        help="Max tokens to store per sample. Lower this if OOM.")
     parser.add_argument("--output-dir", type=str, default="./quantized_models/mistral7b_gw_awq_asym_l2",
                        help="Output directory")
-    parser.add_argument("--model-path", type=str, default="mistralai/Mistral-7B-v0.3",
+    parser.add_argument("--model-path", type=str, default="./models/Mistral-7B-v0.3",
                        help="Model name or local path")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--calib-dataset", type=str, default="c4",
