@@ -89,6 +89,8 @@ class GroupWiseAWQAsymmetricL2Quantizer:
         for x in X_list:
             x_flat = x.reshape(-1, x.shape[-1])
             # KEY CHANGE: Use pow(2) instead of abs() for L2 Norm
+            # Ensure we're working with float32 for numerical stability
+            x_flat = x_flat.float()
             salience_sum += x_flat.pow(2).sum(dim=0)
 
         salience = salience_sum / total_samples
@@ -291,8 +293,9 @@ class GroupWiseAWQAsymmetricL2Quantizer:
                 indices = indices.sort()[0]
                 inp = inp[:, indices, :]
 
-            # Store activation on CPU (Float16) to save GPU RAM
-            inp_stored = inp.detach().cpu().to(torch.float16).clone()
+            # Store activation on CPU (use float32 for numerical stability in L2 computation)
+            # We need float32 because squaring float16 values can overflow to inf
+            inp_stored = inp.detach().cpu().float().clone()
             self.activation_data[name].append(inp_stored)
             del inp
         return hook
@@ -451,7 +454,7 @@ def main():
 
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        dtype=torch.float16,
+        torch_dtype=torch.bfloat16,  # Use bfloat16 instead of float16 for better numerical stability
         device_map="auto",
         trust_remote_code=True
     )
