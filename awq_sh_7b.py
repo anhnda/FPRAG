@@ -424,8 +424,8 @@ def main():
                        help="Disable heuristic rounding")
     parser.add_argument("--outlier-percent", type=float, default=0.05,
                        help="Percent of outliers to ignore (default: 0.05)")
-    parser.add_argument("--max-tokens-per-sample", type=int, default=512,
-                       help="Max tokens to store per sample (subsampling for memory, default: 512)")
+    parser.add_argument("--max-tokens-per-sample", type=int, default=2048,
+                       help="Max tokens to store per sample (subsampling for memory, default: 2048)")
     # DEFAULT CHANGED: 50 -> 16 for Mistral-7B memory safety
     parser.add_argument("--layer-batch-size", type=int, default=16,
                        help="Number of layers to process per batch (default: 16 for 7B models)")
