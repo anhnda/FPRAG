@@ -178,6 +178,9 @@ class GroupWiseAWQAsymmetricL2Quantizer:
         W = module.weight.data
         b = module.bias.data if module.bias is not None else None
 
+        # Convert X_search to match weight dtype (bfloat16) for matmul compatibility
+        X_search = X_search.to(W.dtype)
+
         # Compute original output
         if b is not None:
             Y_orig = torch.matmul(X_search, W.t()) + b
