@@ -118,92 +118,93 @@ class AWQSlidingWindowValidator:
     @torch.no_grad()
     def evaluate_sliding_window(self, model, tokenizer, texts):
         """
-        Evaluate using sliding window approach (loglikelihood_rolling).
-
-        This method:
-        1. Tokenizes long documents
-        2. Uses sliding windows with specified stride
-        3. Computes log-likelihood for each window
-        4. Aggregates across all windows
-
-        This is more realistic than standard perplexity because:
-        - Tests prediction with longer context
-        - Overlapping windows provide better coverage
-        - Matches how models are used in practice
+        CORRECTED: Evaluate using Sliding Window (Rolling Likelihood).
+        
+        Logic:
+        1. Context Window = max_length (e.g., 2048)
+        2. Stride = 512
+        3. We feed [Context + Target] into the model.
+        4. We MASK the labels for the [Context] part (set to -100).
+        5. We only calculate loss on the [Target] (Stride) part.
         """
         model.eval()
-        total_loss = 0
+        nlls = [] # List of negative log-likelihoods
         total_tokens = 0
-        total_windows = 0
         successful_docs = 0
+
+        # Llama 3 requires explicit BOS token handling
+        # Ensure tokenizer adds BOS if not present
+        if tokenizer.bos_token_id is None:
+            print("Warning: Tokenizer has no BOS token defined. Llama 3 PPL might be inaccurate.")
 
         for text in tqdm(texts, desc="  Evaluating (sliding window)", leave=False):
             try:
-                # Tokenize the full document
-                inputs = tokenizer(
-                    text,
-                    return_tensors="pt",
-                    truncation=False,  # Don't truncate initially
-                    padding=False
+                encodings = tokenizer(
+                    text, 
+                    return_tensors="pt", 
+                    add_special_tokens=True # Crucial for Llama 3
                 )
+                input_ids = encodings.input_ids[:, :self.max_length * 10] # Safety clip for massive docs
+                
+                seq_len = input_ids.size(1)
+                
+                # Perform sliding window evaluation
+                prev_end_loc = 0
+                for begin_loc in range(0, seq_len, self.stride):
+                    
+                    # Define the window
+                    end_loc = min(begin_loc + self.max_length, seq_len)
+                    
+                    # The "Target" is the length we actually want to predict in this step
+                    # Usually equal to stride, unless we are at the very end
+                    trg_len = end_loc - prev_end_loc  
+                    
+                    # Prepare inputs
+                    input_ids_chunk = input_ids[:, begin_loc:end_loc].to(self.device)
+                    
+                    # Prepare targets (clone inputs)
+                    target_ids_chunk = input_ids_chunk.clone()
+                    
+                    # MASKING: Set context tokens (those before the target area) to -100
+                    # so they don't contribute to the loss
+                    target_ids_chunk[:, :-trg_len] = -100
 
-                input_ids = inputs["input_ids"][0]  # Get the token sequence
+                    # Forward pass
+                    with torch.no_grad():
+                        outputs = model(input_ids_chunk, labels=target_ids_chunk)
+                        
+                        # Calculate likelihood
+                        # loss is the average NLL of the unmasked tokens
+                        # we convert back to sum by multiplying by trg_len
+                        neg_log_likelihood = outputs.loss * trg_len
 
-                # Skip very short documents
-                if len(input_ids) < self.stride:
-                    continue
-
-                # Process document with sliding window
-                doc_loss = 0
-                doc_tokens = 0
-                doc_windows = 0
-
-                # Sliding window iteration
-                for i in range(0, len(input_ids), self.stride):
-                    # Extract window
-                    window_end = min(i + self.max_length, len(input_ids))
-                    window = input_ids[i:window_end].unsqueeze(0).to(self.device)
-
-                    # Skip windows that are too short
-                    if window.shape[1] < 2:
-                        continue
-
-                    # Compute loss for this window
-                    outputs = model(window, labels=window, use_cache=False)
-                    loss = outputs.loss.item()
-                    n_tokens = window.shape[1]
-
-                    doc_loss += loss * n_tokens
-                    doc_tokens += n_tokens
-                    doc_windows += 1
-
-                    # If we've reached the end, break
-                    if window_end >= len(input_ids):
+                    nlls.append(neg_log_likelihood)
+                    
+                    prev_end_loc = end_loc
+                    if end_loc == seq_len:
                         break
 
-                # Accumulate document statistics
-                if doc_tokens > 0:
-                    total_loss += doc_loss
-                    total_tokens += doc_tokens
-                    total_windows += doc_windows
-                    successful_docs += 1
+                successful_docs += 1
+                total_tokens += seq_len
 
             except Exception as e:
-                # Skip problematic documents
+                print(f"Error processing doc: {e}")
                 continue
 
-        # Compute final metrics
-        avg_loss = total_loss / total_tokens if total_tokens > 0 else float('inf')
-        perplexity = np.exp(avg_loss) if total_tokens > 0 else float('inf')
+        if not nlls:
+            return None
 
+        # Final PPL Calculation
+        # PPL = exp(Sum(NLL) / Total_Tokens)
+        total_nll = torch.stack(nlls).sum()
+        perplexity = torch.exp(total_nll / total_tokens).item()
+        
         return {
             "perplexity": perplexity,
-            "avg_loss": avg_loss,
+            "avg_loss": (total_nll / total_tokens).item(),
             "num_documents": successful_docs,
-            "total_windows": total_windows,
-            "total_tokens": total_tokens,
-            "avg_tokens_per_doc": total_tokens / successful_docs if successful_docs > 0 else 0,
-            "avg_windows_per_doc": total_windows / successful_docs if successful_docs > 0 else 0
+            "total_windows": len(nlls),
+            "total_tokens": total_tokens
         }
 
     def evaluate_model_on_dataset(self, model_path, model_name, texts, dataset_name):
