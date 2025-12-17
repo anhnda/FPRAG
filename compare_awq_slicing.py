@@ -194,20 +194,19 @@ class AWQSlidingWindowValidator:
             return None
 
         try:
-            # FIX 1: Add flag to fix Llama 3 / Mistral tokenizer regex
-            # and ensure fast tokenizer is used for correct mapping
+            # FIX: Explicitly handle the Llama-3/Mistral regex issue
+            # The warning requires passing this flag to fix tokenization
+            tokenizer_kwargs = {}
+            if "Llama-3" in model_path or "Mistral" in model_path:
+                tokenizer_kwargs["fix_mistral_regex"] = True
+
             tokenizer = AutoTokenizer.from_pretrained(
                 model_path, 
                 trust_remote_code=True,
-                use_fast=True # Llama 3 usually requires the fast tokenizer
+                use_fast=True,
+                **tokenizer_kwargs  # <--- PASSING THE FIX HERE
             )
             
-            # Hack for the regex warning if the flag is supported by your transformers version
-            # If this throws an error, upgrade transformers: pip install -U transformers
-            if "Mistral" in model_path or "Llama-3" in model_path:
-                 pass # Newer transformers handle this, but if you get the error again, 
-                      # try adding tokenizer_kwargs={"fix_mistral_regex": True} to from_pretrained
-
             if tokenizer.pad_token is None:
                 tokenizer.pad_token = tokenizer.eos_token
             
@@ -226,6 +225,8 @@ class AWQSlidingWindowValidator:
             results = self.evaluate_sliding_window(model, tokenizer, texts)
 
             print(f"  ✅ Perplexity: {results['perplexity']:.4f}")
+            print(f"     Documents: {results['num_documents']}, Windows: {results['total_windows']}")
+
             del model
             torch.cuda.empty_cache()
 
@@ -233,10 +234,13 @@ class AWQSlidingWindowValidator:
 
         except Exception as e:
             print(f"  ❌ Error: {e}")
+            # If the flag causes a crash (rare on older transformers), fallback:
+            if "unexpected keyword argument" in str(e):
+                print("  ⚠️ 'fix_mistral_regex' not supported. Trying without...")
+                # ... (You could add fallback logic here, but usually upgrading transformers is better)
             import traceback
             traceback.print_exc()
             return None
-
     def run_comprehensive_validation(self, heuristic_path, standard_path, n_samples=500):
         """Run validation on all datasets using sliding window."""
         print("\n" + "="*80)
