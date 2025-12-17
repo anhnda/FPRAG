@@ -80,7 +80,7 @@ class AWQSlidingWindowValidator:
         # Debug flag to print tokens once
         debug_printed = False
 
-        for text in tqdm(texts, desc="  Evaluating", leave=False):
+        for doc_idx, text in enumerate(texts):
             # 1. Tokenize WITHOUT adding special tokens automatically
             #    This prevents the [BOS][BOS] issue (PPL 15.5)
             encodings = tokenizer(text, return_tensors="pt", add_special_tokens=False)
@@ -111,8 +111,16 @@ class AWQSlidingWindowValidator:
 
             prev_end_loc = 0
 
-            # Sliding Window Loop
-            for begin_loc in range(0, seq_len, self.stride):
+            # Calculate total number of windows for this document
+            num_windows = (seq_len - self.max_length) // self.stride + 1
+            if num_windows < 1:
+                num_windows = 1
+
+            print(f"\n  📊 Document {doc_idx+1}/{len(texts)}: {seq_len:,} tokens → {num_windows} windows")
+
+            # Sliding Window Loop with progress bar
+            window_range = list(range(0, seq_len, self.stride))
+            for window_idx, begin_loc in enumerate(window_range):
                 end_loc = min(begin_loc + self.max_length, seq_len)
 
                 # The tokens we actually want to score in this pass
@@ -141,6 +149,14 @@ class AWQSlidingWindowValidator:
                 nlls.append(neg_log_likelihood)
 
                 prev_end_loc = end_loc
+
+                # Periodic progress update every 50 windows
+                if (window_idx + 1) % 50 == 0 or window_idx == len(window_range) - 1:
+                    current_total_tokens = total_tokens + prev_end_loc
+                    current_nll = torch.stack(nlls).sum()
+                    current_ppl = torch.exp(current_nll / current_total_tokens).item()
+                    print(f"    Window {window_idx+1}/{len(window_range)}: PPL={current_ppl:.4f} (tokens={current_total_tokens:,})")
+
                 if end_loc == seq_len:
                     break
 
