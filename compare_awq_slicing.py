@@ -567,7 +567,7 @@ def main():
     parser.add_argument(
         "--max-length",
         type=int,
-        default=1024,
+        default=2048,
         help="Maximum sequence length per window (tokens)"
     )
     parser.add_argument(
