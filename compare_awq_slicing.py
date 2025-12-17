@@ -15,6 +15,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
 from tqdm import tqdm
 import random
+import numpy as np
 
 class AWQSlidingWindowValidator:
     def __init__(self, device="cuda", seed=42, stride=512, max_length=2048): # Increased to 2048 for Llama 3
@@ -77,10 +78,8 @@ class AWQSlidingWindowValidator:
         nlls = []
         total_tokens = 0
 
-        # Debug flag to print tokens once
-        debug_printed = False
-
-        for doc_idx, text in enumerate(texts):
+        # Progress bar for documents
+        for doc_idx, text in enumerate(tqdm(texts, desc="  Evaluating", leave=False)):
             # 1. Tokenize WITHOUT adding special tokens automatically
             #    This prevents the [BOS][BOS] issue (PPL 15.5)
             encodings = tokenizer(text, return_tensors="pt", add_special_tokens=False)
@@ -104,21 +103,9 @@ class AWQSlidingWindowValidator:
             # Skip if too short
             if seq_len < 2: continue
 
-            # DEBUG: Print first tokens of first doc to verify BOS
-            if not debug_printed:
-                print(f"\n  🔍 DEBUG: First 5 tokens sent to model: {input_ids[0, :5].tolist()}")
-                debug_printed = True
-
             prev_end_loc = 0
 
-            # Calculate total number of windows for this document
-            num_windows = (seq_len - self.max_length) // self.stride + 1
-            if num_windows < 1:
-                num_windows = 1
-
-            print(f"\n  📊 Document {doc_idx+1}/{len(texts)}: {seq_len:,} tokens → {num_windows} windows")
-
-            # Sliding Window Loop with progress bar
+            # Sliding Window Loop
             window_range = list(range(0, seq_len, self.stride))
             for window_idx, begin_loc in enumerate(window_range):
                 end_loc = min(begin_loc + self.max_length, seq_len)
@@ -149,13 +136,6 @@ class AWQSlidingWindowValidator:
                 nlls.append(neg_log_likelihood)
 
                 prev_end_loc = end_loc
-
-                # Periodic progress update every 50 windows
-                if (window_idx + 1) % 50 == 0 or window_idx == len(window_range) - 1:
-                    current_total_tokens = total_tokens + prev_end_loc
-                    current_nll = torch.stack(nlls).sum()
-                    current_ppl = torch.exp(current_nll / current_total_tokens).item()
-                    print(f"    Window {window_idx+1}/{len(window_range)}: PPL={current_ppl:.4f} (tokens={current_total_tokens:,})")
 
                 if end_loc == seq_len:
                     break
@@ -217,11 +197,19 @@ class AWQSlidingWindowValidator:
             return None
 
     def run_validation(self, heuristic_path, standard_path=None, n_samples=2000):
+        print("\n" + "="*80)
+        print("LOADING DATASETS")
+        print("="*80)
+
         datasets = {
             'WikiText-2': self.load_wikitext2_test(n_samples),
             'C4': self.load_c4_validation(n_samples),
             # 'AG News': self.load_ag_news_test(n_samples)
         }
+
+        print("\n" + "="*80)
+        print("EVALUATING MODELS")
+        print("="*80)
 
         models = {
             'Heuristic AWQ': heuristic_path,
@@ -231,19 +219,189 @@ class AWQSlidingWindowValidator:
         if standard_path:
             models['Standard AWQ'] = standard_path
 
+        # Evaluate each model on each dataset
         for dataset_name, texts in datasets.items():
+            print(f"\n{'='*80}")
+            print(f"Dataset: {dataset_name}")
+            print(f"{'='*80}")
+
             for model_name, model_path in models.items():
-                self.evaluate_model_on_dataset(model_path, model_name, texts, dataset_name)
+                result = self.evaluate_model_on_dataset(
+                    model_path, model_name, texts, dataset_name
+                )
+
+                if result:
+                    if dataset_name not in self.results:
+                        self.results[dataset_name] = {}
+                    self.results[dataset_name][model_name] = result
+
+        return self.results
+
+    def generate_comparison_table(self):
+        """Generate formatted comparison table."""
+        print("\n" + "="*80)
+        print("COMPREHENSIVE RESULTS")
+        print("="*80)
+
+        # Check if we have both models for comparison
+        has_both_models = any(
+            len(self.results.get(ds, {})) == 2
+            for ds in self.results.keys()
+        )
+
+        if not has_both_models:
+            # Single model mode - just show results
+            print(f"\n{'Dataset':<15} {'Perplexity':<15} {'Total Tokens':<15}")
+            print("-" * 50)
+
+            dataset_results = []
+            for dataset_name, models_data in self.results.items():
+                for model_name, data in models_data.items():
+                    ppl = data['perplexity']
+                    tokens = data['total_tokens']
+                    print(f"{dataset_name:<15} {ppl:<15.4f} {tokens:<15,}")
+                    dataset_results.append({
+                        'dataset': dataset_name,
+                        'model': model_name,
+                        'perplexity': ppl,
+                        'total_tokens': tokens
+                    })
+            return dataset_results
+
+        # Comparison mode - show deltas
+        print(f"\n{'Dataset':<15} {'Heuristic AWQ':<15} {'Standard AWQ':<15} {'Delta':<12} {'Winner':<10}")
+        print("-" * 80)
+
+        dataset_results = []
+        for dataset_name in self.results.keys():
+            if 'Heuristic AWQ' in self.results[dataset_name] and 'Standard AWQ' in self.results[dataset_name]:
+                heur_ppl = self.results[dataset_name]['Heuristic AWQ']['perplexity']
+                std_ppl = self.results[dataset_name]['Standard AWQ']['perplexity']
+                delta = heur_ppl - std_ppl
+                delta_pct = (delta / std_ppl) * 100
+
+                # Winner: lower perplexity is better
+                winner = "Heuristic" if delta < -0.05 else ("Standard" if delta > 0.05 else "Tie")
+
+                print(f"{dataset_name:<15} {heur_ppl:<15.4f} {std_ppl:<15.4f} {delta_pct:>+11.3f}%  {winner:<10}")
+
+                dataset_results.append({
+                    'dataset': dataset_name,
+                    'heuristic_ppl': heur_ppl,
+                    'standard_ppl': std_ppl,
+                    'delta_pct': delta_pct,
+                    'winner': winner
+                })
+
+        return dataset_results
+
+    def analyze_results(self, dataset_results):
+        """Comprehensive analysis of results."""
+        # Check if comparison mode or single model mode
+        if not dataset_results or 'heuristic_ppl' not in dataset_results[0]:
+            print("\n" + "="*80)
+            print("SINGLE MODEL EVALUATION COMPLETE")
+            print("="*80)
+            return {'mode': 'single_model'}
+
+        print("\n" + "="*80)
+        print("ANALYSIS")
+        print("="*80)
+
+        # Count wins
+        heur_wins = sum(1 for r in dataset_results if r['winner'] == 'Heuristic')
+        std_wins = sum(1 for r in dataset_results if r['winner'] == 'Standard')
+        ties = sum(1 for r in dataset_results if r['winner'] == 'Tie')
+
+        print(f"\nWin Count:")
+        print(f"  Heuristic AWQ: {heur_wins}/{len(dataset_results)}")
+        print(f"  Standard AWQ:  {std_wins}/{len(dataset_results)}")
+        print(f"  Ties:          {ties}/{len(dataset_results)}")
+
+        # Average performance
+        avg_heur = np.mean([r['heuristic_ppl'] for r in dataset_results])
+        avg_std = np.mean([r['standard_ppl'] for r in dataset_results])
+        avg_delta_pct = ((avg_heur - avg_std) / avg_std) * 100
+
+        print(f"\nAverage Perplexity:")
+        print(f"  Heuristic AWQ: {avg_heur:.4f}")
+        print(f"  Standard AWQ:  {avg_std:.4f}")
+        print(f"  Difference:    {avg_delta_pct:+.3f}%")
+
+        # Determine winner
+        print("\n" + "="*80)
+        print("FINAL VERDICT")
+        print("="*80)
+
+        if heur_wins > std_wins:
+            print(f"\n🏆 HEURISTIC AWQ is the OVERALL WINNER!")
+            print(f"   Wins: {heur_wins}/{len(dataset_results)} datasets")
+            print(f"   Average improvement: {abs(avg_delta_pct):.3f}%")
+            winner = "Heuristic AWQ"
+        elif std_wins > heur_wins:
+            print(f"\n🏆 STANDARD AWQ is the OVERALL WINNER!")
+            print(f"   Wins: {std_wins}/{len(dataset_results)} datasets")
+            print(f"   Average improvement: {abs(avg_delta_pct):.3f}%")
+            winner = "Standard AWQ"
+        else:
+            print(f"\n🤝 TIE - Both methods equally strong")
+            winner = "Tie"
+
+        return {
+            'winner': winner,
+            'heuristic_wins': heur_wins,
+            'standard_wins': std_wins,
+            'ties': ties,
+            'avg_heuristic': avg_heur,
+            'avg_standard': avg_std,
+            'avg_delta_pct': avg_delta_pct
+        }
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--heuristic-path", type=str, required=True)
-    parser.add_argument("--standard-path", type=str, default="")
+    parser = argparse.ArgumentParser(
+        description="AWQ Sliding Window Cross-Dataset Validation",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    parser.add_argument("--heuristic-path", type=str, required=True,
+                       help="Path to Heuristic AWQ model")
+    parser.add_argument("--standard-path", type=str, default="",
+                       help="Path to Standard AWQ model (optional for comparison)")
+    parser.add_argument("--n-samples", type=int, default=2000,
+                       help="Number of samples per dataset")
     args = parser.parse_args()
 
     validator = AWQSlidingWindowValidator()
-    validator.run_validation(args.heuristic_path, args.standard_path)
+
+    # Run validation
+    validator.run_validation(
+        args.heuristic_path,
+        args.standard_path if args.standard_path else None,
+        args.n_samples
+    )
+
+    # Generate comparison table
+    dataset_results = validator.generate_comparison_table()
+
+    # Analyze results
+    analysis = validator.analyze_results(dataset_results)
+
+    # Final summary
+    print("\n" + "="*80)
+    print("VALIDATION COMPLETE")
+    print("="*80)
+
+    if analysis.get('mode') != 'single_model':
+        print(f"\n🏆 Winner: {analysis['winner']}")
+        print(f"📊 Tested: {len(dataset_results)} datasets")
+        print(f"✅ Heuristic wins: {analysis['heuristic_wins']}")
+        print(f"✅ Standard wins: {analysis['standard_wins']}")
+        print(f"🤝 Ties: {analysis['ties']}")
+    else:
+        print(f"\n📊 Tested: {len(dataset_results)} datasets")
+        print(f"✅ Single model evaluation complete")
+
+    print("\n" + "="*80)
 
 if __name__ == "__main__":
     main()
