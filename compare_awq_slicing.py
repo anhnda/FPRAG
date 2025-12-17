@@ -38,6 +38,7 @@ class AWQSlidingWindowValidator:
         Load WikiText-2 test set.
         CRITICAL FIX: Concatenates all lines into one continuous stream.
         WikiText is a stream dataset; evaluating separate lines destroys context.
+        Note: n_samples parameter is ignored - full test set is always used.
         """
         print("\n[1/3] Loading WikiText-2 test...")
         dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
@@ -52,22 +53,44 @@ class AWQSlidingWindowValidator:
         return [full_text]
 
     def load_c4_validation(self, n_samples=500):
+        """
+        Load C4 validation set as continuous stream.
+        Concatenates multiple documents into one stream for sliding window evaluation.
+        """
         print("\n[2/3] Loading C4 validation...")
         dataset = load_dataset("allenai/c4", "en", split="validation", streaming=True)
         texts = []
         for item in tqdm(dataset, total=n_samples, desc="  Collecting C4"):
             if len(texts) >= n_samples: break
-            if len(item['text'].strip()) > 500: texts.append(item['text'])
-        return texts
+            if len(item['text'].strip()) > 500:
+                texts.append(item['text'])
+
+        # Join into continuous stream
+        full_text = "\n\n".join(texts)
+        print(f"  ✅ Loaded continuous stream ({len(full_text)} chars, {len(texts)} documents)")
+
+        # Return as single-item list
+        return [full_text]
 
     def load_ag_news_test(self, n_samples=500):
+        """
+        Load AG News test set as continuous stream.
+        Concatenates multiple articles into one stream for sliding window evaluation.
+        """
         print("\n[3/3] Loading AG News test...")
         dataset = load_dataset("ag_news", split="test")
         texts = [item['text'] for item in dataset if len(item['text'].strip()) > 200]
+
         if n_samples < len(texts):
             random.seed(self.seed)
             texts = random.sample(texts, n_samples)
-        return texts
+
+        # Join into continuous stream
+        full_text = "\n\n".join(texts)
+        print(f"  ✅ Loaded continuous stream ({len(full_text)} chars, {len(texts)} articles)")
+
+        # Return as single-item list
+        return [full_text]
 
     @torch.no_grad()
     def evaluate_sliding_window(self, model, tokenizer, texts):
@@ -79,7 +102,7 @@ class AWQSlidingWindowValidator:
         total_tokens = 0
 
         # Progress bar for documents
-        for doc_idx, text in enumerate(tqdm(texts, desc="  Evaluating", leave=False)):
+        for text in tqdm(texts, desc="  Evaluating", leave=False):
             # 1. Tokenize WITHOUT adding special tokens automatically
             #    This prevents the [BOS][BOS] issue (PPL 15.5)
             encodings = tokenizer(text, return_tensors="pt", add_special_tokens=False)
