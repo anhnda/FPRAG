@@ -219,7 +219,7 @@ class AWQSlidingWindowValidator:
     def run_validation(self, heuristic_path, standard_path=None, n_samples=500):
         datasets = {
             'WikiText-2': self.load_wikitext2_test(n_samples),
-            # 'C4': self.load_c4_validation(n_samples),
+            'C4': self.load_c4_validation(n_samples),
             # 'AG News': self.load_ag_news_test(n_samples)
         }
 
