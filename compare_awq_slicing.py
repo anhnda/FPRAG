@@ -216,7 +216,7 @@ class AWQSlidingWindowValidator:
             traceback.print_exc()
             return None
 
-    def run_validation(self, heuristic_path, standard_path=None, n_samples=500):
+    def run_validation(self, heuristic_path, standard_path=None, n_samples=2000):
         datasets = {
             'WikiText-2': self.load_wikitext2_test(n_samples),
             'C4': self.load_c4_validation(n_samples),
