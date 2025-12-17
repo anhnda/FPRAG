@@ -13,12 +13,8 @@ Stride: 512 tokens
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
-import numpy as np
 from tqdm import tqdm
 import random
-import os
-import json
-from datetime import datetime
 
 class AWQSlidingWindowValidator:
     def __init__(self, device="cuda", seed=42, stride=512, max_length=2048): # Increased to 2048 for Llama 3
@@ -37,18 +33,22 @@ class AWQSlidingWindowValidator:
         print("="*80)
 
     def load_wikitext2_test(self, n_samples=None):
-        """Load WikiText-2 test set."""
+        """
+        Load WikiText-2 test set.
+        CRITICAL FIX: Concatenates all lines into one continuous stream.
+        WikiText is a stream dataset; evaluating separate lines destroys context.
+        """
         print("\n[1/3] Loading WikiText-2 test...")
         dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
-        texts = [text for text in dataset['text'] if len(text) > 0] # Filter empty lines
 
-        # Wikitext is often evaluated as one long stream, but for sample-based:
-        if n_samples and n_samples < len(texts):
-            random.seed(self.seed)
-            texts = random.sample(texts, n_samples)
+        # 1. Join everything into one massive string with newlines
+        # This matches standard PPL evaluation (like lm-eval-harness)
+        full_text = "\n".join([x for x in dataset['text'] if x])
 
-        print(f"  ✅ Loaded {len(texts)} samples")
-        return texts
+        print(f"  ✅ Loaded continuous stream ({len(full_text)} chars)")
+
+        # Return as a single-item list so the loop treats it as one giant doc
+        return [full_text]
 
     def load_c4_validation(self, n_samples=500):
         print("\n[2/3] Loading C4 validation...")
@@ -94,8 +94,9 @@ class AWQSlidingWindowValidator:
                     input_ids = torch.cat([bos_tensor, input_ids], dim=1)
 
             # Limit length for massive docs to prevent OOM
-            if input_ids.size(1) > self.max_length * 20:
-                input_ids = input_ids[:, :self.max_length * 20]
+            # Increased to * 200 to allow full WikiText-2 test set (~280k tokens)
+            if input_ids.size(1) > self.max_length * 200:
+                input_ids = input_ids[:, :self.max_length * 200]
 
             input_ids = input_ids.to(self.device)
             seq_len = input_ids.size(1)
@@ -199,7 +200,7 @@ class AWQSlidingWindowValidator:
             traceback.print_exc()
             return None
 
-    def run_validation(self, heuristic_path, standard_path, n_samples=500):
+    def run_validation(self, heuristic_path, standard_path=None, n_samples=500):
         datasets = {
             'WikiText-2': self.load_wikitext2_test(n_samples),
             # 'C4': self.load_c4_validation(n_samples),
@@ -208,8 +209,11 @@ class AWQSlidingWindowValidator:
 
         models = {
             'Heuristic AWQ': heuristic_path,
-            # 'Standard AWQ': standard_path
         }
+
+        # Add standard model if provided
+        if standard_path:
+            models['Standard AWQ'] = standard_path
 
         for dataset_name, texts in datasets.items():
             for model_name, model_path in models.items():
