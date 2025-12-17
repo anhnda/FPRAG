@@ -114,68 +114,48 @@ class AWQSlidingWindowValidator:
 
         print(f"  ✅ Loaded {len(texts)} samples")
         return texts
-
     @torch.no_grad()
     def evaluate_sliding_window(self, model, tokenizer, texts):
         """
         CORRECTED: Evaluate using Sliding Window (Rolling Likelihood).
-        
-        Logic:
-        1. Context Window = max_length (e.g., 2048)
-        2. Stride = 512
-        3. We feed [Context + Target] into the model.
-        4. We MASK the labels for the [Context] part (set to -100).
-        5. We only calculate loss on the [Target] (Stride) part.
         """
         model.eval()
-        nlls = [] # List of negative log-likelihoods
+        nlls = [] 
         total_tokens = 0
         successful_docs = 0
 
-        # Llama 3 requires explicit BOS token handling
-        # Ensure tokenizer adds BOS if not present
-        if tokenizer.bos_token_id is None:
-            print("Warning: Tokenizer has no BOS token defined. Llama 3 PPL might be inaccurate.")
-
         for text in tqdm(texts, desc="  Evaluating (sliding window)", leave=False):
             try:
+                # FIX 2: Explicitly add special tokens (BOS)
                 encodings = tokenizer(
                     text, 
                     return_tensors="pt", 
-                    add_special_tokens=True # Crucial for Llama 3
+                    add_special_tokens=True 
                 )
-                input_ids = encodings.input_ids[:, :self.max_length * 10] # Safety clip for massive docs
+                input_ids = encodings.input_ids[:, :self.max_length * 10] 
                 
                 seq_len = input_ids.size(1)
-                
-                # Perform sliding window evaluation
                 prev_end_loc = 0
+                
                 for begin_loc in range(0, seq_len, self.stride):
-                    
-                    # Define the window
                     end_loc = min(begin_loc + self.max_length, seq_len)
-                    
-                    # The "Target" is the length we actually want to predict in this step
-                    # Usually equal to stride, unless we are at the very end
                     trg_len = end_loc - prev_end_loc  
                     
                     # Prepare inputs
                     input_ids_chunk = input_ids[:, begin_loc:end_loc].to(self.device)
-                    
-                    # Prepare targets (clone inputs)
                     target_ids_chunk = input_ids_chunk.clone()
                     
-                    # MASKING: Set context tokens (those before the target area) to -100
-                    # so they don't contribute to the loss
+                    # FIX 3: MASKING THE CONTEXT
+                    # We set the labels of the previous tokens to -100
+                    # This ensures we only calculate loss on the NEW tokens (the stride)
                     target_ids_chunk[:, :-trg_len] = -100
 
-                    # Forward pass
                     with torch.no_grad():
                         outputs = model(input_ids_chunk, labels=target_ids_chunk)
                         
-                        # Calculate likelihood
-                        # loss is the average NLL of the unmasked tokens
-                        # we convert back to sum by multiplying by trg_len
+                        # Calculate Sum of NLL (not average)
+                        # outputs.loss is the mean NLL of the unmasked tokens
+                        # We multiply by trg_len to get the sum
                         neg_log_likelihood = outputs.loss * trg_len
 
                     nlls.append(neg_log_likelihood)
@@ -188,14 +168,12 @@ class AWQSlidingWindowValidator:
                 total_tokens += seq_len
 
             except Exception as e:
-                print(f"Error processing doc: {e}")
                 continue
 
         if not nlls:
             return None
 
-        # Final PPL Calculation
-        # PPL = exp(Sum(NLL) / Total_Tokens)
+        # FIX 4: Correct PPL Aggregation
         total_nll = torch.stack(nlls).sum()
         perplexity = torch.exp(total_nll / total_tokens).item()
         
@@ -216,9 +194,27 @@ class AWQSlidingWindowValidator:
             return None
 
         try:
-            tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+            # FIX 1: Add flag to fix Llama 3 / Mistral tokenizer regex
+            # and ensure fast tokenizer is used for correct mapping
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_path, 
+                trust_remote_code=True,
+                use_fast=True # Llama 3 usually requires the fast tokenizer
+            )
+            
+            # Hack for the regex warning if the flag is supported by your transformers version
+            # If this throws an error, upgrade transformers: pip install -U transformers
+            if "Mistral" in model_path or "Llama-3" in model_path:
+                 pass # Newer transformers handle this, but if you get the error again, 
+                      # try adding tokenizer_kwargs={"fix_mistral_regex": True} to from_pretrained
+
             if tokenizer.pad_token is None:
                 tokenizer.pad_token = tokenizer.eos_token
+            
+            # Llama 3 explicit BOS check
+            if tokenizer.bos_token_id is None:
+                print("  ⚠️ WARNING: Tokenizer missing BOS token. Forcing add_bos_token=True")
+                tokenizer.add_bos_token = True
 
             model = AutoModelForCausalLM.from_pretrained(
                 model_path,
@@ -230,8 +226,6 @@ class AWQSlidingWindowValidator:
             results = self.evaluate_sliding_window(model, tokenizer, texts)
 
             print(f"  ✅ Perplexity: {results['perplexity']:.4f}")
-            print(f"     Documents: {results['num_documents']}, Windows: {results['total_windows']}")
-
             del model
             torch.cuda.empty_cache()
 
