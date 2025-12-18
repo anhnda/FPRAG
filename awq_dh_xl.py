@@ -136,7 +136,7 @@ class DynamicHeuristicAWQQuantizerXL:
         print(f"  Use heuristic: {use_heuristic}")
         if use_heuristic:
             print(f"  Outlier detection: DYNAMIC (Kneedle algorithm on sorted E[X])")
-            print(f"  Knee tolerance offset: {knee_tolerance:.2f}")
+            print(f"  Knee tolerance offset: {knee_tolerance:.8f}")
             print(f"  Quantization: HEURISTIC-GUIDED GROUP-WISE ASYMMETRIC [0, {2**bits - 1}]")
         else:
             print(f"  Quantization: STANDARD GROUP-WISE ASYMMETRIC [0, {2**bits - 1}]")
