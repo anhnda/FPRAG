@@ -198,7 +198,7 @@ class DynamicHeuristicAWQQuantizerXL:
             debug: Print debug information
 
         Returns:
-            threshold value above which channels are considered outliers
+            tuple: (threshold value, outlier percentage)
         """
         # Sort activation means in ascending order
         sorted_means, _ = torch.sort(activation_means.abs())
@@ -211,9 +211,10 @@ class DynamicHeuristicAWQQuantizerXL:
             # Not enough data, use a conservative default (top 5%)
             threshold_idx = int(0.95 * n)
             threshold = sorted_means[threshold_idx].item()
+            outlier_percent = 0.05
             if debug:
                 print(f"    DEBUG: Not enough data for Kneedle, using top 5% as default")
-            return threshold
+            return threshold, outlier_percent
 
         # Find knee point in first half
         knee_idx_in_half = find_knee_point(first_half, tolerance_offset=self.knee_tolerance)
@@ -234,13 +235,17 @@ class DynamicHeuristicAWQQuantizerXL:
             print(f"    DEBUG: Knee point index in first half: {knee_idx_in_half}/{len(first_half)}")
             print(f"    DEBUG: Knee threshold value: {threshold:.6f}")
             print(f"    DEBUG: Outliers: {num_outliers}/{n} ({outlier_percent*100:.2f}%)")
+            print(f"    DEBUG: vs Default 5.00%: {outlier_percent*100 - 5.0:+.2f}% difference")
 
-        return threshold
+        return threshold, outlier_percent
 
     @torch.no_grad()
     def quantize_weight_heuristic_groupwise(self, W, group_activation_means, apply_heuristic=True, debug=False):
         """
         Vectorized implementation of 'quantize_groupwise_global_greedy' with DYNAMIC outlier detection.
+
+        Returns:
+            tuple: (W_dequant, outlier_percent) if apply_heuristic=True, else (W_dequant, None)
         """
         out_features, in_features = W.shape
         device = W.device
@@ -283,7 +288,7 @@ class DynamicHeuristicAWQQuantizerXL:
             # Return early if simple rounding
             W_dequant = (W_int - zp_flat) * scale_flat
             if padded_in_features > in_features: W_dequant = W_dequant[:, :in_features]
-            return W_dequant.to(W.dtype)
+            return W_dequant.to(W.dtype), None
 
         # --- 3. Global Greedy Heuristic (Vectorized) ---
 
@@ -305,7 +310,7 @@ class DynamicHeuristicAWQQuantizerXL:
         valid_mask = valid_mask & in_range
 
         # DYNAMIC Outlier Masking using Kneedle algorithm
-        outlier_threshold = self.compute_dynamic_outlier_threshold(act_padded, debug=debug)
+        outlier_threshold, outlier_percent = self.compute_dynamic_outlier_threshold(act_padded, debug=debug)
         is_outlier = act_padded.abs() > outlier_threshold
         valid_mask = valid_mask & (~is_outlier).unsqueeze(0)
 
@@ -342,7 +347,7 @@ class DynamicHeuristicAWQQuantizerXL:
         if padded_in_features > in_features:
             W_dequant = W_dequant[:, :in_features]
 
-        return W_dequant.to(W.dtype)
+        return W_dequant.to(W.dtype), outlier_percent
 
     @torch.no_grad()
     def search_best_scale(self, name, module):
@@ -392,7 +397,7 @@ class DynamicHeuristicAWQQuantizerXL:
             W_scaled = W * scales.unsqueeze(0)
             scaled_act_mean = raw_mean / scales
 
-            W_quant = self.quantize_weight_heuristic_groupwise(
+            W_quant, _ = self.quantize_weight_heuristic_groupwise(
                 W_scaled,
                 scaled_act_mean,
                 apply_heuristic=self.use_heuristic
@@ -479,7 +484,7 @@ class DynamicHeuristicAWQQuantizerXL:
             W_scaled = W * scales.unsqueeze(0)
             scaled_act_mean = raw_mean / scales
 
-            W_quant = self.quantize_weight_heuristic_groupwise(
+            W_quant, _ = self.quantize_weight_heuristic_groupwise(
                 W_scaled,
                 scaled_act_mean,
                 apply_heuristic=self.use_heuristic,
@@ -549,7 +554,7 @@ class DynamicHeuristicAWQQuantizerXL:
             W_scaled = W_chunk * best_scales.unsqueeze(0)
             scaled_act_mean = raw_mean / best_scales
 
-            W_quant = self.quantize_weight_heuristic_groupwise(
+            W_quant, outlier_pct = self.quantize_weight_heuristic_groupwise(
                 W_scaled,
                 scaled_act_mean,
                 apply_heuristic=self.use_heuristic
@@ -560,7 +565,8 @@ class DynamicHeuristicAWQQuantizerXL:
             chunk_stats.append({
                 'alpha': best_alpha,
                 'error': best_error,
-                'scales': best_scales
+                'scales': best_scales,
+                'outlier_percent': outlier_pct if outlier_pct is not None else 0.0
             })
 
             # Cleanup
@@ -574,24 +580,29 @@ class DynamicHeuristicAWQQuantizerXL:
         # Store average statistics
         avg_alpha = np.mean([s['alpha'] for s in chunk_stats])
         avg_error = np.mean([s['error'] for s in chunk_stats])
+        avg_outlier_pct = np.mean([s['outlier_percent'] for s in chunk_stats])
 
         # Build detailed stats dict
         stats_dict = {
             'scales': chunk_stats[0]['scales'].cpu(),  # Use first chunk's scales
             'alpha': avg_alpha,
             'error': avg_error,
+            'outlier_percent': avg_outlier_pct,
         }
         for i, stat in enumerate(chunk_stats):
             stats_dict[f'alpha_chunk{i+1}'] = stat['alpha']
             stats_dict[f'error_chunk{i+1}'] = stat['error']
+            stats_dict[f'outlier_pct_chunk{i+1}'] = stat['outlier_percent']
 
         self.layer_scales[name] = stats_dict
 
         # Print summary
         alpha_str = ', '.join([f'α_{i+1}={s["alpha"]:.4f}' for i, s in enumerate(chunk_stats)])
         error_str = ', '.join([f'err_{i+1}={s["error"]:.8f}' for i, s in enumerate(chunk_stats)])
+        outlier_str = ', '.join([f'out_{i+1}={s["outlier_percent"]*100:.2f}%' for i, s in enumerate(chunk_stats)])
         print(f"     ✓ Done: {alpha_str}")
         print(f"             {error_str}")
+        print(f"             {outlier_str}")
 
         del W_final_chunks, chunk_stats, W_final, raw_mean
         torch.cuda.empty_cache()
@@ -611,7 +622,7 @@ class DynamicHeuristicAWQQuantizerXL:
         else:
             scaled_act_mean = torch.zeros(W.shape[1], device=W.device, dtype=W.dtype)
 
-        W_quant = self.quantize_weight_heuristic_groupwise(
+        W_quant, outlier_pct = self.quantize_weight_heuristic_groupwise(
             W_scaled,
             scaled_act_mean,
             apply_heuristic=self.use_heuristic
@@ -623,7 +634,8 @@ class DynamicHeuristicAWQQuantizerXL:
         self.layer_scales[name] = {
             'scales': best_scales.cpu(),
             'alpha': best_alpha,
-            'error': best_error
+            'error': best_error,
+            'outlier_percent': outlier_pct if outlier_pct is not None else 0.0
         }
 
         del best_scales, scaled_act_mean, W_scaled, W_quant, W_final
@@ -739,9 +751,30 @@ class DynamicHeuristicAWQQuantizerXL:
 
         if self.layer_scales:
             alphas = [info['alpha'] for info in self.layer_scales.values()]
+            outlier_pcts = [info.get('outlier_percent', 0.0) for info in self.layer_scales.values()]
+
             print(f"\nOptimal α statistics:")
             print(f"  Mean: {np.mean(alphas):.3f}")
             print(f"  Median: {np.median(alphas):.3f}")
+
+            if self.use_heuristic and outlier_pcts:
+                mean_outlier = np.mean(outlier_pcts) * 100
+                median_outlier = np.median(outlier_pcts) * 100
+                default_pct = 5.0
+                diff_from_default = mean_outlier - default_pct
+
+                print(f"\nDynamic Outlier Detection statistics:")
+                print(f"  Mean outlier %: {mean_outlier:.2f}%")
+                print(f"  Median outlier %: {median_outlier:.2f}%")
+                print(f"  vs Default 5.00%: {diff_from_default:+.2f}%")
+                print(f"  Min: {np.min(outlier_pcts)*100:.2f}% | Max: {np.max(outlier_pcts)*100:.2f}%")
+
+                if mean_outlier < default_pct:
+                    print(f"  → Dynamic method keeps FEWER outliers (more aggressive quantization)")
+                elif mean_outlier > default_pct:
+                    print(f"  → Dynamic method keeps MORE outliers (more conservative)")
+                else:
+                    print(f"  → Similar to default 5%")
 
 
 def main():
