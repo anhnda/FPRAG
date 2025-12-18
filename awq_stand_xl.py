@@ -617,6 +617,8 @@ def main():
                             "XL models require smaller batches due to larger hidden dim.")
     parser.add_argument("--lmhead-chunks", type=int, default=4,
                        help="Number of chunks to split lm_head into (default: 4, higher = less memory)")
+    parser.add_argument("--cache-dir", type=str, default="./calibration_cache",
+                       help="Directory to cache calibration data (default: ./calibration_cache)")
     args = parser.parse_args()
 
     # Set random seeds
@@ -660,11 +662,11 @@ def main():
     # Load calibration data
     print(f"\nLoading calibration dataset: {args.calib_dataset}")
     if args.calib_dataset == "c4":
-        calib_texts = get_c4_calibration_data(tokenizer, n_samples=args.n_calib, seqlen=2048, seed=args.seed)
+        calib_texts = get_c4_calibration_data(tokenizer, n_samples=args.n_calib, seqlen=2048, seed=args.seed, cache_dir=args.cache_dir)
     elif args.calib_dataset == "wikitext2-simple":
         calib_texts = load_wikitext2_simple(n_samples=args.n_calib)
     else:
-        calib_texts = get_wikitext2_calibration_data(tokenizer, n_samples=args.n_calib, seqlen=2048, seed=args.seed)
+        calib_texts = get_wikitext2_calibration_data(tokenizer, n_samples=args.n_calib, seqlen=2048, seed=args.seed, cache_dir=args.cache_dir)
 
     # Initialize quantizer
     quantizer = GroupWiseAWQAsymmetricL2Quantizer(
