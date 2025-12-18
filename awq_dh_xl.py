@@ -193,6 +193,11 @@ class DynamicHeuristicAWQQuantizerXL:
         """
         Compute dynamic outlier threshold using Kneedle algorithm.
 
+        Strategy:
+        1. Sort activation means in DESCENDING order [high ... medium ... low]
+        2. Apply Kneedle to FIRST HALF [high ... medium] to find outlier→normal transition
+        3. Tolerance offset allows tuning: positive = more conservative (keep more outliers)
+
         Args:
             activation_means: Tensor of per-channel activation means (E[X])
             debug: Print debug information
@@ -200,41 +205,43 @@ class DynamicHeuristicAWQQuantizerXL:
         Returns:
             tuple: (threshold value, outlier percentage)
         """
-        # Sort activation means in ascending order
-        sorted_means, _ = torch.sort(activation_means.abs())
+        # Sort activation means in DESCENDING order [high → low]
+        sorted_means, _ = torch.sort(activation_means.abs(), descending=True)
         n = len(sorted_means)
 
-        # Apply Kneedle to first half
+        # Apply Kneedle to FIRST HALF [high ... medium] to find outlier transition
         first_half = sorted_means[:n // 2]
 
         if len(first_half) < 3:
             # Not enough data, use a conservative default (top 5%)
-            threshold_idx = int(0.95 * n)
+            # In descending order, top 5% is at the beginning
+            threshold_idx = int(0.05 * n)
             threshold = sorted_means[threshold_idx].item()
             outlier_percent = 0.05
             if debug:
                 print(f"    DEBUG: Not enough data for Kneedle, using top 5% as default")
             return threshold, outlier_percent
 
-        # Find knee point in first half
+        # Find knee point in first half (where outliers end, normal begins)
         knee_idx_in_half = find_knee_point(first_half, tolerance_offset=self.knee_tolerance)
 
-        # Map back to full sorted array
+        # This is already the index in full array (descending sorted)
         knee_idx = knee_idx_in_half
 
         # The threshold is the value at the knee point
         threshold = sorted_means[knee_idx].item()
 
-        # Count how many channels are outliers
-        num_outliers = (activation_means.abs() > threshold).sum().item()
+        # Count how many channels are outliers (above or equal to threshold)
+        num_outliers = (activation_means.abs() >= threshold).sum().item()
         outlier_percent = num_outliers / n
 
         if debug:
-            print(f"    DEBUG: Sorted means range: [{sorted_means[0]:.6f}, {sorted_means[-1]:.6f}]")
-            print(f"    DEBUG: First half range: [{first_half[0]:.6f}, {first_half[-1]:.6f}]")
+            print(f"    DEBUG: Sorted means (descending): [{sorted_means[0]:.6f} ... {sorted_means[-1]:.6f}]")
+            print(f"    DEBUG: First half range: [{first_half[0]:.6f} ... {first_half[-1]:.6f}]")
             print(f"    DEBUG: Knee point index in first half: {knee_idx_in_half}/{len(first_half)}")
+            print(f"    DEBUG: Knee point index in full array: {knee_idx}/{n} ({knee_idx/n*100:.1f}%)")
             print(f"    DEBUG: Knee threshold value: {threshold:.6f}")
-            print(f"    DEBUG: Outliers: {num_outliers}/{n} ({outlier_percent*100:.2f}%)")
+            print(f"    DEBUG: Outliers (>= threshold): {num_outliers}/{n} ({outlier_percent*100:.2f}%)")
             print(f"    DEBUG: vs Default 5.00%: {outlier_percent*100 - 5.0:+.2f}% difference")
 
         return threshold, outlier_percent
