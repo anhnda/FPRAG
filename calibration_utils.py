@@ -12,9 +12,11 @@ import torch
 import random
 from datasets import load_dataset
 from typing import List
+import pickle
+from pathlib import Path
 
 
-def get_c4_calibration_data(tokenizer, n_samples=128, seqlen=2048, seed=42, return_tensors=False):
+def get_c4_calibration_data(tokenizer, n_samples=128, seqlen=2048, seed=42, return_tensors=False, cache_dir="./calibration_cache"):
     """
     Load C4 calibration data with random slicing (standard GPTQ/AWQ approach).
 
@@ -22,6 +24,7 @@ def get_c4_calibration_data(tokenizer, n_samples=128, seqlen=2048, seed=42, retu
     - Uses direct URL to C4 shard (bypasses trust_remote_code issue)
     - Fast text length filtering before tokenization (~50x faster)
     - Optional tensor return (more efficient, no decode/re-encode)
+    - Caching support to avoid re-downloading data
 
     Why Random Slicing?
     - Avoids bias from document headers/introductions
@@ -43,6 +46,7 @@ def get_c4_calibration_data(tokenizer, n_samples=128, seqlen=2048, seed=42, retu
         seqlen: Sequence length in tokens (default: 2048)
         seed: Random seed for reproducibility
         return_tensors: If True, return token tensors. If False, return text strings (default: False)
+        cache_dir: Directory to cache downloaded data (default: "./calibration_cache")
 
     Returns:
         List[torch.Tensor] if return_tensors=True, else List[str]
@@ -53,6 +57,17 @@ def get_c4_calibration_data(tokenizer, n_samples=128, seqlen=2048, seed=42, retu
     print(f"  Method: Random slicing with fast filtering")
     print(f"  Seed: {seed}")
 
+    # Check cache first
+    cache_path = Path(cache_dir)
+    cache_path.mkdir(exist_ok=True)
+
+    cache_file = cache_path / f"c4_calib_n{n_samples}_len{seqlen}_seed{seed}_tensors{return_tensors}.pkl"
+    if cache_file.exists():
+        print(f"\n  📦 Loading from cache: {cache_file}")
+        with open(cache_file, 'rb') as f:
+            return pickle.load(f)
+
+    print(f"\n  ⚠️  No cache found, downloading from C4...")
     random.seed(seed)
 
     # URL to the first shard of C4
@@ -121,10 +136,15 @@ def get_c4_calibration_data(tokenizer, n_samples=128, seqlen=2048, seed=42, retu
     print(f"\n  ✓ Collected {len(dataset)} samples from C4")
     print(f"  ✓ Skipped {skipped} documents (too short)")
 
+    # Save to cache
+    print(f"  💾 Saving to cache: {cache_file}")
+    with open(cache_file, 'wb') as f:
+        pickle.dump(dataset, f)
+
     return dataset
 
 
-def get_wikitext2_calibration_data(tokenizer, n_samples=128, seqlen=2048, seed=42, split='train'):
+def get_wikitext2_calibration_data(tokenizer, n_samples=128, seqlen=2048, seed=42, split='train', cache_dir="./calibration_cache"):
     """
     Load WikiText-2 calibration data (lightweight alternative to C4).
 
@@ -137,6 +157,7 @@ def get_wikitext2_calibration_data(tokenizer, n_samples=128, seqlen=2048, seed=4
         seqlen: Sequence length in tokens
         seed: Random seed
         split: Dataset split ('train', 'validation', 'test')
+        cache_dir: Directory to cache downloaded data (default: "./calibration_cache")
 
     Returns:
         List[str]: Calibration texts
@@ -147,6 +168,17 @@ def get_wikitext2_calibration_data(tokenizer, n_samples=128, seqlen=2048, seed=4
     print(f"  Split: {split}")
     print(f"  Seed: {seed}")
 
+    # Check cache first
+    cache_path = Path(cache_dir)
+    cache_path.mkdir(exist_ok=True)
+
+    cache_file = cache_path / f"wikitext2_calib_n{n_samples}_len{seqlen}_seed{seed}_split{split}.pkl"
+    if cache_file.exists():
+        print(f"\n  📦 Loading from cache: {cache_file}")
+        with open(cache_file, 'rb') as f:
+            return pickle.load(f)
+
+    print(f"\n  ⚠️  No cache found, downloading from WikiText-2...")
     random.seed(seed)
 
     # Load WikiText-2
@@ -188,10 +220,15 @@ def get_wikitext2_calibration_data(tokenizer, n_samples=128, seqlen=2048, seed=4
 
     print(f"  ✓ Collected {len(calibration_texts)} samples from WikiText-2")
 
+    # Save to cache
+    print(f"  💾 Saving to cache: {cache_file}")
+    with open(cache_file, 'wb') as f:
+        pickle.dump(calibration_texts, f)
+
     return calibration_texts
 
 
-def load_calibration_data(dataset_name, tokenizer, n_samples=128, seqlen=2048, seed=42):
+def load_calibration_data(dataset_name, tokenizer, n_samples=128, seqlen=2048, seed=42, cache_dir="./calibration_cache"):
     """
     Universal calibration data loader.
 
@@ -201,6 +238,7 @@ def load_calibration_data(dataset_name, tokenizer, n_samples=128, seqlen=2048, s
         n_samples: Number of calibration samples
         seqlen: Sequence length in tokens
         seed: Random seed
+        cache_dir: Directory to cache downloaded data (default: "./calibration_cache")
 
     Returns:
         List[str]: Calibration texts
@@ -208,9 +246,9 @@ def load_calibration_data(dataset_name, tokenizer, n_samples=128, seqlen=2048, s
     dataset_name = dataset_name.lower()
 
     if dataset_name == 'c4':
-        return get_c4_calibration_data(tokenizer, n_samples, seqlen, seed)
+        return get_c4_calibration_data(tokenizer, n_samples, seqlen, seed, cache_dir=cache_dir)
     elif dataset_name in ['wikitext2', 'wikitext']:
-        return get_wikitext2_calibration_data(tokenizer, n_samples, seqlen, seed, split='train')
+        return get_wikitext2_calibration_data(tokenizer, n_samples, seqlen, seed, split='train', cache_dir=cache_dir)
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}. Use 'c4' or 'wikitext2'")
 

@@ -16,14 +16,18 @@ from datasets import load_dataset
 from tqdm import tqdm
 import random
 import numpy as np
+import pickle
+from pathlib import Path
 
 class AWQSlidingWindowValidator:
-    def __init__(self, device="cuda", seed=42, stride=512, max_length=2048): # Increased to 2048 for Llama 3
+    def __init__(self, device="cuda", seed=42, stride=512, max_length=2048, cache_dir="./dataset_cache"): # Increased to 2048 for Llama 3
         self.device = device
         self.seed = seed
         self.stride = stride
         self.max_length = max_length
         self.results = {}
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(exist_ok=True)
 
         print("="*80)
         print("AWQ SLIDING WINDOW CROSS-DATASET VALIDATION (FINAL)")
@@ -31,6 +35,7 @@ class AWQSlidingWindowValidator:
         print(f"Device: {device}")
         print(f"Stride: {stride}")
         print(f"Max Seq Length: {max_length}")
+        print(f"Cache Dir: {cache_dir}")
         print("="*80)
 
     def load_wikitext2_test(self, n_samples=None):
@@ -41,6 +46,14 @@ class AWQSlidingWindowValidator:
         Note: n_samples parameter is ignored - full test set is always used.
         """
         print("\n[1/3] Loading WikiText-2 test...")
+
+        # Check cache first
+        cache_file = self.cache_dir / f"wikitext2_test_seed{self.seed}.pkl"
+        if cache_file.exists():
+            print(f"  📦 Loading from cache: {cache_file}")
+            with open(cache_file, 'rb') as f:
+                return pickle.load(f)
+
         dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
 
         # 1. Join everything into one massive string with newlines
@@ -50,7 +63,14 @@ class AWQSlidingWindowValidator:
         print(f"  ✅ Loaded continuous stream ({len(full_text)} chars)")
 
         # Return as a single-item list so the loop treats it as one giant doc
-        return [full_text]
+        result = [full_text]
+
+        # Save to cache
+        print(f"  💾 Saving to cache: {cache_file}")
+        with open(cache_file, 'wb') as f:
+            pickle.dump(result, f)
+
+        return result
 
     def load_c4_validation(self, n_samples=500):
         """
@@ -58,6 +78,14 @@ class AWQSlidingWindowValidator:
         Concatenates multiple documents into one stream for sliding window evaluation.
         """
         print("\n[2/3] Loading C4 validation...")
+
+        # Check cache first
+        cache_file = self.cache_dir / f"c4_validation_n{n_samples}_seed{self.seed}.pkl"
+        if cache_file.exists():
+            print(f"  📦 Loading from cache: {cache_file}")
+            with open(cache_file, 'rb') as f:
+                return pickle.load(f)
+
         dataset = load_dataset("allenai/c4", "en", split="validation", streaming=True)
         texts = []
         for item in tqdm(dataset, total=n_samples, desc="  Collecting C4"):
@@ -70,7 +98,14 @@ class AWQSlidingWindowValidator:
         print(f"  ✅ Loaded continuous stream ({len(full_text)} chars, {len(texts)} documents)")
 
         # Return as single-item list
-        return [full_text]
+        result = [full_text]
+
+        # Save to cache
+        print(f"  💾 Saving to cache: {cache_file}")
+        with open(cache_file, 'wb') as f:
+            pickle.dump(result, f)
+
+        return result
 
     def load_ag_news_test(self, n_samples=500):
         """
@@ -78,6 +113,14 @@ class AWQSlidingWindowValidator:
         Concatenates multiple articles into one stream for sliding window evaluation.
         """
         print("\n[3/3] Loading AG News test...")
+
+        # Check cache first
+        cache_file = self.cache_dir / f"ag_news_test_n{n_samples}_seed{self.seed}.pkl"
+        if cache_file.exists():
+            print(f"  📦 Loading from cache: {cache_file}")
+            with open(cache_file, 'rb') as f:
+                return pickle.load(f)
+
         dataset = load_dataset("ag_news", split="test")
         texts = [item['text'] for item in dataset if len(item['text'].strip()) > 200]
 
@@ -90,7 +133,14 @@ class AWQSlidingWindowValidator:
         print(f"  ✅ Loaded continuous stream ({len(full_text)} chars, {len(texts)} articles)")
 
         # Return as single-item list
-        return [full_text]
+        result = [full_text]
+
+        # Save to cache
+        print(f"  💾 Saving to cache: {cache_file}")
+        with open(cache_file, 'wb') as f:
+            pickle.dump(result, f)
+
+        return result
 
     @torch.no_grad()
     def evaluate_sliding_window(self, model, tokenizer, texts):
@@ -403,9 +453,11 @@ def main():
                        help="Path to Standard AWQ model (optional for comparison)")
     parser.add_argument("--n-samples", type=int, default=2000,
                        help="Number of samples per dataset")
+    parser.add_argument("--cache-dir", type=str, default="./dataset_cache",
+                       help="Directory to cache downloaded datasets")
     args = parser.parse_args()
 
-    validator = AWQSlidingWindowValidator()
+    validator = AWQSlidingWindowValidator(cache_dir=args.cache_dir)
 
     # Run validation
     validator.run_validation(
