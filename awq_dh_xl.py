@@ -67,8 +67,9 @@ def find_knee_point(values, tolerance_offset=0.0):
         return n // 2
 
     # Convert to numpy for easier computation
+    # CRITICAL: Convert bfloat16 to float32 first (bfloat16 not supported by numpy)
     if torch.is_tensor(values):
-        y = values.cpu().numpy()
+        y = values.cpu().float().numpy()
     else:
         y = np.array(values)
 
