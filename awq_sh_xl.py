@@ -169,8 +169,12 @@ class StandardHeuristicAWQQuantizerXL:
             W_dequant = (W_int - zp_flat) * scale_flat
             if padded_in_features > in_features: W_dequant = W_dequant[:, :in_features]
             # Return empty flip stats
-            flip_stats = {'total': 0, 'per_channel_mean': 0, 'per_channel_median': 0,
-                         'per_channel_min': 0, 'per_channel_max': 0}
+            flip_stats = {
+                'total': 0, 'per_channel_mean': 0, 'per_channel_median': 0,
+                'per_channel_min': 0, 'per_channel_max': 0, 'per_channel_std': 0,
+                'per_channel_p25': 0, 'per_channel_p75': 0, 'per_channel_p90': 0,
+                'per_channel_p95': 0, 'per_channel_p99': 0, 'per_channel_zero_pct': 100
+            }
             return W_dequant.to(W.dtype), flip_stats
 
         # --- 3. Global Greedy Heuristic (Vectorized) ---
@@ -239,12 +243,22 @@ class StandardHeuristicAWQQuantizerXL:
         if padded_in_features > in_features:
             flips_per_channel = flips_per_channel[:in_features]
 
+        # Compute comprehensive statistics
         flip_stats = {
             'total': num_flips_total,
             'per_channel_mean': flips_per_channel.mean().item(),
             'per_channel_median': flips_per_channel.median().item(),
             'per_channel_min': flips_per_channel.min().item(),
-            'per_channel_max': flips_per_channel.max().item()
+            'per_channel_max': flips_per_channel.max().item(),
+            'per_channel_std': flips_per_channel.std().item(),
+            # Percentiles
+            'per_channel_p25': torch.quantile(flips_per_channel, 0.25).item(),
+            'per_channel_p75': torch.quantile(flips_per_channel, 0.75).item(),
+            'per_channel_p90': torch.quantile(flips_per_channel, 0.90).item(),
+            'per_channel_p95': torch.quantile(flips_per_channel, 0.95).item(),
+            'per_channel_p99': torch.quantile(flips_per_channel, 0.99).item(),
+            # Percentage with 0 flips
+            'per_channel_zero_pct': (flips_per_channel == 0).float().mean().item() * 100
         }
 
         # --- 7. Dequantize & Return ---
@@ -490,6 +504,13 @@ class StandardHeuristicAWQQuantizerXL:
         total_flips = sum([s['flip_stats']['total'] for s in chunk_stats])
         avg_per_channel_mean = np.mean([s['flip_stats']['per_channel_mean'] for s in chunk_stats])
         avg_per_channel_median = np.mean([s['flip_stats']['per_channel_median'] for s in chunk_stats])
+        avg_per_channel_std = np.mean([s['flip_stats']['per_channel_std'] for s in chunk_stats])
+        avg_per_channel_p25 = np.mean([s['flip_stats']['per_channel_p25'] for s in chunk_stats])
+        avg_per_channel_p75 = np.mean([s['flip_stats']['per_channel_p75'] for s in chunk_stats])
+        avg_per_channel_p90 = np.mean([s['flip_stats']['per_channel_p90'] for s in chunk_stats])
+        avg_per_channel_p95 = np.mean([s['flip_stats']['per_channel_p95'] for s in chunk_stats])
+        avg_per_channel_p99 = np.mean([s['flip_stats']['per_channel_p99'] for s in chunk_stats])
+        avg_per_channel_zero_pct = np.mean([s['flip_stats']['per_channel_zero_pct'] for s in chunk_stats])
 
         # Build detailed stats dict
         stats_dict = {
@@ -499,7 +520,14 @@ class StandardHeuristicAWQQuantizerXL:
             'flip_stats': {
                 'total': total_flips,
                 'per_channel_mean': avg_per_channel_mean,
-                'per_channel_median': avg_per_channel_median
+                'per_channel_median': avg_per_channel_median,
+                'per_channel_std': avg_per_channel_std,
+                'per_channel_p25': avg_per_channel_p25,
+                'per_channel_p75': avg_per_channel_p75,
+                'per_channel_p90': avg_per_channel_p90,
+                'per_channel_p95': avg_per_channel_p95,
+                'per_channel_p99': avg_per_channel_p99,
+                'per_channel_zero_pct': avg_per_channel_zero_pct
             }
         }
         for i, stat in enumerate(chunk_stats):
@@ -675,6 +703,13 @@ class StandardHeuristicAWQQuantizerXL:
                 flip_totals = [info.get('flip_stats', {}).get('total', 0) for info in self.layer_scales.values()]
                 per_ch_means = [info.get('flip_stats', {}).get('per_channel_mean', 0) for info in self.layer_scales.values()]
                 per_ch_medians = [info.get('flip_stats', {}).get('per_channel_median', 0) for info in self.layer_scales.values()]
+                per_ch_stds = [info.get('flip_stats', {}).get('per_channel_std', 0) for info in self.layer_scales.values()]
+                per_ch_p25s = [info.get('flip_stats', {}).get('per_channel_p25', 0) for info in self.layer_scales.values()]
+                per_ch_p75s = [info.get('flip_stats', {}).get('per_channel_p75', 0) for info in self.layer_scales.values()]
+                per_ch_p90s = [info.get('flip_stats', {}).get('per_channel_p90', 0) for info in self.layer_scales.values()]
+                per_ch_p95s = [info.get('flip_stats', {}).get('per_channel_p95', 0) for info in self.layer_scales.values()]
+                per_ch_p99s = [info.get('flip_stats', {}).get('per_channel_p99', 0) for info in self.layer_scales.values()]
+                per_ch_zero_pcts = [info.get('flip_stats', {}).get('per_channel_zero_pct', 0) for info in self.layer_scales.values()]
 
                 total_flips = np.sum(flip_totals)
                 mean_flips_per_layer = np.mean(flip_totals)
@@ -684,6 +719,13 @@ class StandardHeuristicAWQQuantizerXL:
 
                 avg_per_ch_mean = np.mean(per_ch_means)
                 avg_per_ch_median = np.mean(per_ch_medians)
+                avg_per_ch_std = np.mean(per_ch_stds)
+                avg_per_ch_p25 = np.mean(per_ch_p25s)
+                avg_per_ch_p75 = np.mean(per_ch_p75s)
+                avg_per_ch_p90 = np.mean(per_ch_p90s)
+                avg_per_ch_p95 = np.mean(per_ch_p95s)
+                avg_per_ch_p99 = np.mean(per_ch_p99s)
+                avg_per_ch_zero_pct = np.mean(per_ch_zero_pcts)
 
                 print(f"\nWeight Flipping Statistics:")
                 print(f"  Total flips across all layers: {int(total_flips):,}")
@@ -693,6 +735,11 @@ class StandardHeuristicAWQQuantizerXL:
                 print(f"\n  Per-Channel Statistics (averaged across layers):")
                 print(f"    Mean flips per channel: {avg_per_ch_mean:.2f}")
                 print(f"    Median flips per channel: {avg_per_ch_median:.2f}")
+                print(f"    Std dev: {avg_per_ch_std:.2f}")
+                print(f"\n    Percentiles:")
+                print(f"      25th: {avg_per_ch_p25:.2f} | 50th: {avg_per_ch_median:.2f} | 75th: {avg_per_ch_p75:.2f}")
+                print(f"      90th: {avg_per_ch_p90:.2f} | 95th: {avg_per_ch_p95:.2f} | 99th: {avg_per_ch_p99:.2f}")
+                print(f"\n    Channels with 0 flips: {avg_per_ch_zero_pct:.1f}%")
 
 
 def main():
