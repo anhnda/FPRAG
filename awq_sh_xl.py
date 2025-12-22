@@ -168,7 +168,10 @@ class StandardHeuristicAWQQuantizerXL:
             # Return early if simple rounding (no flips)
             W_dequant = (W_int - zp_flat) * scale_flat
             if padded_in_features > in_features: W_dequant = W_dequant[:, :in_features]
-            return W_dequant.to(W.dtype), 0
+            # Return empty flip stats
+            flip_stats = {'total': 0, 'per_channel_mean': 0, 'per_channel_median': 0,
+                         'per_channel_min': 0, 'per_channel_max': 0}
+            return W_dequant.to(W.dtype), flip_stats
 
         # --- 3. Global Greedy Heuristic (Vectorized) ---
 
@@ -225,16 +228,32 @@ class StandardHeuristicAWQQuantizerXL:
         W_int.scatter_add_(1, sorted_indices, sorted_flip_dir)
         W_int.clamp_(0, max_int)
 
-        # Count number of flips
-        num_flips = final_flips_sorted.sum().item()
+        # --- 6. Compute Flip Statistics ---
+        # Total flips
+        num_flips_total = final_flips_sorted.sum().item()
 
-        # --- 6. Dequantize & Return ---
+        # Per-channel flip statistics (sum across output dimension)
+        flips_per_channel = final_flips_sorted.sum(dim=0).float()  # [padded_in_features]
+
+        # Only consider actual channels (not padding)
+        if padded_in_features > in_features:
+            flips_per_channel = flips_per_channel[:in_features]
+
+        flip_stats = {
+            'total': num_flips_total,
+            'per_channel_mean': flips_per_channel.mean().item(),
+            'per_channel_median': flips_per_channel.median().item(),
+            'per_channel_min': flips_per_channel.min().item(),
+            'per_channel_max': flips_per_channel.max().item()
+        }
+
+        # --- 7. Dequantize & Return ---
         W_dequant = (W_int - zp_flat) * scale_flat
 
         if padded_in_features > in_features:
             W_dequant = W_dequant[:, :in_features]
 
-        return W_dequant.to(W.dtype), num_flips
+        return W_dequant.to(W.dtype), flip_stats
 
     @torch.no_grad()
     def search_best_scale(self, name, module):
@@ -440,7 +459,7 @@ class StandardHeuristicAWQQuantizerXL:
             W_scaled = W_chunk * best_scales.unsqueeze(0)
             scaled_act_mean = raw_mean / best_scales
 
-            W_quant, num_flips = self.quantize_weight_heuristic_groupwise(
+            W_quant, flip_stats = self.quantize_weight_heuristic_groupwise(
                 W_scaled,
                 scaled_act_mean,
                 apply_heuristic=self.use_heuristic
@@ -452,7 +471,7 @@ class StandardHeuristicAWQQuantizerXL:
                 'alpha': best_alpha,
                 'error': best_error,
                 'scales': best_scales,
-                'num_flips': num_flips
+                'flip_stats': flip_stats
             })
 
             # Cleanup
@@ -466,26 +485,34 @@ class StandardHeuristicAWQQuantizerXL:
         # Store average statistics
         avg_alpha = np.mean([s['alpha'] for s in chunk_stats])
         avg_error = np.mean([s['error'] for s in chunk_stats])
-        total_flips = sum([s['num_flips'] for s in chunk_stats])
+
+        # Aggregate flip statistics
+        total_flips = sum([s['flip_stats']['total'] for s in chunk_stats])
+        avg_per_channel_mean = np.mean([s['flip_stats']['per_channel_mean'] for s in chunk_stats])
+        avg_per_channel_median = np.mean([s['flip_stats']['per_channel_median'] for s in chunk_stats])
 
         # Build detailed stats dict
         stats_dict = {
             'scales': chunk_stats[0]['scales'].cpu(),  # Use first chunk's scales
             'alpha': avg_alpha,
             'error': avg_error,
-            'num_flips': total_flips,  # Total flips across all chunks
+            'flip_stats': {
+                'total': total_flips,
+                'per_channel_mean': avg_per_channel_mean,
+                'per_channel_median': avg_per_channel_median
+            }
         }
         for i, stat in enumerate(chunk_stats):
             stats_dict[f'alpha_chunk{i+1}'] = stat['alpha']
             stats_dict[f'error_chunk{i+1}'] = stat['error']
-            stats_dict[f'flips_chunk{i+1}'] = stat['num_flips']
+            stats_dict[f'flips_chunk{i+1}'] = stat['flip_stats']['total']
 
         self.layer_scales[name] = stats_dict
 
         # Print summary
         alpha_str = ', '.join([f'α_{i+1}={s["alpha"]:.4f}' for i, s in enumerate(chunk_stats)])
         error_str = ', '.join([f'err_{i+1}={s["error"]:.8f}' for i, s in enumerate(chunk_stats)])
-        flips_str = ', '.join([f'flips_{i+1}={s["num_flips"]:,}' for i, s in enumerate(chunk_stats)])
+        flips_str = ', '.join([f'flips_{i+1}={s["flip_stats"]["total"]:,}' for i, s in enumerate(chunk_stats)])
         print(f"     ✓ Done: {alpha_str}")
         print(f"             {error_str}")
         print(f"             {flips_str}")
@@ -508,7 +535,7 @@ class StandardHeuristicAWQQuantizerXL:
         else:
             scaled_act_mean = torch.zeros(W.shape[1], device=W.device, dtype=W.dtype)
 
-        W_quant, num_flips = self.quantize_weight_heuristic_groupwise(
+        W_quant, flip_stats = self.quantize_weight_heuristic_groupwise(
             W_scaled,
             scaled_act_mean,
             apply_heuristic=self.use_heuristic
@@ -521,7 +548,7 @@ class StandardHeuristicAWQQuantizerXL:
             'scales': best_scales.cpu(),
             'alpha': best_alpha,
             'error': best_error,
-            'num_flips': num_flips
+            'flip_stats': flip_stats
         }
 
         del best_scales, scaled_act_mean, W_scaled, W_quant, W_final
@@ -643,18 +670,29 @@ class StandardHeuristicAWQQuantizerXL:
             print(f"  Mean: {np.mean(alphas):.3f}")
             print(f"  Median: {np.median(alphas):.3f}")
 
-            if self.use_heuristic and num_flips_list:
-                mean_flips = np.mean(num_flips_list)
-                median_flips = np.median(num_flips_list)
-                min_flips = np.min(num_flips_list)
-                max_flips = np.max(num_flips_list)
-                total_flips = np.sum(num_flips_list)
+            if self.use_heuristic:
+                # Collect flip statistics
+                flip_totals = [info.get('flip_stats', {}).get('total', 0) for info in self.layer_scales.values()]
+                per_ch_means = [info.get('flip_stats', {}).get('per_channel_mean', 0) for info in self.layer_scales.values()]
+                per_ch_medians = [info.get('flip_stats', {}).get('per_channel_median', 0) for info in self.layer_scales.values()]
+
+                total_flips = np.sum(flip_totals)
+                mean_flips_per_layer = np.mean(flip_totals)
+                median_flips_per_layer = np.median(flip_totals)
+                min_flips = np.min(flip_totals)
+                max_flips = np.max(flip_totals)
+
+                avg_per_ch_mean = np.mean(per_ch_means)
+                avg_per_ch_median = np.mean(per_ch_medians)
 
                 print(f"\nWeight Flipping Statistics:")
                 print(f"  Total flips across all layers: {int(total_flips):,}")
-                print(f"  Mean flips per layer: {mean_flips:,.1f}")
-                print(f"  Median flips per layer: {median_flips:,.1f}")
+                print(f"  Mean flips per layer: {mean_flips_per_layer:,.1f}")
+                print(f"  Median flips per layer: {median_flips_per_layer:,.1f}")
                 print(f"  Min: {int(min_flips):,} | Max: {int(max_flips):,}")
+                print(f"\n  Per-Channel Statistics (averaged across layers):")
+                print(f"    Mean flips per channel: {avg_per_ch_mean:.2f}")
+                print(f"    Median flips per channel: {avg_per_ch_median:.2f}")
 
 
 def main():
