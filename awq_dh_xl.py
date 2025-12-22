@@ -98,11 +98,12 @@ def find_knee_point(values, tolerance_offset=0.0):
 
     # Apply tolerance offset
     # Offset moves the threshold higher (more conservative with outliers)
-    if tolerance_offset > 0 and knee_idx < n - 1:
+    if knee_idx < n - 1:
         # Calculate how many indices to shift based on offset
         # offset is a fraction of the range
         offset_indices = int(tolerance_offset * n)
         knee_idx = min(knee_idx + offset_indices, n - 1)
+        knee_idx = max(knee_idx, 0)
 
     return knee_idx
 
