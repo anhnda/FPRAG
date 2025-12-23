@@ -915,9 +915,9 @@ def main():
                        help="Enable heuristic rounding (default: True)")
     parser.add_argument("--no-heuristic", dest="use_heuristic", action="store_false",
                        help="Disable heuristic rounding")
-    parser.add_argument("--knee-tolerance", type=float, default=0.0001,
+    parser.add_argument("--knee-tolerance", type=float, default=0.000,
                        help="Tolerance offset for knee point (default: 0.1, higher = more conservative)")
-    parser.add_argument("--max-flip-percent", type=float, default=0.05,
+    parser.add_argument("--max-flip-percent", type=float, default=0.01,
                        help="Max percentage of channel size that can be flipped (default: 0.05 = 5%%)")
     parser.add_argument("--max-tokens-per-sample", type=int, default=2048,
                        help="Max tokens to store per sample (default: 2048)")
