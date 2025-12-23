@@ -370,10 +370,17 @@ class DynamicHeuristicAWQQuantizerXL:
             # Count flips per input channel (sum across output dimension)
             flips_per_channel = unsorted_flips.sum(dim=0)  # [padded_in_features]
 
+            # Debug: Track before limiting
+            flips_before_limiting = flips_per_channel.clone()
+            max_before = flips_before_limiting[:in_features].max().item()
+
             # Identify channels exceeding the limit
             channels_to_limit = (flips_per_channel > max_flips_allowed).nonzero(as_tuple=True)[0]
 
             if len(channels_to_limit) > 0:
+                if debug:
+                    print(f"    DEBUG: Limiting {len(channels_to_limit)} channels (max_allowed={max_flips_allowed}, max_before={max_before:.0f})")
+
                 # Unsort flip impacts to match original order
                 unsorted_impacts = torch.zeros(out_features, padded_in_features, device=device, dtype=flip_impacts.dtype)
                 unsorted_impacts.scatter_(1, sorted_indices, sorted_impacts)
@@ -395,6 +402,11 @@ class DynamicHeuristicAWQQuantizerXL:
 
                 # Convert back to sorted order
                 final_flips_sorted = torch.gather(unsorted_flips, 1, sorted_indices)
+
+                if debug:
+                    flips_after_limiting = unsorted_flips.sum(dim=0)[:in_features]
+                    max_after = flips_after_limiting.max().item()
+                    print(f"    DEBUG: After limiting: max_flips_per_channel={max_after:.0f} (should be <={max_flips_allowed})")
 
         sorted_flip_dir = torch.gather(flip_dir, 1, sorted_indices)
         sorted_flip_dir[~final_flips_sorted] = 0.0
@@ -418,9 +430,16 @@ class DynamicHeuristicAWQQuantizerXL:
 
         # Check if limiting was applied
         num_channels_limited = 0
+        actual_max_flips = flips_per_channel.max().item()
         if self.max_flips_per_channel_pct is not None and self.max_flips_per_channel_pct > 0:
             max_flips_allowed = max(1, int(out_features * self.max_flips_per_channel_pct))
             num_channels_limited = (flips_per_channel > max_flips_allowed).sum().item()
+            # Sanity check: if we limited channels, max should be <= max_allowed
+            if num_channels_limited > 0 and debug:
+                print(f"    DEBUG STATS: max_flips_allowed={max_flips_allowed}, actual_max={actual_max_flips:.0f}, "
+                      f"channels_over_limit={num_channels_limited}")
+                if actual_max_flips > max_flips_allowed:
+                    print(f"    ⚠️  WARNING: Max flips ({actual_max_flips:.0f}) exceeds limit ({max_flips_allowed})!")
 
         # Compute comprehensive statistics
         flip_stats = {
