@@ -111,7 +111,7 @@ def find_knee_point(values, tolerance_offset=0.0):
 class DynamicHeuristicAWQQuantizerXL:
     def __init__(self, model, tokenizer, device="cuda", bits=4, n_grid=20,
                  group_size=128, use_heuristic=True, knee_tolerance=0.1, max_tokens_per_sample=512,
-                 layer_batch_size=16, lmhead_chunks=4, max_flip_percent=0.05):
+                 layer_batch_size=16, lmhead_chunks=4):
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
@@ -123,7 +123,6 @@ class DynamicHeuristicAWQQuantizerXL:
         self.max_tokens_per_sample = max_tokens_per_sample
         self.layer_batch_size = layer_batch_size
         self.lmhead_chunks = lmhead_chunks
-        self.max_flip_percent = max_flip_percent  # Max percentage of channel size that can be flipped
 
         # Storage for activations
         self.activation_data = {}
@@ -139,7 +138,6 @@ class DynamicHeuristicAWQQuantizerXL:
         if use_heuristic:
             print(f"  Outlier detection: DYNAMIC (Kneedle algorithm on sorted E[X])")
             print(f"  Knee tolerance offset: {knee_tolerance:.8f}")
-            print(f"  Max flip percent per channel: {max_flip_percent*100:.1f}%")
             print(f"  Quantization: HEURISTIC-GUIDED GROUP-WISE ASYMMETRIC [0, {2**bits - 1}]")
         else:
             print(f"  Quantization: STANDARD GROUP-WISE ASYMMETRIC [0, {2**bits - 1}]")
@@ -346,10 +344,6 @@ class DynamicHeuristicAWQQuantizerXL:
         error_unsqueezed = torch.abs(current_error).unsqueeze(1)
         all_residuals = torch.cat([error_unsqueezed, residuals], dim=1)
         best_k = torch.argmin(all_residuals, dim=1)
-
-        # --- Constraint: Limit flips per channel to max_flip_percent of channel size ---
-        max_flips_per_channel = int(self.max_flip_percent * in_features)
-        best_k = torch.clamp(best_k, max=max_flips_per_channel)
 
         # --- 5. Apply Flips ---
         idx_range = torch.arange(padded_in_features, device=device).unsqueeze(0)
@@ -910,8 +904,6 @@ def main():
                        help="Disable heuristic rounding")
     parser.add_argument("--knee-tolerance", type=float, default=0.0001,
                        help="Tolerance offset for knee point (default: 0.1, higher = more conservative)")
-    parser.add_argument("--max-flip-percent", type=float, default=0.05,
-                       help="Max percentage of channel size that can be flipped (default: 0.05 = 5%%)")
     parser.add_argument("--max-tokens-per-sample", type=int, default=2048,
                        help="Max tokens to store per sample (default: 2048)")
     parser.add_argument("--layer-batch-size", type=int, default=16,
@@ -947,7 +939,6 @@ def main():
     print(f"Use heuristic: {args.use_heuristic}")
     print(f"Dynamic outlier detection: Kneedle algorithm")
     print(f"Knee tolerance offset: {args.knee_tolerance}")
-    print(f"Max flip percent per channel: {args.max_flip_percent*100:.1f}%")
     print(f"Special: lm_head split into {args.lmhead_chunks} chunks")
     print("=" * 80)
 
@@ -986,8 +977,7 @@ def main():
         knee_tolerance=args.knee_tolerance,
         max_tokens_per_sample=args.max_tokens_per_sample,
         layer_batch_size=args.layer_batch_size,
-        lmhead_chunks=args.lmhead_chunks,
-        max_flip_percent=args.max_flip_percent
+        lmhead_chunks=args.lmhead_chunks
     )
 
     # Use batched sequential quantization (optimal memory/speed balance)
