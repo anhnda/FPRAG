@@ -347,19 +347,6 @@ class DynamicHeuristicAWQQuantizerXL:
         all_residuals = torch.cat([error_unsqueezed, residuals], dim=1)
         best_k = torch.argmin(all_residuals, dim=1)
 
-        # --- Constraint: Limit ACTUAL flips (ignoring masked outliers) to max_flip_percent ---
-        # Max flips based on ORIGINAL channel size (not valid count)
-        max_flips_per_channel = int(self.max_flip_percent * in_features)
-
-        # Find cutoff k such that cumulative NON-MASKED flips <= max_flips
-        # Ignore masked outliers, only count actual flips
-        cumsum_valid = torch.cumsum(sorted_validity, dim=1)  # [out_features, padded_in_features]
-        within_limit = cumsum_valid <= max_flips_per_channel
-        cutoff_k = within_limit.sum(dim=1)  # Largest k where cumsum_valid[k] <= max_flips
-
-        # Apply cutoff constraint
-        best_k = torch.minimum(best_k, cutoff_k)
-
         # --- 5. Apply Flips ---
         idx_range = torch.arange(padded_in_features, device=device).unsqueeze(0)
         flip_mask_sorted = idx_range < best_k.unsqueeze(1)
@@ -367,6 +354,13 @@ class DynamicHeuristicAWQQuantizerXL:
 
         sorted_flip_dir = torch.gather(flip_dir, 1, sorted_indices)
         sorted_flip_dir[~final_flips_sorted] = 0.0
+
+        # --- Constraint: Limit actual flips (ignoring masked outliers) to max_flip_percent ---
+        # Count cumulative non-masked flips and truncate beyond max limit
+        max_flips_per_channel = int(self.max_flip_percent * in_features)
+        cumsum_actual_flips = final_flips_sorted.long().cumsum(dim=1)
+        within_limit = cumsum_actual_flips <= max_flips_per_channel
+        sorted_flip_dir[~within_limit] = 0.0
 
         W_int.scatter_add_(1, sorted_indices, sorted_flip_dir)
         W_int.clamp_(0, max_int)
