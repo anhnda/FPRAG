@@ -347,9 +347,18 @@ class DynamicHeuristicAWQQuantizerXL:
         all_residuals = torch.cat([error_unsqueezed, residuals], dim=1)
         best_k = torch.argmin(all_residuals, dim=1)
 
-        # --- Constraint: Limit flips per channel to max_flip_percent of channel size ---
+        # --- Constraint: Limit ACTUAL flips (ignoring masked outliers) to max_flip_percent ---
+        # Max flips based on ORIGINAL channel size (not valid count)
         max_flips_per_channel = int(self.max_flip_percent * in_features)
-        best_k = torch.clamp(best_k, max=max_flips_per_channel)
+
+        # Find cutoff k such that cumulative NON-MASKED flips <= max_flips
+        # Ignore masked outliers, only count actual flips
+        cumsum_valid = torch.cumsum(sorted_validity, dim=1)  # [out_features, padded_in_features]
+        within_limit = cumsum_valid <= max_flips_per_channel
+        cutoff_k = within_limit.sum(dim=1)  # Largest k where cumsum_valid[k] <= max_flips
+
+        # Apply cutoff constraint
+        best_k = torch.minimum(best_k, cutoff_k)
 
         # --- 5. Apply Flips ---
         idx_range = torch.arange(padded_in_features, device=device).unsqueeze(0)
