@@ -267,6 +267,14 @@ class DynamicHeuristicAWQQuantizerXL:
         out_features, in_features = W.shape
         device = W.device
 
+        # DEBUG: Print limiting config for first layer
+        if debug:
+            print(f"    DEBUG CONFIG: max_flips_per_channel_pct={self.max_flips_per_channel_pct}")
+            print(f"    DEBUG CONFIG: out_features={out_features}, in_features={in_features}")
+            if self.max_flips_per_channel_pct is not None and self.max_flips_per_channel_pct > 0:
+                expected_max = int(out_features * self.max_flips_per_channel_pct)
+                print(f"    DEBUG CONFIG: Expected max_allowed={expected_max}")
+
         # --- 1. Pre-processing / Padding ---
         n_groups = (in_features + self.group_size - 1) // self.group_size
         padded_in_features = n_groups * self.group_size
@@ -360,6 +368,7 @@ class DynamicHeuristicAWQQuantizerXL:
         final_flips_sorted = flip_mask_sorted & (sorted_validity.bool())
 
         # --- 5.5. Enforce Per-Channel Flip Limit ---
+        num_channels_limited_in_layer = 0
         if self.max_flips_per_channel_pct is not None and self.max_flips_per_channel_pct > 0:
             max_flips_allowed = max(1, int(out_features * self.max_flips_per_channel_pct))
 
@@ -376,10 +385,12 @@ class DynamicHeuristicAWQQuantizerXL:
 
             # Identify channels exceeding the limit
             channels_to_limit = (flips_per_channel > max_flips_allowed).nonzero(as_tuple=True)[0]
+            num_channels_limited_in_layer = len(channels_to_limit)
 
             if len(channels_to_limit) > 0:
                 if debug:
                     print(f"    DEBUG: Limiting {len(channels_to_limit)} channels (max_allowed={max_flips_allowed}, max_before={max_before:.0f})")
+                    print(f"    DEBUG: out_features={out_features}, limit_pct={self.max_flips_per_channel_pct*100:.1f}%")
 
                 # Unsort flip impacts to match original order
                 unsorted_impacts = torch.zeros(out_features, padded_in_features, device=device, dtype=flip_impacts.dtype)
@@ -424,6 +435,13 @@ class DynamicHeuristicAWQQuantizerXL:
         unsorted_flips_final.scatter_(1, sorted_indices, final_flips_sorted)
         flips_per_channel = unsorted_flips_final.sum(dim=0).float()  # [padded_in_features]
 
+        # DEBUG: Print detailed flip distribution for first layer
+        if debug:
+            print(f"    DEBUG STATS: total_flips={num_flips_total}")
+            print(f"    DEBUG STATS: flips_per_channel shape={flips_per_channel.shape}")
+            print(f"    DEBUG STATS: non-zero channels={(flips_per_channel > 0).sum().item()}/{padded_in_features}")
+            print(f"    DEBUG STATS: max_flips={flips_per_channel.max().item():.0f}, median={flips_per_channel.median().item():.2f}")
+
         # Only consider actual channels (not padding)
         if padded_in_features > in_features:
             flips_per_channel = flips_per_channel[:in_features]
@@ -459,8 +477,14 @@ class DynamicHeuristicAWQQuantizerXL:
             'per_channel_zero_pct': (flips_per_channel == 0).float().mean().item() * 100,
             # Limiting statistics
             'num_channels_limited': num_channels_limited,
+            'num_channels_limited_in_layer': num_channels_limited_in_layer,
             'max_allowed_per_channel': max_flips_allowed if self.max_flips_per_channel_pct is not None and self.max_flips_per_channel_pct > 0 else None
         }
+
+        # ALWAYS print limiting info for first few layers to verify it's working
+        if debug and self.max_flips_per_channel_pct is not None and self.max_flips_per_channel_pct > 0:
+            print(f"    LIMIT VERIFICATION: max_allowed={max_flips_allowed}, actual_max={actual_max_flips:.0f}, "
+                  f"limited={num_channels_limited_in_layer} channels, pct={self.max_flips_per_channel_pct*100:.1f}%")
 
         # --- 7. Dequantize & Return ---
         W_dequant = (W_int - zp_flat) * scale_flat
@@ -975,10 +999,24 @@ class DynamicHeuristicAWQQuantizerXL:
                 print(f"\n    Channels with 0 flips: {avg_per_ch_zero_pct:.1f}%")
 
                 if self.max_flips_per_channel_pct is not None and self.max_flips_per_channel_pct > 0:
+                    # Calculate per-layer limits to show range
+                    max_allowed_per_layer = [info.get('flip_stats', {}).get('max_allowed_per_channel', 0)
+                                            for info in self.layer_scales.values()
+                                            if info.get('flip_stats', {}).get('max_allowed_per_channel') is not None]
+
                     print(f"\n  Per-Channel Limiting:")
-                    print(f"    Max allowed flips per channel: {self.max_flips_per_channel_pct*100:.1f}% of output features")
+                    print(f"    Target limit: {self.max_flips_per_channel_pct*100:.1f}% of output features PER LAYER")
+                    if max_allowed_per_layer:
+                        print(f"    Actual limits: min={min(max_allowed_per_layer)} to max={max(max_allowed_per_layer)} (varies by layer size)")
+                    print(f"    Avg max flips per channel: {avg_per_ch_max:.2f} (should be ≤ layer's limit)")
                     print(f"    Total channels limited: {int(total_channels_limited):,}")
                     print(f"    Layers with limited channels: {sum(1 for x in channels_limited if x > 0)}/{len(channels_limited)}")
+
+                    # Verification
+                    if max_allowed_per_layer and avg_per_ch_max > max(max_allowed_per_layer) * 1.01:
+                        print(f"    ⚠️  WARNING: Average max ({avg_per_ch_max:.1f}) exceeds maximum limit ({max(max_allowed_per_layer)})!")
+                    else:
+                        print(f"    ✓ Limiting working correctly")
 
 
 def main():
