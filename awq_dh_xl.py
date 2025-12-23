@@ -352,31 +352,19 @@ class DynamicHeuristicAWQQuantizerXL:
         flip_mask_sorted = idx_range < best_k.unsqueeze(1)
         final_flips_sorted = flip_mask_sorted & (sorted_validity.bool())
 
-        # --- Constraint: Limit flips per INPUT channel (column W[:,k]) to max_flip_percent ---
-        # Convert flips back to original order to count per column
-        original_flips = torch.zeros_like(final_flips_sorted, dtype=torch.bool)
-        original_flips.scatter_(1, sorted_indices, final_flips_sorted)
+        # --- Constraint: Limit flips per OUTPUT channel (row W[i,:]) to max_flip_percent ---
+        # For each output neuron i, limit flips in W[i,:] to max_flip_percent * in_features
+        # This is already in sorted order, so we can apply directly
 
-        # Vectorized constraint: For each column, keep only top max_flips_per_input by rounding cost
-        max_flips_per_input = int(self.max_flip_percent * out_features)
-
-        # Sort rows by rounding cost for each column (descending = most significant first)
-        sorted_row_indices_per_col = torch.argsort(rounding_costs, dim=0, descending=True)  # [out_features, in_features]
-
-        # Create rank matrix: rank[i,k] = rank of row i in column k (0 = highest cost)
-        rank_matrix = torch.zeros_like(rounding_costs, dtype=torch.long, device=device)
-        row_arange = torch.arange(out_features, device=device).unsqueeze(1).expand(out_features, in_features)
-        rank_matrix.scatter_(0, sorted_row_indices_per_col, row_arange)
-
-        # Keep flips where rank < max_flips_per_input
-        original_flips = original_flips & (rank_matrix < max_flips_per_input)
-
-        # Convert back to sorted order
-        final_flips_sorted = torch.gather(original_flips, 1, sorted_indices)
-
-        # Apply flip directions
+        # Apply flip directions first
         sorted_flip_dir = torch.gather(flip_dir, 1, sorted_indices)
         sorted_flip_dir[~final_flips_sorted] = 0.0
+
+        # Constraint: Keep only top max_flips_per_output flips per row (ignoring masked outliers)
+        max_flips_per_output = int(self.max_flip_percent * in_features)
+        cumsum_flips = final_flips_sorted.long().cumsum(dim=1)  # Cumulative count along row
+        within_limit = cumsum_flips <= max_flips_per_output
+        sorted_flip_dir[~within_limit] = 0.0
 
         W_int.scatter_add_(1, sorted_indices, sorted_flip_dir)
         W_int.clamp_(0, max_int)
