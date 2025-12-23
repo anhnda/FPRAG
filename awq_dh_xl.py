@@ -8,6 +8,7 @@ Key Features:
 - SPECIAL: Splits lm_head into chunks to avoid OOM
 - L2 salience metric
 - **DYNAMIC OUTLIER DETECTION**: Uses Kneedle algorithm on sorted E[X] instead of fixed percent
+- **PER-CHANNEL FLIP LIMITING**: Limits max flips per input channel (default: 5% of output features)
 - Batched sequential quantization
 
 Dynamic Outlier Detection:
@@ -16,6 +17,12 @@ Dynamic Outlier Detection:
 - Add tolerance/offset to the knee point as anchor
 - Channels above anchor are considered outliers
 - More adaptive to the actual activation distribution per layer
+
+Per-Channel Flip Limiting:
+- Prevents any single input channel from having too many flipped weights
+- Default: max 5% of output features can be flipped for each input channel
+- When limit exceeded, removes flips with smallest absolute impact
+- Helps prevent instability from excessive per-channel perturbations
 """
 
 import torch
@@ -111,7 +118,7 @@ def find_knee_point(values, tolerance_offset=0.0):
 class DynamicHeuristicAWQQuantizerXL:
     def __init__(self, model, tokenizer, device="cuda", bits=4, n_grid=20,
                  group_size=128, use_heuristic=True, knee_tolerance=0.1, max_tokens_per_sample=512,
-                 layer_batch_size=16, lmhead_chunks=4):
+                 layer_batch_size=16, lmhead_chunks=4, max_flips_per_channel_pct=0.05):
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
@@ -123,6 +130,7 @@ class DynamicHeuristicAWQQuantizerXL:
         self.max_tokens_per_sample = max_tokens_per_sample
         self.layer_batch_size = layer_batch_size
         self.lmhead_chunks = lmhead_chunks
+        self.max_flips_per_channel_pct = max_flips_per_channel_pct
 
         # Storage for activations
         self.activation_data = {}
@@ -138,6 +146,7 @@ class DynamicHeuristicAWQQuantizerXL:
         if use_heuristic:
             print(f"  Outlier detection: DYNAMIC (Kneedle algorithm on sorted E[X])")
             print(f"  Knee tolerance offset: {knee_tolerance:.8f}")
+            print(f"  Max flips per channel: {max_flips_per_channel_pct*100:.1f}% of output features")
             print(f"  Quantization: HEURISTIC-GUIDED GROUP-WISE ASYMMETRIC [0, {2**bits - 1}]")
         else:
             print(f"  Quantization: STANDARD GROUP-WISE ASYMMETRIC [0, {2**bits - 1}]")
@@ -350,6 +359,43 @@ class DynamicHeuristicAWQQuantizerXL:
         flip_mask_sorted = idx_range < best_k.unsqueeze(1)
         final_flips_sorted = flip_mask_sorted & (sorted_validity.bool())
 
+        # --- 5.5. Enforce Per-Channel Flip Limit ---
+        if self.max_flips_per_channel_pct is not None and self.max_flips_per_channel_pct > 0:
+            max_flips_allowed = max(1, int(out_features * self.max_flips_per_channel_pct))
+
+            # Unsort flips to original input feature order
+            unsorted_flips = torch.zeros(out_features, padded_in_features, dtype=torch.bool, device=device)
+            unsorted_flips.scatter_(1, sorted_indices, final_flips_sorted)
+
+            # Count flips per input channel (sum across output dimension)
+            flips_per_channel = unsorted_flips.sum(dim=0)  # [padded_in_features]
+
+            # Identify channels exceeding the limit
+            channels_to_limit = (flips_per_channel > max_flips_allowed).nonzero(as_tuple=True)[0]
+
+            if len(channels_to_limit) > 0:
+                # Unsort flip impacts to match original order
+                unsorted_impacts = torch.zeros(out_features, padded_in_features, device=device, dtype=flip_impacts.dtype)
+                unsorted_impacts.scatter_(1, sorted_indices, sorted_impacts)
+
+                for ch_idx in channels_to_limit:
+                    # Find all output features that flip this channel
+                    output_features_with_flip = unsorted_flips[:, ch_idx].nonzero(as_tuple=True)[0]
+
+                    # Get absolute impacts for these flips (smaller = less important)
+                    impacts_for_channel = unsorted_impacts[output_features_with_flip, ch_idx].abs()
+
+                    # Sort by impact (ascending - remove smallest first)
+                    sorted_impact_indices = impacts_for_channel.argsort()
+
+                    # Remove smallest impacts until under the limit
+                    num_to_remove = int(flips_per_channel[ch_idx].item() - max_flips_allowed)
+                    indices_to_remove = output_features_with_flip[sorted_impact_indices[:num_to_remove]]
+                    unsorted_flips[indices_to_remove, ch_idx] = False
+
+                # Convert back to sorted order
+                final_flips_sorted = torch.gather(unsorted_flips, 1, sorted_indices)
+
         sorted_flip_dir = torch.gather(flip_dir, 1, sorted_indices)
         sorted_flip_dir[~final_flips_sorted] = 0.0
 
@@ -361,11 +407,20 @@ class DynamicHeuristicAWQQuantizerXL:
         num_flips_total = final_flips_sorted.sum().item()
 
         # Per-channel flip statistics (sum across output dimension)
-        flips_per_channel = final_flips_sorted.sum(dim=0).float()  # [padded_in_features]
+        # Need to unsort to get actual per-input-channel statistics
+        unsorted_flips_final = torch.zeros(out_features, padded_in_features, dtype=torch.bool, device=device)
+        unsorted_flips_final.scatter_(1, sorted_indices, final_flips_sorted)
+        flips_per_channel = unsorted_flips_final.sum(dim=0).float()  # [padded_in_features]
 
         # Only consider actual channels (not padding)
         if padded_in_features > in_features:
             flips_per_channel = flips_per_channel[:in_features]
+
+        # Check if limiting was applied
+        num_channels_limited = 0
+        if self.max_flips_per_channel_pct is not None and self.max_flips_per_channel_pct > 0:
+            max_flips_allowed = max(1, int(out_features * self.max_flips_per_channel_pct))
+            num_channels_limited = (flips_per_channel > max_flips_allowed).sum().item()
 
         # Compute comprehensive statistics
         flip_stats = {
@@ -382,7 +437,10 @@ class DynamicHeuristicAWQQuantizerXL:
             'per_channel_p95': torch.quantile(flips_per_channel, 0.95).item(),
             'per_channel_p99': torch.quantile(flips_per_channel, 0.99).item(),
             # Percentage with 0 flips
-            'per_channel_zero_pct': (flips_per_channel == 0).float().mean().item() * 100
+            'per_channel_zero_pct': (flips_per_channel == 0).float().mean().item() * 100,
+            # Limiting statistics
+            'num_channels_limited': num_channels_limited,
+            'max_allowed_per_channel': max_flips_allowed if self.max_flips_per_channel_pct is not None and self.max_flips_per_channel_pct > 0 else None
         }
 
         # --- 7. Dequantize & Return ---
@@ -854,6 +912,7 @@ class DynamicHeuristicAWQQuantizerXL:
                 flip_totals = [info.get('flip_stats', {}).get('total', 0) for info in self.layer_scales.values()]
                 per_ch_means = [info.get('flip_stats', {}).get('per_channel_mean', 0) for info in self.layer_scales.values()]
                 per_ch_medians = [info.get('flip_stats', {}).get('per_channel_median', 0) for info in self.layer_scales.values()]
+                per_ch_maxs = [info.get('flip_stats', {}).get('per_channel_max', 0) for info in self.layer_scales.values()]
                 per_ch_stds = [info.get('flip_stats', {}).get('per_channel_std', 0) for info in self.layer_scales.values()]
                 per_ch_p25s = [info.get('flip_stats', {}).get('per_channel_p25', 0) for info in self.layer_scales.values()]
                 per_ch_p75s = [info.get('flip_stats', {}).get('per_channel_p75', 0) for info in self.layer_scales.values()]
@@ -861,6 +920,7 @@ class DynamicHeuristicAWQQuantizerXL:
                 per_ch_p95s = [info.get('flip_stats', {}).get('per_channel_p95', 0) for info in self.layer_scales.values()]
                 per_ch_p99s = [info.get('flip_stats', {}).get('per_channel_p99', 0) for info in self.layer_scales.values()]
                 per_ch_zero_pcts = [info.get('flip_stats', {}).get('per_channel_zero_pct', 0) for info in self.layer_scales.values()]
+                channels_limited = [info.get('flip_stats', {}).get('num_channels_limited', 0) for info in self.layer_scales.values()]
 
                 total_flips = np.sum(flip_totals)
                 mean_flips_per_layer = np.mean(flip_totals)
@@ -870,6 +930,7 @@ class DynamicHeuristicAWQQuantizerXL:
 
                 avg_per_ch_mean = np.mean(per_ch_means)
                 avg_per_ch_median = np.mean(per_ch_medians)
+                avg_per_ch_max = np.mean(per_ch_maxs)
                 avg_per_ch_std = np.mean(per_ch_stds)
                 avg_per_ch_p25 = np.mean(per_ch_p25s)
                 avg_per_ch_p75 = np.mean(per_ch_p75s)
@@ -877,6 +938,7 @@ class DynamicHeuristicAWQQuantizerXL:
                 avg_per_ch_p95 = np.mean(per_ch_p95s)
                 avg_per_ch_p99 = np.mean(per_ch_p99s)
                 avg_per_ch_zero_pct = np.mean(per_ch_zero_pcts)
+                total_channels_limited = np.sum(channels_limited)
 
                 print(f"\nWeight Flipping Statistics:")
                 print(f"  Total flips across all layers: {int(total_flips):,}")
@@ -886,11 +948,18 @@ class DynamicHeuristicAWQQuantizerXL:
                 print(f"\n  Per-Channel Statistics (averaged across layers):")
                 print(f"    Mean flips per channel: {avg_per_ch_mean:.2f}")
                 print(f"    Median flips per channel: {avg_per_ch_median:.2f}")
+                print(f"    Max flips per channel: {avg_per_ch_max:.2f}")
                 print(f"    Std dev: {avg_per_ch_std:.2f}")
                 print(f"\n    Percentiles:")
                 print(f"      25th: {avg_per_ch_p25:.2f} | 50th: {avg_per_ch_median:.2f} | 75th: {avg_per_ch_p75:.2f}")
                 print(f"      90th: {avg_per_ch_p90:.2f} | 95th: {avg_per_ch_p95:.2f} | 99th: {avg_per_ch_p99:.2f}")
                 print(f"\n    Channels with 0 flips: {avg_per_ch_zero_pct:.1f}%")
+
+                if self.max_flips_per_channel_pct is not None and self.max_flips_per_channel_pct > 0:
+                    print(f"\n  Per-Channel Limiting:")
+                    print(f"    Max allowed flips per channel: {self.max_flips_per_channel_pct*100:.1f}% of output features")
+                    print(f"    Total channels limited: {int(total_channels_limited):,}")
+                    print(f"    Layers with limited channels: {sum(1 for x in channels_limited if x > 0)}/{len(channels_limited)}")
 
 
 def main():
@@ -904,6 +973,8 @@ def main():
                        help="Disable heuristic rounding")
     parser.add_argument("--knee-tolerance", type=float, default=0.0001,
                        help="Tolerance offset for knee point (default: 0.1, higher = more conservative)")
+    parser.add_argument("--max-flips-per-channel-pct", type=float, default=0.05,
+                       help="Max percentage of flips per input channel (default: 0.05 = 5%% of output features)")
     parser.add_argument("--max-tokens-per-sample", type=int, default=2048,
                        help="Max tokens to store per sample (default: 2048)")
     parser.add_argument("--layer-batch-size", type=int, default=16,
@@ -937,8 +1008,10 @@ def main():
     print(f"Group size: {args.group_size}")
     print(f"Layer Batch Size: {args.layer_batch_size}")
     print(f"Use heuristic: {args.use_heuristic}")
-    print(f"Dynamic outlier detection: Kneedle algorithm")
-    print(f"Knee tolerance offset: {args.knee_tolerance}")
+    if args.use_heuristic:
+        print(f"Dynamic outlier detection: Kneedle algorithm")
+        print(f"Knee tolerance offset: {args.knee_tolerance}")
+        print(f"Max flips per channel: {args.max_flips_per_channel_pct*100:.1f}% of output features")
     print(f"Special: lm_head split into {args.lmhead_chunks} chunks")
     print("=" * 80)
 
@@ -977,7 +1050,8 @@ def main():
         knee_tolerance=args.knee_tolerance,
         max_tokens_per_sample=args.max_tokens_per_sample,
         layer_batch_size=args.layer_batch_size,
-        lmhead_chunks=args.lmhead_chunks
+        lmhead_chunks=args.lmhead_chunks,
+        max_flips_per_channel_pct=args.max_flips_per_channel_pct
     )
 
     # Use batched sequential quantization (optimal memory/speed balance)
