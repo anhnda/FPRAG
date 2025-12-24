@@ -1001,8 +1001,8 @@ def main():
                        help="Disable James-Stein mean estimation")
     parser.add_argument("--knee-tolerance", type=float, default=0.000,
                        help="Tolerance offset for knee point (default: 0.000, higher = more conservative)")
-    parser.add_argument("--max-flip-percent", type=float, default=0.01,
-                       help="Max percentage of channel size that can be flipped (default: 0.01 = 1%%)")
+    parser.add_argument("--max-flip-percent", type=float, default=0.05,
+                       help="Max percentage of channel size that can be flipped (default: 0.05 = 5%%)")
     parser.add_argument("--max-tokens-per-sample", type=int, default=2048,
                        help="Max tokens to store per sample (default: 2048)")
     parser.add_argument("--layer-batch-size", type=int, default=16,
