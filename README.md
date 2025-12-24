@@ -124,7 +124,7 @@ Perplexity (↓ lower is better):
 1. **Adaptive outlier detection**: Kneedle algorithm adjusts per layer (vs fixed 5%)
 2. **Flip constraint**: Prevents over-correction (limits to 1% per channel)
 3. **Better optimization**: Global greedy rounding reduces quantization error
-4. **Minimal overhead**: ~10-15% slower than Standard AWQ, but better quality
+
 
 ## Hardware Requirements
 
