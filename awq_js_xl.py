@@ -991,6 +991,7 @@ def main():
     parser.add_argument("--n-calib", type=int, default=128, help="Number of calibration samples")
     parser.add_argument("--n-grid", type=int, default=20)
     parser.add_argument("--group-size", type=int, default=128)
+    parser.add_argument("--bits", type=int, default=4, choices=[3, 4], help="Quantization bit width (default: 4)")
     parser.add_argument("--use-heuristic", action="store_true", default=True,
                        help="Enable heuristic rounding (default: True)")
     parser.add_argument("--no-heuristic", dest="use_heuristic", action="store_false",
@@ -1071,7 +1072,7 @@ def main():
         model=model,
         tokenizer=tokenizer,
         device=device,
-        bits=4,
+        bits=args.bits,
         n_grid=args.n_grid,
         group_size=args.group_size,
         use_heuristic=args.use_heuristic,

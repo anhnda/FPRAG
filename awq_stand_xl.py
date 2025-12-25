@@ -71,7 +71,7 @@ class GroupWiseAWQAsymmetricL2Quantizer:
         print(f"  Grid search points: {n_grid}")
         print(f"  Group size: {group_size}")
         print(f"  Token subsampling: {max_tokens_per_sample} tokens/sample (memory optimization)")
-        print(f"  Quantization: GROUP-WISE ASYMMETRIC [0, 15]")
+        print(f"  Quantization: GROUP-WISE ASYMMETRIC [0, {2**bits - 1}]")
         print(f"  Salience metric: E[X²] (L2 norm) - Better MSE alignment")
         print(f"  Special: lm_head split into {lmhead_chunks} chunks to avoid OOM")
 
@@ -126,12 +126,13 @@ class GroupWiseAWQAsymmetricL2Quantizer:
         W_max = W_grouped.max(dim=2, keepdim=True)[0]
 
         # Asymmetric quantization parameters
-        scale = (W_max - W_min) / 15.0
+        max_int = 2**self.bits - 1
+        scale = (W_max - W_min) / max_int
         scale = scale.clamp(min=1e-8)
-        zero_point = torch.round(-W_min / scale).clamp(0, 15)
+        zero_point = torch.round(-W_min / scale).clamp(0, max_int)
 
-        # Quantize to [0, 15]
-        W_int = torch.round(W_grouped / scale + zero_point).clamp(0, 15)
+        # Quantize to [0, max_int]
+        W_int = torch.round(W_grouped / scale + zero_point).clamp(0, max_int)
 
         # Dequantize
         W_dequant_grouped = (W_int - zero_point) * scale
@@ -601,6 +602,7 @@ def main():
     parser.add_argument("--n-calib", type=int, default=128, help="Calibration samples")
     parser.add_argument("--n-grid", type=int, default=20, help="Grid search points")
     parser.add_argument("--group-size", type=int, default=128, help="Group size for quantization")
+    parser.add_argument("--bits", type=int, default=4, choices=[3, 4], help="Quantization bit width (default: 4)")
     parser.add_argument("--max-tokens-per-sample", type=int, default=2048,
                        help="Max tokens to store per sample. Lower this if OOM.")
     parser.add_argument("--output-dir", type=str, default="./quantized_models/model_gw_awq_asym_l2_xl",
@@ -673,7 +675,7 @@ def main():
         model=model,
         tokenizer=tokenizer,
         device=device,
-        bits=4,
+        bits=args.bits,
         n_grid=args.n_grid,
         group_size=args.group_size,
         max_tokens_per_sample=args.max_tokens_per_sample,
