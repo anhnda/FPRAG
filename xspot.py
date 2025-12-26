@@ -371,8 +371,8 @@ class JamesSteinGQAExporter:
 
 def main():
     parser = argparse.ArgumentParser(description='Export James-Stein estimates and GQA group weights')
-    parser.add_argument('--model-path', type=str, default='openbmb/MiniCPM-2B-sft-bf16',
-                        help='Model name or path')
+    parser.add_argument('--model-path', type=str, default='./models/Llama-3-8B',
+                        help='Model name or path (default: ./models/Llama-3-8B)')
     parser.add_argument('--layer-id', type=int, default=0,
                         help='Layer index (default: 0)')
     parser.add_argument('--group-id', type=int, default=0,
