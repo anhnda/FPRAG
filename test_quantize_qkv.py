@@ -127,10 +127,10 @@ def main():
     # Load data
     print("\n[1] Loading data...")
     try:
-        js_means = np.load('js_means.npy')  # [4096]
-        Wq = np.load('Wq_group0.npy')  # [4, 128, 4096]
-        Wk = np.load('Wk_group0.npy')  # [128, 4096]
-        Wv = np.load('Wv_group0.npy')  # [128, 4096]
+        js_means = np.load('./xspot_layer0_group0/js_means.npy')  # [4096]
+        Wq = np.load('./xspot_layer0_group0/Wq_group0.npy')  # [4, 128, 4096]
+        Wk = np.load('./xspot_layer0_group0/Wk_group0.npy')  # [128, 4096]
+        Wv = np.load('./xspot_layer0_group0/Wv_group0.npy')  # [128, 4096]
     except FileNotFoundError as e:
         print(f"ERROR: File not found: {e}")
         print("Please ensure you've run xspot.py and have the following files:")
