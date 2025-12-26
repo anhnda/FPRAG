@@ -871,14 +871,16 @@ def main():
     scores_orig = [r['score_orig'] for r in results]
     scores_quant_nearest = [r['score_quant_nearest'] for r in results]
     scores_quant_flip = [r['score_quant_flip'] for r in results]
+    scores_quant_reflip = [r['score_quant_reflip'] for r in results]
 
-    # 1. Attention scores comparison (3-way)
+    # 1. Attention scores comparison (4-way)
     ax1 = fig.add_subplot(gs[0, 0])
     x = np.arange(len(heads))
-    width = 0.25
-    ax1.bar(x - width, scores_orig, width, label='Original', alpha=0.8, color='blue')
-    ax1.bar(x, scores_quant_nearest, width, label='Nearest', alpha=0.8, color='orange')
-    ax1.bar(x + width, scores_quant_flip, width, label='Heuristic', alpha=0.8, color='green')
+    width = 0.2
+    ax1.bar(x - 1.5*width, scores_orig, width, label='Original', alpha=0.8, color='blue')
+    ax1.bar(x - 0.5*width, scores_quant_nearest, width, label='Nearest', alpha=0.8, color='orange')
+    ax1.bar(x + 0.5*width, scores_quant_flip, width, label='Heuristic', alpha=0.8, color='green')
+    ax1.bar(x + 1.5*width, scores_quant_reflip, width, label='ReFlip', alpha=0.8, color='purple')
     ax1.set_xlabel('Query Head')
     ax1.set_ylabel('Attention Score (Q·K)')
     ax1.set_title('Original vs Quantized Attention Scores')
@@ -887,10 +889,12 @@ def main():
     ax1.legend()
     ax1.grid(True, alpha=0.3, axis='y')
 
-    # 2. Error comparison
+    # 2. Error comparison (3-way)
     ax2 = fig.add_subplot(gs[0, 1])
-    ax2.bar(x - width/2, errors_nearest, width, label='Nearest', alpha=0.7, color='orange')
-    ax2.bar(x + width/2, errors_flip, width, label='Heuristic', alpha=0.7, color='green')
+    width2 = 0.25
+    ax2.bar(x - width2, errors_nearest, width2, label='Nearest', alpha=0.7, color='orange')
+    ax2.bar(x, errors_flip, width2, label='Heuristic', alpha=0.7, color='green')
+    ax2.bar(x + width2, errors_reflip, width2, label='ReFlip', alpha=0.7, color='purple')
     ax2.set_xlabel('Query Head')
     ax2.set_ylabel('Error (Quantized - Original)')
     ax2.set_title('Absolute Error Comparison')
@@ -900,15 +904,19 @@ def main():
     ax2.legend()
     ax2.grid(True, alpha=0.3, axis='y')
 
-    # 3. Error reduction %
+    # 3. Error reduction % (comparing all strategies)
     ax3 = fig.add_subplot(gs[0, 2])
-    ax3.bar(heads, improvements, alpha=0.7, color='purple')
+    x = np.arange(len(heads))
+    width = 0.25
+    ax3.bar(x - width, improvements_h, width, alpha=0.7, color='orange', label='N→H')
+    ax3.bar(x, improvements_r, width, alpha=0.7, color='green', label='N→R')
+    ax3.bar(x + width, improvements_hr, width, alpha=0.7, color='purple', label='H→R')
     ax3.set_xlabel('Query Head')
     ax3.set_ylabel('Error Reduction (%)')
-    ax3.set_title('Improvement: Nearest → Heuristic')
-    ax3.set_xticks(heads)
+    ax3.set_title('Error Reduction Comparison')
+    ax3.set_xticks(x)
     ax3.set_xticklabels([f'H{i}' for i in heads])
-    ax3.axhline(0, color='red', linestyle='--', linewidth=1, label='No improvement')
+    ax3.axhline(0, color='red', linestyle='--', linewidth=1, alpha=0.5)
     ax3.legend()
     ax3.grid(True, alpha=0.3, axis='y')
 
@@ -1010,13 +1018,15 @@ def main():
 
     # 11. Error reduction summary
     ax11 = fig.add_subplot(gs[3, 1])
-    ax11.text(0.5, 0.5, f"Mean error reduction: {np.mean(improvements):.2f}%\n"
-                         f"Best: {np.max(improvements):.2f}% (head {np.argmax(improvements)})\n"
-                         f"Worst: {np.min(improvements):.2f}% (head {np.argmin(improvements)})\n\n"
-                         f"Strategy comparison:\n"
-                         f"Nearest MAE: {np.mean(np.abs(errors_nearest)):.6f}\n"
-                         f"Heuristic MAE: {np.mean(np.abs(errors_flip)):.6f}",
-              ha='center', va='center', fontsize=11,
+    ax11.text(0.5, 0.5, f"Error Reduction (mean):\n"
+                         f"N→H: {np.mean(improvements_h):.2f}%\n"
+                         f"N→R: {np.mean(improvements_r):.2f}%\n"
+                         f"H→R: {np.mean(improvements_hr):.2f}%\n\n"
+                         f"Strategy MAE:\n"
+                         f"Nearest: {np.mean(np.abs(errors_nearest)):.6f}\n"
+                         f"Heuristic: {np.mean(np.abs(errors_flip)):.6f}\n"
+                         f"ReFlip: {np.mean(np.abs(errors_reflip)):.6f}",
+              ha='center', va='center', fontsize=10,
               bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.5))
     ax11.set_xlim(0, 1)
     ax11.set_ylim(0, 1)
@@ -1132,19 +1142,26 @@ def main():
              attention_scores_orig=np.array(scores_orig),
              attention_scores_nearest=np.array(scores_quant_nearest),
              attention_scores_flip=np.array(scores_quant_flip),
+             attention_scores_reflip=np.array(scores_quant_reflip),
              # Errors
              errors_nearest=np.array(errors_nearest),
              errors_flip=np.array(errors_flip),
+             errors_reflip=np.array(errors_reflip),
              rel_errors_nearest=np.array(rel_errors_nearest),
              rel_errors_flip=np.array(rel_errors_flip),
-             improvements=np.array(improvements),
+             rel_errors_reflip=np.array(rel_errors_reflip),
+             improvements_h=np.array(improvements_h),
+             improvements_r=np.array(improvements_r),
+             improvements_hr=np.array(improvements_hr),
              # Query and Key vectors
              Q_orig=[r['Q_orig'] for r in results],
              Q_quant_nearest=[r['Q_quant_nearest'] for r in results],
              Q_quant_flip=[r['Q_quant_flip'] for r in results],
+             Q_quant_reflip=[r['Q_quant_reflip'] for r in results],
              K_orig=K_orig,
              K_quant_nearest=K_nearest,
-             K_quant_flip=K_flip)
+             K_quant_flip=K_flip,
+             K_quant_reflip=K_quant_reflip)
     print(f"  Saved: quantization_results.npz")
 
     print("\n" + "="*70)
@@ -1159,8 +1176,16 @@ def main():
           f"({np.mean(np.abs(rel_errors_flip)):.4f}%)")
     print(f"     - Flipped {Wq_flip_stats['total_flips'] + Wk_flip_stats['total_flips']:,} weights "
           f"({((Wq_flip_stats['total_flips'] + Wk_flip_stats['total_flips']) / (Wq.size + Wk.size) * 100):.4f}%)")
-    print(f"  3. Improvement: {np.mean(improvements):.2f}% average error reduction")
-    print(f"  4. Best improvement: {np.max(improvements):.2f}% (head {np.argmax(improvements)})")
+    print(f"  3. ReFlip quantization:")
+    print(f"     - Mean attention score error: {np.mean(np.abs(errors_reflip)):.6f} "
+          f"({np.mean(np.abs(rel_errors_reflip)):.4f}%)")
+    print(f"     - Protected {reflip_stats['total_critical_dims']} critical dimensions "
+          f"({reflip_stats['critical_dim_pct']*100:.1f}% target)")
+    print(f"\n  Improvements:")
+    print(f"     - Nearest → Heuristic: {np.mean(improvements_h):.2f}% average error reduction")
+    print(f"     - Nearest → ReFlip:    {np.mean(improvements_r):.2f}% average error reduction")
+    print(f"     - Heuristic → ReFlip:  {np.mean(improvements_hr):.2f}% average error reduction")
+    print(f"     - Best ReFlip improvement: {np.max(improvements_r):.2f}% (head {np.argmax(improvements_r)})")
 
 
 if __name__ == '__main__':
