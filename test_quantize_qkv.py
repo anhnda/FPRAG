@@ -806,16 +806,24 @@ def main():
         Q_error_nearest = Q_nearest - Q_orig
         Q_error_flip = Q_flip - Q_orig
 
-        # Sort errors (keeping sign)
-        sorted_error_nearest = np.sort(Q_error_nearest)
-        sorted_error_flip = np.sort(Q_error_flip)
+        # Get sort indices from nearest error
+        sort_indices = np.argsort(Q_error_nearest)
 
-        # Plot
+        # Sort errors and Q_orig magnitude using the same indices
+        sorted_error_nearest = Q_error_nearest[sort_indices]
+        sorted_error_flip = Q_error_flip[sort_indices]
+        sorted_Q_magnitude = np.abs(Q_orig[sort_indices])
+
+        # Plot errors
         x_dims = np.arange(len(sorted_error_nearest))
-        ax.plot(x_dims, sorted_error_nearest, label='Nearest', alpha=0.8,
+        ax.plot(x_dims, sorted_error_nearest, label='Error (Nearest)', alpha=0.8,
                 linewidth=1.5, color='orange', marker='o', markersize=2)
-        ax.plot(x_dims, sorted_error_flip, label='Heuristic', alpha=0.8,
+        ax.plot(x_dims, sorted_error_flip, label='Error (Heuristic)', alpha=0.8,
                 linewidth=1.5, color='green', marker='s', markersize=2)
+
+        # Plot Q magnitude for context (using square markers)
+        ax.plot(x_dims, sorted_Q_magnitude, label='|Q_orig|', alpha=0.6,
+                linewidth=1.2, color='blue', marker='s', markersize=3, linestyle='--')
 
         # Add zero line
         ax.axhline(0, color='black', linestyle='--', linewidth=1, alpha=0.5)
