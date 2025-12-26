@@ -16,7 +16,6 @@ Usage:
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-from pathlib import Path
 
 sns.set_style("whitegrid")
 
@@ -92,10 +91,14 @@ def quantize_weight_groupwise_int4(W, group_size=128):
     scales_flat = scale.reshape(out_features, n_groups)
     zp_flat = zp.reshape(out_features, n_groups)
 
-    # If original was 3D, reshape scales/zp accordingly
+    # If original was 3D, reshape scales/zp to match original structure
     if len(original_shape) == 3:
-        scales_out = scales_flat.reshape(original_shape[0], n_groups)
-        zp_out = zp_flat.reshape(original_shape[0], n_groups)
+        # Original: [num_heads, head_dim, hidden_size] e.g. [4, 128, 4096]
+        # Flattened to: [num_heads * head_dim, hidden_size] e.g. [512, 4096]
+        # Scales: [num_heads * head_dim, n_groups] e.g. [512, 32]
+        # Reshape to: [num_heads, head_dim, n_groups] e.g. [4, 128, 32]
+        scales_out = scales_flat.reshape(original_shape[0], original_shape[1], n_groups)
+        zp_out = zp_flat.reshape(original_shape[0], original_shape[1], n_groups)
     else:
         scales_out = scales_flat
         zp_out = zp_flat
@@ -162,8 +165,8 @@ def main():
     print("  Quantizing Wk (1 head)...")
     Wk_quant, Wk_scales, Wk_zp, Wk_int = quantize_weight_groupwise_int4(Wk, group_size=128)
 
-    print(f"\n  Wq scales: {Wq_scales.shape} [num_heads, n_groups]")
-    print(f"  Wk scales: {Wk_scales.shape} [1, n_groups]")
+    print(f"\n  Wq scales: {Wq_scales.shape} [num_heads, head_dim, n_groups]")
+    print(f"  Wk scales: {Wk_scales.shape} [head_dim, n_groups]")
 
     # Compute weight quantization errors
     print("\n[3] Weight quantization errors:")
@@ -211,8 +214,10 @@ def main():
         print(f"Relative error:     {rel_error:15.4f}%")
 
         # Scale statistics for this head
-        head_scales = Wq_scales[head_idx]  # [n_groups]
-        print(f"\nWq scales for head {head_idx} ({len(head_scales)} groups):")
+        # Wq_scales[head_idx] has shape [head_dim, n_groups] = [128, 32]
+        # Flatten to get all scales for this head
+        head_scales = Wq_scales[head_idx].flatten()  # [head_dim * n_groups]
+        print(f"\nWq scales for head {head_idx} ({len(head_scales)} total scales):")
         print(f"  Mean:   {head_scales.mean():.8f}")
         print(f"  Median: {np.median(head_scales):.8f}")
         print(f"  Min:    {head_scales.min():.8f}")
@@ -234,8 +239,10 @@ def main():
         })
 
     # K scales (shared across all heads)
+    # Wk_scales has shape [head_dim, n_groups] = [128, 32]
     print(f"\n{'='*70}")
-    print(f"Wk scales (shared by all 4 query heads, {len(Wk_scales[0])} groups):")
+    print(f"Wk scales (shared by all 4 query heads, {Wk_scales.size} total scales):")
+    print(f"  Shape:  {Wk_scales.shape} [head_dim, n_groups]")
     print(f"  Mean:   {Wk_scales.mean():.8f}")
     print(f"  Median: {np.median(Wk_scales):.8f}")
     print(f"  Min:    {Wk_scales.min():.8f}")
