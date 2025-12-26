@@ -73,6 +73,28 @@ def plot_js_means_distribution(data, output_dir):
     naive_means = data['naive_means']
     metadata = data['metadata']
 
+    # Compute statistics for comparison
+    stats_naive = {
+        'min': naive_means.min(),
+        'max': naive_means.max(),
+        'mean': naive_means.mean(),
+        'median': np.median(naive_means),
+        'std': naive_means.std()
+    }
+
+    stats_js = {
+        'min': js_means.min(),
+        'max': js_means.max(),
+        'mean': js_means.mean(),
+        'median': np.median(js_means),
+        'std': js_means.std()
+    }
+
+    # Range reduction
+    range_naive = stats_naive['max'] - stats_naive['min']
+    range_js = stats_js['max'] - stats_js['min']
+    range_reduction = (range_naive - range_js) / range_naive * 100
+
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 
     # 1. Histogram comparison
@@ -115,7 +137,7 @@ def plot_js_means_distribution(data, output_dir):
     ax.legend()
     ax.grid(True, alpha=0.3)
 
-    # 4. Scatter plot
+    # 4. Scatter plot with statistics table
     ax = axes[1, 1]
     ax.scatter(naive_means, js_means, alpha=0.3, s=10)
     ax.plot([naive_means.min(), naive_means.max()],
@@ -128,14 +150,37 @@ def plot_js_means_distribution(data, output_dir):
     ax.set_xlabel('Naive Mean')
     ax.set_ylabel('James-Stein Mean')
     ax.set_title('Shrinkage Scatter Plot')
-    ax.legend()
+    ax.legend(loc='upper left')
     ax.grid(True, alpha=0.3)
+
+    # Add statistics table
+    stats_text = f"""Statistics Comparison:
+
+                Naive        JS          Diff
+Min:      {stats_naive['min']:8.5f}  {stats_js['min']:8.5f}  {stats_js['min']-stats_naive['min']:+8.5f}
+Max:      {stats_naive['max']:8.5f}  {stats_js['max']:8.5f}  {stats_js['max']-stats_naive['max']:+8.5f}
+Mean:     {stats_naive['mean']:8.5f}  {stats_js['mean']:8.5f}  {stats_js['mean']-stats_naive['mean']:+8.5f}
+Median:   {stats_naive['median']:8.5f}  {stats_js['median']:8.5f}  {stats_js['median']-stats_naive['median']:+8.5f}
+Std:      {stats_naive['std']:8.5f}  {stats_js['std']:8.5f}  {stats_js['std']-stats_naive['std']:+8.5f}
+
+Range:    {range_naive:8.5f}  {range_js:8.5f}  ({range_reduction:+.2f}%)
+"""
+    ax.text(0.02, 0.98, stats_text, transform=ax.transAxes,
+            fontsize=8, verticalalignment='top', family='monospace',
+            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
 
     plt.tight_layout()
     output_path = output_dir / 'js_means_distribution.png'
     plt.savefig(output_path, bbox_inches='tight')
     print(f"Saved: {output_path}")
     plt.close()
+
+    # Return statistics for use in summary report
+    return {
+        'naive': stats_naive,
+        'js': stats_js,
+        'range_reduction': range_reduction
+    }
 
 
 def plot_weight_distributions(data, output_dir):
@@ -449,7 +494,7 @@ def plot_combined_importance(data, output_dir):
     plt.close()
 
 
-def generate_summary_report(data, output_dir):
+def generate_summary_report(data, output_dir, js_stats=None):
     """Generate text summary report."""
     metadata = data['metadata']
     js_means = data['js_means']
@@ -471,6 +516,26 @@ def generate_summary_report(data, output_dir):
     report.append(f"Shrinkage factor (λ): {metadata['james_stein']['shrinkage_factor']:.6f}")
     report.append(f"Mean absolute shrinkage: {metadata['james_stein']['mean_abs_diff']:.6f}")
     report.append(f"Max absolute shrinkage: {metadata['james_stein']['max_abs_diff']:.6f}")
+
+    # Add detailed statistics comparison if available
+    if js_stats is not None:
+        report.append("\n--- Detailed Statistics Comparison (Naive vs JS) ---")
+        report.append(f"{'Metric':<12} {'Naive':<12} {'JS':<12} {'Difference':<12}")
+        report.append("-" * 50)
+        stats_naive = js_stats['naive']
+        stats_js = js_stats['js']
+
+        report.append(f"{'Min':<12} {stats_naive['min']:<12.6f} {stats_js['min']:<12.6f} {stats_js['min']-stats_naive['min']:<+12.6f}")
+        report.append(f"{'Max':<12} {stats_naive['max']:<12.6f} {stats_js['max']:<12.6f} {stats_js['max']-stats_naive['max']:<+12.6f}")
+        report.append(f"{'Mean':<12} {stats_naive['mean']:<12.6f} {stats_js['mean']:<12.6f} {stats_js['mean']-stats_naive['mean']:<+12.6f}")
+        report.append(f"{'Median':<12} {stats_naive['median']:<12.6f} {stats_js['median']:<12.6f} {stats_js['median']-stats_naive['median']:<+12.6f}")
+        report.append(f"{'Std Dev':<12} {stats_naive['std']:<12.6f} {stats_js['std']:<12.6f} {stats_js['std']-stats_naive['std']:<+12.6f}")
+
+        range_naive = stats_naive['max'] - stats_naive['min']
+        range_js = stats_js['max'] - stats_js['min']
+        report.append(f"{'Range':<12} {range_naive:<12.6f} {range_js:<12.6f} {range_js-range_naive:<+12.6f}")
+        report.append(f"\nRange reduction: {js_stats['range_reduction']:.2f}%")
+        report.append(f"Std reduction: {(stats_naive['std']-stats_js['std'])/stats_naive['std']*100:.2f}%")
 
     report.append("\n--- Weight Statistics ---")
     report.append(f"Query weights (Wq):")
@@ -550,14 +615,14 @@ def main():
 
     # Generate visualizations
     print(f"\nGenerating visualizations...")
-    plot_js_means_distribution(data, output_dir)
+    js_stats = plot_js_means_distribution(data, output_dir)
     plot_weight_distributions(data, output_dir)
     plot_per_head_analysis(data, output_dir)
     plot_kv_analysis(data, output_dir)
     plot_combined_importance(data, output_dir)
 
     # Generate summary report
-    generate_summary_report(data, output_dir)
+    generate_summary_report(data, output_dir, js_stats=js_stats)
 
     print(f"\n{'='*60}")
     print(f"✓ Visualization complete!")
