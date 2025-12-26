@@ -791,11 +791,21 @@ def main():
     print(f"  Saved: attention_quantization_analysis.png")
 
     # New figure: Sorted errors over 128 head dimensions for 4 heads
+    # Split into two plots per head: errors (top) and magnitude (bottom)
     print("\n[5b] Generating sorted error visualization...")
-    fig2 = plt.figure(figsize=(16, 12))
+    fig2 = plt.figure(figsize=(16, 16))
+    gs2 = fig2.add_gridspec(4, 4, hspace=0.4, wspace=0.3, height_ratios=[1, 0.6, 1, 0.6])
 
     for head_idx in range(num_heads):
-        ax = fig2.add_subplot(2, 2, head_idx + 1)
+        # Calculate grid position
+        col = head_idx % 2  # 0 or 1
+        row_offset = (head_idx // 2) * 2  # 0 or 2
+
+        # Top subplot: Errors
+        ax_error = fig2.add_subplot(gs2[row_offset, col*2:(col+1)*2])
+
+        # Bottom subplot: Magnitude
+        ax_mag = fig2.add_subplot(gs2[row_offset + 1, col*2:(col+1)*2], sharex=ax_error)
 
         # Get Q vectors for this head
         Q_orig = results[head_idx]['Q_orig']
@@ -814,19 +824,14 @@ def main():
         sorted_error_flip = Q_error_flip[sort_indices]
         sorted_Q_magnitude = np.abs(Q_orig[sort_indices])
 
-        # Plot errors
         x_dims = np.arange(len(sorted_error_nearest))
-        ax.plot(x_dims, sorted_error_nearest, label='Error (Nearest)', alpha=0.8,
-                linewidth=1.5, color='orange', marker='o', markersize=2)
-        ax.plot(x_dims, sorted_error_flip, label='Error (Heuristic)', alpha=0.8,
-                linewidth=1.5, color='green', marker='s', markersize=2)
 
-        # Plot Q magnitude for context (using square markers)
-        ax.plot(x_dims, sorted_Q_magnitude, label='|Q_orig|', alpha=0.6,
-                linewidth=1.2, color='blue', marker='s', markersize=3, linestyle='--')
-
-        # Add zero line
-        ax.axhline(0, color='black', linestyle='--', linewidth=1, alpha=0.5)
+        # Top plot: Errors
+        ax_error.plot(x_dims, sorted_error_nearest, label='Error (Nearest)', alpha=0.8,
+                      linewidth=1.5, color='orange', marker='o', markersize=2)
+        ax_error.plot(x_dims, sorted_error_flip, label='Error (Heuristic)', alpha=0.8,
+                      linewidth=1.5, color='green', marker='s', markersize=2)
+        ax_error.axhline(0, color='black', linestyle='--', linewidth=1, alpha=0.5)
 
         # Statistics
         mean_nearest = Q_error_nearest.mean()
@@ -834,16 +839,23 @@ def main():
         std_nearest = Q_error_nearest.std()
         std_flip = Q_error_flip.std()
 
-        ax.set_xlabel('Sorted Dimension Index', fontsize=11)
-        ax.set_ylabel('Error (Quantized - Original)', fontsize=11)
-        ax.set_title(f'Head {head_idx}: Sorted Q Errors (128 dims)\n'
-                     f'Nearest: μ={mean_nearest:.4f}, σ={std_nearest:.4f} | '
-                     f'Heuristic: μ={mean_flip:.4f}, σ={std_flip:.4f}',
-                     fontsize=10)
-        ax.legend(loc='best', fontsize=10)
-        ax.grid(True, alpha=0.3)
+        ax_error.set_ylabel('Error', fontsize=10)
+        ax_error.set_title(f'Head {head_idx}: Sorted Q Errors (128 dims)\n'
+                          f'Nearest: μ={mean_nearest:.4f}, σ={std_nearest:.4f} | '
+                          f'Heuristic: μ={mean_flip:.4f}, σ={std_flip:.4f}',
+                          fontsize=9)
+        ax_error.legend(loc='best', fontsize=9)
+        ax_error.grid(True, alpha=0.3)
+        ax_error.tick_params(labelbottom=False)
 
-    plt.tight_layout()
+        # Bottom plot: Magnitude
+        ax_mag.plot(x_dims, sorted_Q_magnitude, label='|Q_orig|', alpha=0.7,
+                    linewidth=1.5, color='blue', marker='s', markersize=3)
+        ax_mag.set_xlabel('Sorted Dimension Index', fontsize=10)
+        ax_mag.set_ylabel('|Q_orig| Magnitude', fontsize=10)
+        ax_mag.legend(loc='best', fontsize=9)
+        ax_mag.grid(True, alpha=0.3)
+
     plt.savefig('sorted_error_comparison.png', dpi=300, bbox_inches='tight')
     print(f"  Saved: sorted_error_comparison.png")
 
