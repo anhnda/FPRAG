@@ -20,6 +20,115 @@ import seaborn as sns
 sns.set_style("whitegrid")
 
 
+def find_knee_point(values, tolerance_offset=0.0):
+    """
+    Find knee point in sorted values using Kneedle algorithm.
+
+    Args:
+        values: 1D array of sorted values (ascending order)
+        tolerance_offset: Additional offset to add to knee point (default: 0.0)
+
+    Returns:
+        index of knee point
+
+    Algorithm:
+    1. Normalize values to [0, 1]
+    2. Create reference line from start to end
+    3. Find point with maximum distance from reference line
+    4. Apply tolerance offset
+    """
+    n = len(values)
+    if n < 3:
+        return n // 2
+
+    # Normalize to [0, 1]
+    y_min, y_max = values.min(), values.max()
+    if y_max - y_min < 1e-10:
+        # All values are the same, no knee
+        return n // 2
+
+    y_norm = (values - y_min) / (y_max - y_min)
+    x_norm = np.linspace(0, 1, n)
+
+    # Compute distances from the line connecting first and last point
+    # Line equation: y = m*x + b
+    # For normalized: line goes from (0, y_norm[0]) to (1, y_norm[-1])
+    y_line = y_norm[0] + (y_norm[-1] - y_norm[0]) * x_norm
+
+    # Perpendicular distance from each point to the line
+    distances = np.abs(y_norm - y_line)
+
+    # Find point with maximum distance (the knee)
+    knee_idx = np.argmax(distances)
+
+    # Apply tolerance offset
+    if knee_idx < n - 1:
+        # Calculate how many indices to shift based on offset
+        offset_indices = int(tolerance_offset * n)
+        knee_idx = min(knee_idx + offset_indices, n - 1)
+        knee_idx = max(knee_idx, 0)
+
+    return knee_idx
+
+
+def compute_dynamic_outlier_threshold(activation_means, knee_tolerance=0.0, debug=False):
+    """
+    Compute dynamic outlier threshold using Kneedle algorithm.
+
+    Strategy:
+    1. Sort activation means in DESCENDING order [high ... medium ... low]
+    2. Apply Kneedle to FIRST HALF [high ... medium] to find outlier→normal transition
+    3. Tolerance offset allows tuning: positive = more conservative (keep more outliers)
+
+    Args:
+        activation_means: Array of per-channel activation means (E[X])
+        knee_tolerance: Tolerance offset for knee point (default: 0.0)
+        debug: Print debug information
+
+    Returns:
+        tuple: (threshold value, outlier percentage)
+    """
+    # Sort activation means in DESCENDING order [high → low]
+    sorted_means = np.sort(np.abs(activation_means))[::-1]  # Descending
+    n = len(sorted_means)
+
+    # Apply Kneedle to FIRST HALF [high ... medium] to find outlier transition
+    first_half = sorted_means[:n // 2]
+
+    if len(first_half) < 3:
+        # Not enough data, use a conservative default (top 5%)
+        threshold_idx = int(0.05 * n)
+        threshold = sorted_means[threshold_idx]
+        outlier_percent = 0.05
+        if debug:
+            print(f"    DEBUG: Not enough data for Kneedle, using top 5% as default")
+        return threshold, outlier_percent
+
+    # Find knee point in first half (where outliers end, normal begins)
+    knee_idx_in_half = find_knee_point(first_half, tolerance_offset=knee_tolerance)
+
+    # This is already the index in full array (descending sorted)
+    knee_idx = knee_idx_in_half
+
+    # The threshold is the value at the knee point
+    threshold = sorted_means[knee_idx]
+
+    # Count how many channels are outliers (above or equal to threshold)
+    num_outliers = (np.abs(activation_means) >= threshold).sum()
+    outlier_percent = num_outliers / n
+
+    if debug:
+        print(f"    DEBUG: Sorted means (descending): [{sorted_means[0]:.6f} ... {sorted_means[-1]:.6f}]")
+        print(f"    DEBUG: First half range: [{first_half[0]:.6f} ... {first_half[-1]:.6f}]")
+        print(f"    DEBUG: Knee point index in first half: {knee_idx_in_half}/{len(first_half)}")
+        print(f"    DEBUG: Knee point index in full array: {knee_idx}/{n} ({knee_idx/n*100:.1f}%)")
+        print(f"    DEBUG: Knee threshold value: {threshold:.6f}")
+        print(f"    DEBUG: Outliers (>= threshold): {num_outliers}/{n} ({outlier_percent*100:.2f}%)")
+        print(f"    DEBUG: vs Default 5.00%: {outlier_percent*100 - 5.0:+.2f}% difference")
+
+    return threshold, outlier_percent
+
+
 def quantize_weight_groupwise_int4(W, group_size=128, method='nearest'):
     """
     Quantize weights to INT4 using group-wise asymmetric quantization [0, 15].
@@ -108,26 +217,29 @@ def quantize_weight_groupwise_int4(W, group_size=128, method='nearest'):
 
 
 def quantize_weight_groupwise_int4_with_flip(W, activation_means, group_size=128,
-                                              outlier_threshold_pct=0.05, max_flip_pct=0.05):
+                                              knee_tolerance=0.0, max_flip_pct=0.01, debug=False):
     """
     Quantize weights to INT4 with heuristic flip correction (from awq_js_xl.py).
 
     This implements the global greedy rounding correction that flips quantization
     directions to minimize the overall error in X @ W computation.
 
+    Uses DYNAMIC outlier detection via Kneedle algorithm instead of fixed percentile.
+
     Args:
         W: Weight matrix of shape [..., in_features]
         activation_means: Channel-wise activation means, shape [in_features]
         group_size: Size of each quantization group (default: 128)
-        outlier_threshold_pct: Percentile for outlier masking (default: 0.05 = top 5%)
-        max_flip_pct: Max percentage of weights that can be flipped per row (default: 0.05)
+        knee_tolerance: Tolerance offset for Kneedle algorithm (default: 0.0)
+        max_flip_pct: Max percentage of weights that can be flipped per row (default: 0.01 = 1%)
+        debug: Print debug information (default: False)
 
     Returns:
         W_quant: Dequantized weights (same shape as W)
         scales: Per-group scales
         zp: Per-group zero points
         W_int: Integer weights
-        flip_stats: Statistics about flips
+        flip_stats: Statistics about flips (includes 'outlier_percent' from dynamic detection)
     """
     original_shape = W.shape
 
@@ -194,10 +306,16 @@ def quantize_weight_groupwise_int4_with_flip(W, activation_means, group_size=128
     in_range = (w_int_proposed >= 0) & (w_int_proposed <= max_int)
     valid_mask = valid_mask & in_range
 
-    # Outlier masking (exclude top X% activation channels)
-    outlier_threshold = np.percentile(np.abs(act_padded), (1 - outlier_threshold_pct) * 100)
+    # DYNAMIC outlier masking using Kneedle algorithm
+    outlier_threshold, outlier_percent = compute_dynamic_outlier_threshold(
+        act_padded, knee_tolerance=knee_tolerance, debug=debug
+    )
     is_outlier = np.abs(act_padded) > outlier_threshold
     valid_mask = valid_mask & (~is_outlier)[np.newaxis, :]
+
+    if debug:
+        print(f"    DEBUG: Dynamic outlier detection found {outlier_percent*100:.2f}% outliers")
+        print(f"    DEBUG: Outlier threshold: {outlier_threshold:.6f}")
 
     # E. Sorting & Optimization
     rounding_costs = np.abs(W_div + zp_flat - W_int)
@@ -269,7 +387,8 @@ def quantize_weight_groupwise_int4_with_flip(W, activation_means, group_size=128
         'flips_per_row_mean': float(flips_per_row.mean()),
         'flips_per_row_max': int(flips_per_row.max()),
         'flips_per_row_min': int(flips_per_row.min()),
-        'flip_rate_pct': float(total_flips / (out_features * in_features) * 100)
+        'flip_rate_pct': float(total_flips / (out_features * in_features) * 100),
+        'outlier_percent': float(outlier_percent)  # From dynamic Kneedle detection
     }
 
     return W_quant_final, scales_out, zp_out, W_int_final, flip_stats
@@ -354,8 +473,10 @@ def main():
     print(f"\n  Flip statistics:")
     print(f"    Wq: {Wq_flip_stats['total_flips']} flips "
           f"({Wq_flip_stats['flip_rate_pct']:.4f}% of weights)")
+    print(f"        Dynamic outlier detection: {Wq_flip_stats['outlier_percent']*100:.2f}% outliers")
     print(f"    Wk: {Wk_flip_stats['total_flips']} flips "
           f"({Wk_flip_stats['flip_rate_pct']:.4f}% of weights)")
+    print(f"        Dynamic outlier detection: {Wk_flip_stats['outlier_percent']*100:.2f}% outliers")
 
     # Compute weight quantization errors
     print("\n[3] Weight quantization errors:")
