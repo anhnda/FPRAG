@@ -503,19 +503,21 @@ def main():
 
     # Visualization
     print("\n[5] Generating visualizations...")
-    fig = plt.figure(figsize=(16, 12))
-    gs = fig.add_gridspec(3, 3, hspace=0.3, wspace=0.3)
+    fig = plt.figure(figsize=(18, 14))
+    gs = fig.add_gridspec(4, 3, hspace=0.35, wspace=0.3)
 
-    # 1. Attention scores comparison
-    ax1 = fig.add_subplot(gs[0, 0])
     heads = [r['head'] for r in results]
     scores_orig = [r['score_orig'] for r in results]
-    scores_quant = [r['score_quant'] for r in results]
+    scores_quant_nearest = [r['score_quant_nearest'] for r in results]
+    scores_quant_flip = [r['score_quant_flip'] for r in results]
 
+    # 1. Attention scores comparison (3-way)
+    ax1 = fig.add_subplot(gs[0, 0])
     x = np.arange(len(heads))
-    width = 0.35
-    ax1.bar(x - width/2, scores_orig, width, label='Original', alpha=0.8, color='blue')
-    ax1.bar(x + width/2, scores_quant, width, label='Quantized', alpha=0.8, color='orange')
+    width = 0.25
+    ax1.bar(x - width, scores_orig, width, label='Original', alpha=0.8, color='blue')
+    ax1.bar(x, scores_quant_nearest, width, label='Nearest', alpha=0.8, color='orange')
+    ax1.bar(x + width, scores_quant_flip, width, label='Heuristic', alpha=0.8, color='green')
     ax1.set_xlabel('Query Head')
     ax1.set_ylabel('Attention Score (Q·K)')
     ax1.set_title('Original vs Quantized Attention Scores')
@@ -524,95 +526,145 @@ def main():
     ax1.legend()
     ax1.grid(True, alpha=0.3, axis='y')
 
-    # 2. Absolute errors
+    # 2. Error comparison
     ax2 = fig.add_subplot(gs[0, 1])
-    ax2.bar(heads, errors, alpha=0.7, color='red')
+    ax2.bar(x - width/2, errors_nearest, width, label='Nearest', alpha=0.7, color='orange')
+    ax2.bar(x + width/2, errors_flip, width, label='Heuristic', alpha=0.7, color='green')
     ax2.set_xlabel('Query Head')
     ax2.set_ylabel('Error (Quantized - Original)')
-    ax2.set_title('Absolute Quantization Error per Head')
-    ax2.set_xticks(heads)
+    ax2.set_title('Absolute Error Comparison')
+    ax2.set_xticks(x)
     ax2.set_xticklabels([f'H{i}' for i in heads])
     ax2.axhline(0, color='black', linestyle='--', linewidth=1)
+    ax2.legend()
     ax2.grid(True, alpha=0.3, axis='y')
 
-    # 3. Relative errors
+    # 3. Error reduction %
     ax3 = fig.add_subplot(gs[0, 2])
-    ax3.bar(heads, rel_errors, alpha=0.7, color='purple')
+    ax3.bar(heads, improvements, alpha=0.7, color='purple')
     ax3.set_xlabel('Query Head')
-    ax3.set_ylabel('Relative Error (%)')
-    ax3.set_title('Relative Quantization Error per Head')
+    ax3.set_ylabel('Error Reduction (%)')
+    ax3.set_title('Improvement: Nearest → Heuristic')
     ax3.set_xticks(heads)
     ax3.set_xticklabels([f'H{i}' for i in heads])
-    ax3.axhline(0, color='black', linestyle='--', linewidth=1)
+    ax3.axhline(0, color='red', linestyle='--', linewidth=1, label='No improvement')
+    ax3.legend()
     ax3.grid(True, alpha=0.3, axis='y')
 
-    # 4. Mean scale per head
+    # 4. Relative errors comparison
     ax4 = fig.add_subplot(gs[1, 0])
-    ax4.bar(heads, scale_means, alpha=0.7, color='green')
+    ax4.bar(x - width/2, rel_errors_nearest, width, label='Nearest', alpha=0.7, color='orange')
+    ax4.bar(x + width/2, rel_errors_flip, width, label='Heuristic', alpha=0.7, color='green')
     ax4.set_xlabel('Query Head')
-    ax4.set_ylabel('Mean Scale Value')
-    ax4.set_title('Mean Wq Quantization Scale per Head')
-    ax4.set_xticks(heads)
+    ax4.set_ylabel('Relative Error (%)')
+    ax4.set_title('Relative Error Comparison')
+    ax4.set_xticks(x)
     ax4.set_xticklabels([f'H{i}' for i in heads])
+    ax4.axhline(0, color='black', linestyle='--', linewidth=1)
+    ax4.legend()
     ax4.grid(True, alpha=0.3, axis='y')
 
-    # 5. Scale distributions (boxplot)
+    # 5. Scale distributions comparison (nearest vs flip)
     ax5 = fig.add_subplot(gs[1, 1])
-    scale_data = [results[i]['wq_scales'] for i in range(num_heads)]
-    bp = ax5.boxplot(scale_data, labels=[f'H{i}' for i in heads], patch_artist=True)
-    for patch in bp['boxes']:
-        patch.set_facecolor('lightblue')
-    ax5.set_xlabel('Query Head')
-    ax5.set_ylabel('Scale Value')
-    ax5.set_title('Wq Scale Distribution per Head')
+    scale_data_nearest = [results[i]['wq_scales_nearest'] for i in range(num_heads)]
+    scale_data_flip = [results[i]['wq_scales_flip'] for i in range(num_heads)]
+    # Show first head as example
+    ax5.hist(scale_data_nearest[0], bins=30, alpha=0.5, label='Nearest (H0)', color='orange')
+    ax5.hist(scale_data_flip[0], bins=30, alpha=0.5, label='Heuristic (H0)', color='green')
+    ax5.set_xlabel('Scale Value')
+    ax5.set_ylabel('Count')
+    ax5.set_title('Wq Scale Distribution (Head 0)')
+    ax5.legend()
     ax5.grid(True, alpha=0.3, axis='y')
 
-    # 6. Wk scale distribution
+    # 6. Wk scale comparison
     ax6 = fig.add_subplot(gs[1, 2])
-    ax6.hist(Wk_scales.flatten(), bins=30, alpha=0.7, color='teal', edgecolor='black')
-    ax6.axvline(Wk_scales.mean(), color='red', linestyle='--', linewidth=2,
-                label=f'Mean: {Wk_scales.mean():.6f}')
+    ax6.hist(Wk_scales_nearest.flatten(), bins=30, alpha=0.5, label='Nearest',
+             color='orange', edgecolor='black')
+    ax6.hist(Wk_scales_flip.flatten(), bins=30, alpha=0.5, label='Heuristic',
+             color='green', edgecolor='black')
     ax6.set_xlabel('Scale Value')
     ax6.set_ylabel('Count')
-    ax6.set_title(f'Wk Scale Distribution ({len(Wk_scales.flatten())} groups)')
+    ax6.set_title(f'Wk Scale Distribution Comparison')
     ax6.legend()
     ax6.grid(True, alpha=0.3, axis='y')
 
-    # 7. Q vector comparison (head 0)
+    # 7. Q vector comparison (head 0) - 3-way
     ax7 = fig.add_subplot(gs[2, 0])
     Q0_orig = results[0]['Q_orig']
-    Q0_quant = results[0]['Q_quant']
-    ax7.plot(Q0_orig, label='Original', alpha=0.7, linewidth=1.5)
-    ax7.plot(Q0_quant, label='Quantized', alpha=0.7, linewidth=1.5)
+    Q0_nearest = results[0]['Q_quant_nearest']
+    Q0_flip = results[0]['Q_quant_flip']
+    ax7.plot(Q0_orig, label='Original', alpha=0.7, linewidth=1.5, color='blue')
+    ax7.plot(Q0_nearest, label='Nearest', alpha=0.7, linewidth=1.5, color='orange')
+    ax7.plot(Q0_flip, label='Heuristic', alpha=0.7, linewidth=1.5, color='green')
     ax7.set_xlabel('Dimension')
     ax7.set_ylabel('Value')
-    ax7.set_title('Query Vector Q (Head 0): Original vs Quantized')
+    ax7.set_title('Query Vector Q (Head 0)')
     ax7.legend()
     ax7.grid(True, alpha=0.3)
 
-    # 8. K vector comparison (shared)
+    # 8. K vector comparison (shared) - 3-way
     ax8 = fig.add_subplot(gs[2, 1])
-    K_orig = results[0]['K_orig']  # Same for all heads
-    K_quant = results[0]['K_quant']
-    ax8.plot(K_orig, label='Original', alpha=0.7, linewidth=1.5)
-    ax8.plot(K_quant, label='Quantized', alpha=0.7, linewidth=1.5)
+    K_orig = results[0]['K_orig']
+    K_nearest = results[0]['K_quant_nearest']
+    K_flip = results[0]['K_quant_flip']
+    ax8.plot(K_orig, label='Original', alpha=0.7, linewidth=1.5, color='blue')
+    ax8.plot(K_nearest, label='Nearest', alpha=0.7, linewidth=1.5, color='orange')
+    ax8.plot(K_flip, label='Heuristic', alpha=0.7, linewidth=1.5, color='green')
     ax8.set_xlabel('Dimension')
     ax8.set_ylabel('Value')
-    ax8.set_title('Key Vector K (Shared): Original vs Quantized')
+    ax8.set_title('Key Vector K (Shared)')
     ax8.legend()
     ax8.grid(True, alpha=0.3)
 
-    # 9. Q-K error scatter (head 0)
+    # 9. Q-K error comparison (head 0)
     ax9 = fig.add_subplot(gs[2, 2])
-    Q_error = Q0_quant - Q0_orig
-    K_error = K_quant - K_orig
-    ax9.scatter(Q_error, K_error, alpha=0.5, s=10)
+    Q_error_nearest = Q0_nearest - Q0_orig
+    Q_error_flip = Q0_flip - Q0_orig
+    ax9.scatter(Q_error_nearest, Q_error_flip, alpha=0.5, s=10)
     ax9.axhline(0, color='red', linestyle='--', alpha=0.5)
     ax9.axvline(0, color='red', linestyle='--', alpha=0.5)
-    ax9.set_xlabel('Q Error (Head 0)')
-    ax9.set_ylabel('K Error')
-    ax9.set_title('Q vs K Quantization Errors')
+    ax9.plot([Q_error_nearest.min(), Q_error_nearest.max()],
+             [Q_error_nearest.min(), Q_error_nearest.max()],
+             'k--', alpha=0.5, label='y=x (no improvement)')
+    ax9.set_xlabel('Q Error (Nearest)')
+    ax9.set_ylabel('Q Error (Heuristic)')
+    ax9.set_title('Q Error: Nearest vs Heuristic (Head 0)')
+    ax9.legend()
     ax9.grid(True, alpha=0.3)
+
+    # 10. Flip statistics per head
+    ax10 = fig.add_subplot(gs[3, 0])
+    # This would require per-head flip stats, skip for now
+    ax10.text(0.5, 0.5, f"Total Wq flips: {Wq_flip_stats['total_flips']:,}\n"
+                         f"Flip rate: {Wq_flip_stats['flip_rate_pct']:.4f}%\n\n"
+                         f"Total Wk flips: {Wk_flip_stats['total_flips']:,}\n"
+                         f"Flip rate: {Wk_flip_stats['flip_rate_pct']:.4f}%",
+              ha='center', va='center', fontsize=12,
+              bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    ax10.set_xlim(0, 1)
+    ax10.set_ylim(0, 1)
+    ax10.axis('off')
+    ax10.set_title('Flip Statistics')
+
+    # 11. Error reduction summary
+    ax11 = fig.add_subplot(gs[3, 1])
+    ax11.text(0.5, 0.5, f"Mean error reduction: {np.mean(improvements):.2f}%\n"
+                         f"Best: {np.max(improvements):.2f}% (head {np.argmax(improvements)})\n"
+                         f"Worst: {np.min(improvements):.2f}% (head {np.argmin(improvements)})\n\n"
+                         f"Strategy comparison:\n"
+                         f"Nearest MAE: {np.mean(np.abs(errors_nearest)):.6f}\n"
+                         f"Heuristic MAE: {np.mean(np.abs(errors_flip)):.6f}",
+              ha='center', va='center', fontsize=11,
+              bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.5))
+    ax11.set_xlim(0, 1)
+    ax11.set_ylim(0, 1)
+    ax11.axis('off')
+    ax11.set_title('Summary Statistics')
+
+    # 12. Reserved for future use
+    ax12 = fig.add_subplot(gs[3, 2])
+    ax12.axis('off')
 
     plt.savefig('attention_quantization_analysis.png', dpi=300, bbox_inches='tight')
     print(f"  Saved: attention_quantization_analysis.png")
@@ -626,39 +678,59 @@ def main():
              # Original weights
              Wq_orig=Wq,
              Wk_orig=Wk,
-             # Quantized weights
-             Wq_quant=Wq_quant,
-             Wk_quant=Wk_quant,
-             Wq_int=Wq_int,
-             Wk_int=Wk_int,
-             # Scales and zero points
-             Wq_scales=Wq_scales,
-             Wk_scales=Wk_scales,
-             Wq_zp=Wq_zp,
-             Wk_zp=Wk_zp,
+             # Quantized weights - Nearest
+             Wq_quant_nearest=Wq_quant_nearest,
+             Wk_quant_nearest=Wk_quant_nearest,
+             Wq_int_nearest=Wq_int_nearest,
+             Wk_int_nearest=Wk_int_nearest,
+             # Quantized weights - Heuristic
+             Wq_quant_flip=Wq_quant_flip,
+             Wk_quant_flip=Wk_quant_flip,
+             Wq_int_flip=Wq_int_flip,
+             Wk_int_flip=Wk_int_flip,
+             # Scales and zero points - Nearest
+             Wq_scales_nearest=Wq_scales_nearest,
+             Wk_scales_nearest=Wk_scales_nearest,
+             Wq_zp_nearest=Wq_zp_nearest,
+             Wk_zp_nearest=Wk_zp_nearest,
+             # Scales and zero points - Heuristic
+             Wq_scales_flip=Wq_scales_flip,
+             Wk_scales_flip=Wk_scales_flip,
+             Wq_zp_flip=Wq_zp_flip,
+             Wk_zp_flip=Wk_zp_flip,
              # Attention scores
              attention_scores_orig=np.array(scores_orig),
-             attention_scores_quant=np.array(scores_quant),
+             attention_scores_nearest=np.array(scores_quant_nearest),
+             attention_scores_flip=np.array(scores_quant_flip),
              # Errors
-             errors=np.array(errors),
-             rel_errors=np.array(rel_errors),
+             errors_nearest=np.array(errors_nearest),
+             errors_flip=np.array(errors_flip),
+             rel_errors_nearest=np.array(rel_errors_nearest),
+             rel_errors_flip=np.array(rel_errors_flip),
+             improvements=np.array(improvements),
              # Query and Key vectors
              Q_orig=[r['Q_orig'] for r in results],
-             Q_quant=[r['Q_quant'] for r in results],
+             Q_quant_nearest=[r['Q_quant_nearest'] for r in results],
+             Q_quant_flip=[r['Q_quant_flip'] for r in results],
              K_orig=K_orig,
-             K_quant=K_quant)
+             K_quant_nearest=K_nearest,
+             K_quant_flip=K_flip)
     print(f"  Saved: quantization_results.npz")
 
     print("\n" + "="*70)
     print("✓ Analysis complete!")
     print("="*70)
     print("\nKey findings:")
-    print(f"  1. Mean attention score error: {np.mean(np.abs(errors)):.6f} "
-          f"({np.mean(np.abs(rel_errors)):.4f}%)")
-    print(f"  2. Mean Wq scale across 4 heads: {np.mean(scale_means):.8f}")
-    print(f"  3. Mean Wk scale: {Wk_scales.mean():.8f}")
-    print(f"  4. INT4 quantization (group_size=128) introduces "
-          f"{np.mean(np.abs(rel_errors)):.2f}% error on average")
+    print(f"  1. Nearest quantization:")
+    print(f"     - Mean attention score error: {np.mean(np.abs(errors_nearest)):.6f} "
+          f"({np.mean(np.abs(rel_errors_nearest)):.4f}%)")
+    print(f"  2. Heuristic quantization:")
+    print(f"     - Mean attention score error: {np.mean(np.abs(errors_flip)):.6f} "
+          f"({np.mean(np.abs(rel_errors_flip)):.4f}%)")
+    print(f"     - Flipped {Wq_flip_stats['total_flips'] + Wk_flip_stats['total_flips']:,} weights "
+          f"({((Wq_flip_stats['total_flips'] + Wk_flip_stats['total_flips']) / (Wq.size + Wk.size) * 100):.4f}%)")
+    print(f"  3. Improvement: {np.mean(improvements):.2f}% average error reduction")
+    print(f"  4. Best improvement: {np.max(improvements):.2f}% (head {np.argmax(improvements)})")
 
 
 if __name__ == '__main__':
