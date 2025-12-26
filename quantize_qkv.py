@@ -402,17 +402,18 @@ def quantize_weight_groupwise_int4_with_flip(W, activation_means, group_size=128
 
 def quantize_qkv_reflip(Wq, Wk, X, Q_orig_all, Q_heuristic_all,
                          Wq_heuristic, Wk_heuristic,
-                         critical_dim_pct=0.05, knee_tolerance=0.0,
-                         group_size=128, max_flip_pct=0.01, debug=False):
+                         critical_dim_pct=0.15, knee_tolerance=0.0,
+                         group_size=128, max_flip_pct=0.05,
+                         correction_scale=10.0, debug=False):
     """
     ReFlip: Targeted error correction on critical head dimensions.
 
     Strategy:
     1. Start with heuristic quantization results (already quantized)
     2. For each head, identify critical dimensions using Kneedle on |Q_orig|
-    3. Select top ~5% critical dimensions (configurable)
+    3. Select top ~15% critical dimensions (configurable, increased from 5%)
     4. Compute target error correction for critical dimensions
-    5. Apply second heuristic flip weighted by target corrections
+    5. Apply aggressive weighted heuristic flip (5% max flip, 10x correction scale)
 
     Args:
         Wq: Query weights [num_heads, head_dim, hidden_dim] = [4, 128, 4096]
@@ -422,10 +423,11 @@ def quantize_qkv_reflip(Wq, Wk, X, Q_orig_all, Q_heuristic_all,
         Q_heuristic_all: Heuristic quantized Q vectors [num_heads, head_dim]
         Wq_heuristic: Heuristic quantized Wq weights (starting point)
         Wk_heuristic: Heuristic quantized Wk weights (starting point)
-        critical_dim_pct: Percentage of head dims to protect (default: 0.05 = 5%)
+        critical_dim_pct: Percentage of head dims to protect (default: 0.15 = 15%)
         knee_tolerance: Tolerance for Kneedle algorithm (default: 0.0)
         group_size: Quantization group size (default: 128)
-        max_flip_pct: Max flip percentage for heuristic (default: 0.01 = 1%)
+        max_flip_pct: Max flip percentage for heuristic (default: 0.05 = 5%)
+        correction_scale: Scaling factor for error correction weighting (default: 10.0)
         debug: Print debug information
 
     Returns:
@@ -499,13 +501,14 @@ def quantize_qkv_reflip(Wq, Wk, X, Q_orig_all, Q_heuristic_all,
         # Extract weight rows for critical dimensions
         W_critical = Wq_reflip[head_idx, critical_indices, :]  # [num_critical, 4096]
 
-        # For these rows, apply heuristic flip with weighted activations
-        # Weight each row's activation by the target correction magnitude
+        # For these rows, apply aggressive heuristic flip with weighted activations
+        # Weight each row's activation by the target correction magnitude * scaling factor
         for i, (dim_idx, correction) in enumerate(zip(critical_indices, target_corrections)):
-            # Weight activation means by correction magnitude for this dimension
-            weighted_act = activation_weights * np.abs(correction)
+            # AGGRESSIVE WEIGHTING: Scale up by correction_scale (default 10x)
+            # This makes the flips more responsive to error correction needs
+            weighted_act = activation_weights * np.abs(correction) * correction_scale
 
-            # Apply single-row heuristic flip
+            # Apply single-row heuristic flip with aggressive settings
             # Quantize this single row with weighted activations
             W_row = Wq_reflip[head_idx, dim_idx:dim_idx+1, :]  # [1, 4096]
 
@@ -515,6 +518,9 @@ def quantize_qkv_reflip(Wq, Wk, X, Q_orig_all, Q_heuristic_all,
                     knee_tolerance=knee_tolerance, max_flip_pct=max_flip_pct, debug=False
                 )
                 Wq_reflip[head_idx, dim_idx, :] = W_row_quant[0]
+
+                if debug:
+                    print(f"    Row {dim_idx}: correction={correction:.6f}, flips={row_stats['total_flips']}")
             except Exception as e:
                 if debug:
                     print(f"  Warning: Failed to flip row {dim_idx} in head {head_idx}: {e}")
@@ -566,14 +572,16 @@ def compute_quantization_error(W_orig, W_quant):
 def main():
     # Parse command-line arguments
     parser = argparse.ArgumentParser(description='INT4 Quantization with ReFlip Strategy')
-    parser.add_argument('--critical-dim-pct', type=float, default=0.05,
-                        help='Percentage of head dimensions to protect in ReFlip (default: 0.05 = 5%%)')
+    parser.add_argument('--critical-dim-pct', type=float, default=0.15,
+                        help='Percentage of head dimensions to protect in ReFlip (default: 0.15 = 15%%)')
     parser.add_argument('--knee-tolerance', type=float, default=0.0,
                         help='Tolerance offset for Kneedle algorithm (default: 0.0)')
     parser.add_argument('--group-size', type=int, default=128,
                         help='Quantization group size (default: 128)')
-    parser.add_argument('--max-flip-pct', type=float, default=0.01,
-                        help='Max flip percentage (default: 0.01 = 1%%)')
+    parser.add_argument('--max-flip-pct', type=float, default=0.05,
+                        help='Max flip percentage for ReFlip (default: 0.05 = 5%%)')
+    parser.add_argument('--correction-scale', type=float, default=10.0,
+                        help='Error correction scaling factor for ReFlip (default: 10.0)')
     parser.add_argument('--debug', action='store_true',
                         help='Print debug information')
     args = parser.parse_args()
@@ -583,10 +591,11 @@ def main():
     print("Comparing: Nearest | Heuristic | ReFlip")
     print("="*70)
     print(f"\nParameters:")
-    print(f"  Critical dim %%: {args.critical_dim_pct*100:.1f}%%")
+    print(f"  Critical dim %%: {args.critical_dim_pct*100:.1f}%% (increased from 5%% for more aggressive correction)")
     print(f"  Knee tolerance: {args.knee_tolerance}")
     print(f"  Group size: {args.group_size}")
-    print(f"  Max flip %%: {args.max_flip_pct*100:.1f}%%")
+    print(f"  Max flip %% (ReFlip): {args.max_flip_pct*100:.1f}%% (5x more than heuristic)")
+    print(f"  Correction scale: {args.correction_scale}x (amplifies error correction weighting)")
 
     # Load data
     print("\n[1] Loading data...")
@@ -673,6 +682,7 @@ def main():
         knee_tolerance=args.knee_tolerance,
         group_size=args.group_size,
         max_flip_pct=args.max_flip_pct,
+        correction_scale=args.correction_scale,
         debug=args.debug
     )
 
