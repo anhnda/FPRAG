@@ -401,13 +401,14 @@ def quantize_weight_groupwise_int4_with_flip(W, activation_means, group_size=128
 
 
 def quantize_qkv_reflip(Wq, Wk, X, Q_orig_all, Q_heuristic_all,
+                         Wq_heuristic, Wk_heuristic,
                          critical_dim_pct=0.05, knee_tolerance=0.0,
                          group_size=128, max_flip_pct=0.01, debug=False):
     """
     ReFlip: Targeted error correction on critical head dimensions.
 
     Strategy:
-    1. Start with heuristic quantization results
+    1. Start with heuristic quantization results (already quantized)
     2. For each head, identify critical dimensions using Kneedle on |Q_orig|
     3. Select top ~5% critical dimensions (configurable)
     4. Compute target error correction for critical dimensions
@@ -419,6 +420,8 @@ def quantize_qkv_reflip(Wq, Wk, X, Q_orig_all, Q_heuristic_all,
         X: Input activation vector [hidden_dim] = [4096]
         Q_orig_all: Original Q vectors for all heads [num_heads, head_dim]
         Q_heuristic_all: Heuristic quantized Q vectors [num_heads, head_dim]
+        Wq_heuristic: Heuristic quantized Wq weights (starting point)
+        Wk_heuristic: Heuristic quantized Wk weights (starting point)
         critical_dim_pct: Percentage of head dims to protect (default: 0.05 = 5%)
         knee_tolerance: Tolerance for Kneedle algorithm (default: 0.0)
         group_size: Quantization group size (default: 128)
@@ -434,8 +437,8 @@ def quantize_qkv_reflip(Wq, Wk, X, Q_orig_all, Q_heuristic_all,
     head_dim = Wq.shape[1]
     hidden_dim = Wq.shape[2]
 
-    # Initialize with heuristic quantization (already done, start from Wq)
-    Wq_reflip = Wq.copy()
+    # CRITICAL FIX: Start with heuristic-quantized weights, not original weights
+    Wq_reflip = Wq_heuristic.copy()
 
     all_critical_dims = []
     all_corrections = []
@@ -517,15 +520,20 @@ def quantize_qkv_reflip(Wq, Wk, X, Q_orig_all, Q_heuristic_all,
                     print(f"  Warning: Failed to flip row {dim_idx} in head {head_idx}: {e}")
                 continue
 
-    # Quantize final Wq_reflip to ensure INT4 (re-quantize with nearest rounding)
-    Wq_quant_reflip, Wq_scales, Wq_zp, Wq_int = quantize_weight_groupwise_int4(
-        Wq_reflip, group_size=group_size
-    )
+    # CRITICAL FIX: Don't re-quantize! Wq_reflip is already refined from heuristic quantization
+    # Just return the refined weights directly
+    Wq_quant_reflip = Wq_reflip
+
+    # For compatibility, create dummy scales/zp (not used since weights are already quantized)
+    Wq_scales = np.ones((num_heads, head_dim, hidden_dim // group_size))
+    Wq_zp = np.zeros((num_heads, head_dim, hidden_dim // group_size))
+    Wq_int = Wq_reflip  # Already in FP form from heuristic
 
     # Wk remains the same (use heuristic version)
-    Wk_quant_reflip, Wk_scales, Wk_zp, Wk_int = quantize_weight_groupwise_int4(
-        Wk, group_size=group_size
-    )
+    Wk_quant_reflip = Wk_heuristic
+    Wk_scales = np.ones((head_dim, hidden_dim // group_size))
+    Wk_zp = np.zeros((head_dim, hidden_dim // group_size))
+    Wk_int = Wk_heuristic
 
     reflip_stats = {
         'critical_dims_per_head': [len(dims) for dims in all_critical_dims],
@@ -655,11 +663,12 @@ def main():
         Q_orig_all[head_idx] = X @ Wq[head_idx].T  # [4096] @ [128, 4096]^T = [128]
         Q_heuristic_all[head_idx] = X @ Wq_quant_flip[head_idx].T
 
-    # Apply ReFlip
+    # Apply ReFlip (build on top of heuristic quantization)
     (Wq_quant_reflip, Wq_scales_reflip, Wq_zp_reflip, Wq_int_reflip,
      Wk_quant_reflip, Wk_scales_reflip, Wk_zp_reflip, Wk_int_reflip,
      reflip_stats) = quantize_qkv_reflip(
         Wq, Wk, X, Q_orig_all, Q_heuristic_all,
+        Wq_quant_flip, Wk_quant_flip,  # Pass heuristic-quantized weights
         critical_dim_pct=args.critical_dim_pct,
         knee_tolerance=args.knee_tolerance,
         group_size=args.group_size,
