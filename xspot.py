@@ -119,6 +119,10 @@ class JamesSteinGQAExporter:
         """
         Compute James-Stein shrinkage estimates for channel means.
 
+        Uses the same implementation as awq_js_xl.py:
+        - Variance estimate: mean absolute deviation squared (not activation variance)
+        - Shrinkage formula: c = (p - 2) * σ² / Σ(X̄[j] - μ̄)²
+
         Args:
             X: Activations tensor of shape [num_tokens, hidden_size]
 
@@ -137,36 +141,65 @@ class JamesSteinGQAExporter:
         naive_means = X.mean(dim=0)  # shape: [hidden_size]
         print(f"Naive means shape: {naive_means.shape}")
 
+        # Number of channels
+        p = self.hidden_size
+        print(f"Number of channels (p): {p}")
+
+        # Need at least 3 dimensions for James-Stein to be beneficial
+        if p < 3:
+            print("WARNING: p < 3, James-Stein not applicable, returning naive means")
+            return {
+                'naive_means': naive_means,
+                'js_means': naive_means,
+                'grand_mean': naive_means.mean(),
+                'shrinkage_factor': torch.tensor(0.0),
+                'variance': torch.tensor(0.0),
+                'squared_distance': torch.tensor(0.0)
+            }
+
         # Compute grand mean (mean of all channel means)
         # μ̄ = mean(x̄)
         grand_mean = naive_means.mean()
         print(f"Grand mean: {grand_mean.item():.6f}")
 
-        # Compute variance estimate
-        # Use pooled sample variance across all channels
-        variance = X.var(dim=0).mean()
-        print(f"Estimated variance (pooled): {variance.item():.6f}")
+        # Compute deviations from grand mean
+        deviations = naive_means - grand_mean
 
-        # Compute squared distance from grand mean
-        # ||x̄ - μ̄||²
-        squared_distance = ((naive_means - grand_mean) ** 2).sum()
-        print(f"Squared distance ||x̄ - μ̄||²: {squared_distance.item():.6f}")
+        # Compute sum of squared deviations
+        sum_sq_dev = (deviations ** 2).sum()
+        print(f"Sum of squared deviations: {sum_sq_dev.item():.6f}")
 
-        # Number of channels
-        p = self.hidden_size
-        print(f"Number of channels (p): {p}")
+        # Prevent division by zero
+        if sum_sq_dev < 1e-10:
+            print("WARNING: All means are the same, no shrinkage needed")
+            return {
+                'naive_means': naive_means,
+                'js_means': naive_means,
+                'grand_mean': grand_mean,
+                'shrinkage_factor': torch.tensor(0.0),
+                'variance': torch.tensor(0.0),
+                'squared_distance': sum_sq_dev
+            }
+
+        # CRITICAL FIX: Estimate variance using mean absolute deviation squared
+        # This is the variance of the MEANS, not the variance of the data
+        # Use a conservative estimate: mean absolute deviation squared
+        variance_estimate = ((naive_means - grand_mean).abs().mean()) ** 2
+        # Add small constant for numerical stability
+        variance_estimate = variance_estimate.clamp(min=1e-8)
+        print(f"Variance estimate (MAD²): {variance_estimate.item():.6f}")
 
         # James-Stein shrinkage factor
-        # λ = (p - 2) * σ² / ||x̄ - μ̄||²
-        shrinkage_factor = (p - 2) * variance / (squared_distance + 1e-10)  # Add epsilon for stability
+        # c = (p - 2) * σ² / Σ(X̄[j] - μ̄)²
+        shrinkage_factor = ((p - 2) * variance_estimate) / sum_sq_dev
 
         # Clip shrinkage factor to [0, 1] for stability
-        shrinkage_factor = torch.clamp(shrinkage_factor, 0.0, 1.0)
-        print(f"Shrinkage factor λ: {shrinkage_factor.item():.6f}")
+        shrinkage_factor = shrinkage_factor.clamp(0.0, 1.0)
+        print(f"Shrinkage factor c: {shrinkage_factor.item():.6f}")
 
         # Apply James-Stein shrinkage
-        # θ̂_JS = μ̄ + (1 - λ) * (x̄ - μ̄)
-        js_means = grand_mean + (1 - shrinkage_factor) * (naive_means - grand_mean)
+        # θ̂_JS[j] = μ̄ + (1 - c) * (x̄[j] - μ̄)
+        js_means = grand_mean + (1 - shrinkage_factor) * deviations
         print(f"James-Stein means shape: {js_means.shape}")
 
         # Compute statistics
@@ -182,8 +215,8 @@ class JamesSteinGQAExporter:
             'js_means': js_means,
             'grand_mean': grand_mean,
             'shrinkage_factor': shrinkage_factor,
-            'variance': variance,
-            'squared_distance': squared_distance
+            'variance': variance_estimate,
+            'squared_distance': sum_sq_dev
         }
 
     def extract_group_weights(self):
