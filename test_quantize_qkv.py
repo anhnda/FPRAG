@@ -790,6 +790,55 @@ def main():
     plt.savefig('attention_quantization_analysis.png', dpi=300, bbox_inches='tight')
     print(f"  Saved: attention_quantization_analysis.png")
 
+    # New figure: Sorted errors over 128 head dimensions for 4 heads
+    print("\n[5b] Generating sorted error visualization...")
+    fig2 = plt.figure(figsize=(16, 12))
+
+    for head_idx in range(num_heads):
+        ax = fig2.add_subplot(2, 2, head_idx + 1)
+
+        # Get Q vectors for this head
+        Q_orig = results[head_idx]['Q_orig']
+        Q_nearest = results[head_idx]['Q_quant_nearest']
+        Q_flip = results[head_idx]['Q_quant_flip']
+
+        # Compute errors (keeping sign)
+        Q_error_nearest = Q_nearest - Q_orig
+        Q_error_flip = Q_flip - Q_orig
+
+        # Sort errors (keeping sign)
+        sorted_error_nearest = np.sort(Q_error_nearest)
+        sorted_error_flip = np.sort(Q_error_flip)
+
+        # Plot
+        x_dims = np.arange(len(sorted_error_nearest))
+        ax.plot(x_dims, sorted_error_nearest, label='Nearest', alpha=0.8,
+                linewidth=1.5, color='orange', marker='o', markersize=2)
+        ax.plot(x_dims, sorted_error_flip, label='Heuristic', alpha=0.8,
+                linewidth=1.5, color='green', marker='s', markersize=2)
+
+        # Add zero line
+        ax.axhline(0, color='black', linestyle='--', linewidth=1, alpha=0.5)
+
+        # Statistics
+        mean_nearest = Q_error_nearest.mean()
+        mean_flip = Q_error_flip.mean()
+        std_nearest = Q_error_nearest.std()
+        std_flip = Q_error_flip.std()
+
+        ax.set_xlabel('Sorted Dimension Index', fontsize=11)
+        ax.set_ylabel('Error (Quantized - Original)', fontsize=11)
+        ax.set_title(f'Head {head_idx}: Sorted Q Errors (128 dims)\n'
+                     f'Nearest: μ={mean_nearest:.4f}, σ={std_nearest:.4f} | '
+                     f'Heuristic: μ={mean_flip:.4f}, σ={std_flip:.4f}',
+                     fontsize=10)
+        ax.legend(loc='best', fontsize=10)
+        ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig('sorted_error_comparison.png', dpi=300, bbox_inches='tight')
+    print(f"  Saved: sorted_error_comparison.png")
+
     # Save detailed results
     print("\n[6] Saving detailed results...")
     np.savez('quantization_results.npz',
