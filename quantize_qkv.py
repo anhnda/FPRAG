@@ -344,8 +344,12 @@ def quantize_qkv_reflip(Wq, Wk, X, Q_orig_all, Q_heuristic_all,
             print(f"  Dim corrections (first 5): {dim_corrections[:5]}")
             print(f"  Sum of corrections: {dim_corrections.sum():.6f} (should ≈ {score_error:.6f})")
 
-    # Step 3: Apply weighted corrections to Wq dimensions
-    activation_weights = np.abs(X)  # Base weight from input magnitude
+    # Step 3: Apply direct weight adjustments to correct Q dimensions
+    # Goal: For dimension i, change Q[i] = X @ Wq[head, i, :] by dim_corrections[i]
+    # Method: Redistribute correction across weight dimensions proportionally to X values
+
+    X_abs = np.abs(X)
+    X_abs_sum = X_abs.sum()
 
     for head_idx in range(num_heads):
         moderate_indices = all_moderate_dims[head_idx]
@@ -354,28 +358,22 @@ def quantize_qkv_reflip(Wq, Wk, X, Q_orig_all, Q_heuristic_all,
         if len(moderate_indices) == 0:
             continue
 
-        # For each moderate dimension, adjust Wq[head, dim, :]
+        # For each moderate dimension, adjust Wq[head, dim, :] directly
         for i, (dim_idx, correction) in enumerate(zip(moderate_indices, dim_corrections)):
-            # Weight activations by correction magnitude and scaling factor
-            # Goal: change X @ Wq[dim, :] by 'correction'
-            weighted_act = activation_weights * np.abs(correction) * correction_scale
+            # Redistribute correction to weight dimensions proportionally to |X|
+            # delta_W[j] = correction * (|X[j]| / sum(|X|)) * sign(X[j])
+            # This ensures: X @ delta_W ≈ correction
 
-            # Apply heuristic flip to this row
-            W_row = Wq_reflip[head_idx, dim_idx:dim_idx+1, :]  # [1, 4096]
+            # Apply correction with proper sign
+            W_adjustment = correction * (X_abs / X_abs_sum) * np.sign(X) * correction_scale
 
-            try:
-                W_row_quant, _, _, _, row_stats = quantize_weight_groupwise_int4_with_flip(
-                    W_row, weighted_act, group_size=group_size,
-                    knee_tolerance=knee_tolerance, max_flip_pct=max_flip_pct, debug=False
-                )
-                Wq_reflip[head_idx, dim_idx, :] = W_row_quant[0]
+            # Apply adjustment to quantized weights
+            Wq_reflip[head_idx, dim_idx, :] += W_adjustment
 
-                if debug:
-                    print(f"    Dim {dim_idx}: correction={correction:.6f}, flips={row_stats['total_flips']}")
-            except Exception as e:
-                if debug:
-                    print(f"  Warning: Failed to flip dim {dim_idx} in head {head_idx}: {e}")
-                continue
+            if debug:
+                actual_change = X @ W_adjustment
+                print(f"    Dim {dim_idx}: target={correction:.6f}, actual={actual_change:.6f}, "
+                      f"adjustment_norm={np.linalg.norm(W_adjustment):.6f}")
 
     # Return refined weights
     Wq_quant_reflip = Wq_reflip
