@@ -217,7 +217,8 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
 
         # ===== 2. Compute Q/K Values and Errors (Vectorized) =====
         # K_values: [total_heads, head_dim] - Each K head repeated gqa_ratio times
-        K_values = K_orig_all.squeeze(2).unsqueeze(1).expand(num_k_heads, gqa_ratio, head_dim).reshape(total_heads, head_dim)
+        # K_orig_all shape: [num_k_heads, s=1, head_dim] → expand → [num_k_heads, gqa_ratio, head_dim]
+        K_values = K_orig_all.expand(num_k_heads, gqa_ratio, head_dim).reshape(total_heads, head_dim)
 
         Q_target = Q_orig_all.contiguous().view(total_heads, head_dim)
         Q_current = Q_heuristic_all.contiguous().view(total_heads, head_dim)
@@ -386,7 +387,7 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
         Wq_dequant_4d = (Wq_int_4d.float() - zp_expanded) * scales_expanded
         Q_heuristic_all = torch.einsum('bghd,d->bgh', Wq_dequant_4d, X)
 
-        K_orig_all = torch.einsum('b1hd,d->b1h', Wk_orig_4d, X)  # [num_k, 1, head_dim]
+        K_orig_all = torch.einsum('bshd,d->bsh', Wk_orig_4d, X)  # [num_k, s=1, head_dim]
 
         # ===== 6. Apply Batched ReFlip =====
         try:
