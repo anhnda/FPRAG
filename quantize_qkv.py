@@ -228,19 +228,18 @@ def quantize_weight_groupwise_int4_with_flip(W, activation_means, group_size=128
 
 
 def quantize_qkv_reflip(Wq, Wk, X, Q_orig_all, Q_heuristic_all,
-                         Wq_heuristic, Wk_heuristic,
+                         Wq_heuristic, Wk_heuristic, K_heuristic,
                          critical_dim_pct=0.15, knee_tolerance=0.0,
                          group_size=128, max_flip_pct=0.05,
                          correction_scale=1.0, debug=False):
     """
-    ReFlip: Targeted error correction on critical head dimensions.
+    ReFlip: Targeted error correction on attention scores.
 
     Strategy:
-    1. Start with heuristic quantization results (already quantized)
-    2. For each head, identify critical dimensions using Kneedle on |Q_orig|
-    3. Select top ~15% critical dimensions (configurable, increased from 5%)
-    4. Compute target error correction for critical dimensions
-    5. Apply aggressive weighted heuristic flip (5% max flip, 10x correction scale)
+    1. Compute attention score error per head: score_error = (Q·K)_quant - (Q·K)_orig (4 scalars)
+    2. Identify moderate dimensions using Kneedle on sorted |Q_orig| (start from knee, take next 5%)
+    3. Redistribute scalar error to moderate dimensions proportionally to Q values
+    4. Apply weighted heuristic flip to correct Wq for selected dimensions
 
     Args:
         Wq: Query weights [num_heads, head_dim, hidden_dim] = [4, 128, 4096]
@@ -250,7 +249,8 @@ def quantize_qkv_reflip(Wq, Wk, X, Q_orig_all, Q_heuristic_all,
         Q_heuristic_all: Heuristic quantized Q vectors [num_heads, head_dim]
         Wq_heuristic: Heuristic quantized Wq weights (starting point)
         Wk_heuristic: Heuristic quantized Wk weights (starting point)
-        critical_dim_pct: Percentage of head dims to protect (default: 0.15 = 15%)
+        K_heuristic: Heuristic quantized K vector [head_dim]
+        critical_dim_pct: Percentage of moderate dims to select (default: 0.05 = 5%)
         knee_tolerance: Tolerance for Kneedle algorithm (default: 0.0)
         group_size: Quantization group size (default: 128)
         max_flip_pct: Max flip percentage for heuristic (default: 0.05 = 5%)
@@ -266,77 +266,101 @@ def quantize_qkv_reflip(Wq, Wk, X, Q_orig_all, Q_heuristic_all,
     head_dim = Wq.shape[1]
     hidden_dim = Wq.shape[2]
 
-    # CRITICAL FIX: Start with heuristic-quantized weights, not original weights
+    # Start with heuristic-quantized weights
     Wq_reflip = Wq_heuristic.copy()
 
-    all_critical_dims = []
-    all_corrections = []
+    # Compute K_orig for reference
+    K_orig = X @ Wk.T  # [head_dim]
 
-    # Step 1: Identify critical dimensions for each head
+    all_moderate_dims = []
+    all_dim_corrections = []
+    all_score_errors = []
+
+    # Step 1: Compute attention score errors (scalars per head)
     for head_idx in range(num_heads):
         Q_orig = Q_orig_all[head_idx]
         Q_heuristic = Q_heuristic_all[head_idx]
 
-        # Compute error after heuristic quantization
-        error = Q_heuristic - Q_orig  # [head_dim]
+        # Compute attention scores (scalars)
+        score_orig = Q_orig @ K_orig
+        score_heuristic = Q_heuristic @ K_heuristic
 
-        # Use Kneedle to find critical dimensions based on |Q_orig|
-        sorted_indices_desc = np.argsort(np.abs(Q_orig))[::-1]  # Descending by magnitude
-        sorted_magnitudes = np.abs(Q_orig[sorted_indices_desc])
+        # Scalar error to correct
+        score_error = score_orig - score_heuristic
 
-        # Apply Kneedle to first half to find threshold
-        first_half = sorted_magnitudes[:head_dim // 2]
-        knee_idx = find_knee_point(first_half[::-1], tolerance_offset=knee_tolerance)  # Reverse for ascending
-        knee_idx = len(first_half) - knee_idx - 1  # Convert back to descending index
-
-        # Select critical dimensions: those above knee + top critical_dim_pct
-        num_critical = max(int(critical_dim_pct * head_dim), 1)
-        num_critical = min(num_critical, knee_idx + 1)  # Don't exceed knee threshold
-
-        critical_indices = sorted_indices_desc[:num_critical]
-        all_critical_dims.append(critical_indices)
-
-        # Compute target error correction for critical dimensions
-        # Goal: reduce error to 0, so correction = -error
-        target_corrections = -error[critical_indices]  # [num_critical]
-
-        all_corrections.append(target_corrections)
+        all_score_errors.append(score_error)
 
         if debug:
             print(f"\nHead {head_idx}:")
-            print(f"  Critical dimensions: {num_critical}/{head_dim} ({num_critical/head_dim*100:.1f}%)")
-            print(f"  Knee index: {knee_idx}, Magnitude threshold: {sorted_magnitudes[knee_idx]:.4f}")
-            print(f"  Critical dims: {critical_indices[:5]}...")  # Show first 5
-            print(f"  Target corrections (first 5): {target_corrections[:5]}")
+            print(f"  Score original:    {score_orig:.6f}")
+            print(f"  Score heuristic:   {score_heuristic:.6f}")
+            print(f"  Score error:       {score_error:.6f}")
 
-    # Step 2: Apply weighted heuristic flip for critical dimensions
-    # For each critical dimension, we want to adjust Wq[head, dim, :]
-    # The adjustment should reduce the error in Q[dim] = X @ Wq[dim, :]
+    # Step 2: Identify moderate dimensions and redistribute error
+    for head_idx in range(num_heads):
+        Q_orig = Q_orig_all[head_idx]
+        score_error = all_score_errors[head_idx]
 
-    # Create weighted activation means for second flip
-    # Weight by: |X[j]| * sum_over_heads(target_correction[dim] for critical dims)
+        # Sort by |Q_orig| magnitude (descending)
+        sorted_indices_desc = np.argsort(np.abs(Q_orig))[::-1]
+        sorted_magnitudes = np.abs(Q_orig[sorted_indices_desc])
+
+        # Apply Kneedle to find knee point (transition from high to moderate)
+        # Use first half to find the knee
+        first_half = sorted_magnitudes[:head_dim // 2]
+        knee_idx = find_knee_point(first_half[::-1], tolerance_offset=knee_tolerance)
+        knee_idx = len(first_half) - knee_idx - 1  # Convert back to descending index
+
+        # Select moderate dimensions: starting from knee, take next critical_dim_pct %
+        # These are dimensions after the knee (moderate importance, not too high, not too low)
+        num_moderate = max(int(critical_dim_pct * head_dim), 1)
+        moderate_start = knee_idx
+        moderate_end = min(moderate_start + num_moderate, head_dim)
+        moderate_indices = sorted_indices_desc[moderate_start:moderate_end]
+
+        all_moderate_dims.append(moderate_indices)
+
+        # Redistribute scalar error to moderate dimensions proportionally to Q values
+        if len(moderate_indices) > 0:
+            Q_moderate = Q_orig[moderate_indices]  # Q values for moderate dimensions
+            Q_moderate_abs = np.abs(Q_moderate)
+            Q_moderate_sum = Q_moderate_abs.sum()
+
+            if Q_moderate_sum > 1e-10:
+                # Proportional distribution: correction[i] = score_error * (|Q[i]| / sum(|Q[moderate]|))
+                dim_corrections = score_error * (Q_moderate_abs / Q_moderate_sum)
+            else:
+                # Uniform distribution if all values are near zero
+                dim_corrections = np.full(len(moderate_indices), score_error / len(moderate_indices))
+        else:
+            dim_corrections = np.array([])
+
+        all_dim_corrections.append(dim_corrections)
+
+        if debug:
+            print(f"  Knee index: {knee_idx}/{head_dim}, magnitude: {sorted_magnitudes[knee_idx]:.4f}")
+            print(f"  Moderate dims: {len(moderate_indices)} (from {moderate_start} to {moderate_end})")
+            print(f"  Moderate indices: {moderate_indices[:5]}...")
+            print(f"  Dim corrections (first 5): {dim_corrections[:5]}")
+            print(f"  Sum of corrections: {dim_corrections.sum():.6f} (should ≈ {score_error:.6f})")
+
+    # Step 3: Apply weighted corrections to Wq dimensions
     activation_weights = np.abs(X)  # Base weight from input magnitude
 
-    # For each head, apply correction to critical dimensions only
     for head_idx in range(num_heads):
-        critical_indices = all_critical_dims[head_idx]
-        target_corrections = all_corrections[head_idx]
+        moderate_indices = all_moderate_dims[head_idx]
+        dim_corrections = all_dim_corrections[head_idx]
 
-        if len(critical_indices) == 0:
+        if len(moderate_indices) == 0:
             continue
 
-        # Extract weight rows for critical dimensions
-        W_critical = Wq_reflip[head_idx, critical_indices, :]  # [num_critical, 4096]
-
-        # For these rows, apply aggressive heuristic flip with weighted activations
-        # Weight each row's activation by the target correction magnitude * scaling factor
-        for i, (dim_idx, correction) in enumerate(zip(critical_indices, target_corrections)):
-            # AGGRESSIVE WEIGHTING: Scale up by correction_scale (default 10x)
-            # This makes the flips more responsive to error correction needs
+        # For each moderate dimension, adjust Wq[head, dim, :]
+        for i, (dim_idx, correction) in enumerate(zip(moderate_indices, dim_corrections)):
+            # Weight activations by correction magnitude and scaling factor
+            # Goal: change X @ Wq[dim, :] by 'correction'
             weighted_act = activation_weights * np.abs(correction) * correction_scale
 
-            # Apply single-row heuristic flip with aggressive settings
-            # Quantize this single row with weighted activations
+            # Apply heuristic flip to this row
             W_row = Wq_reflip[head_idx, dim_idx:dim_idx+1, :]  # [1, 4096]
 
             try:
@@ -347,32 +371,32 @@ def quantize_qkv_reflip(Wq, Wk, X, Q_orig_all, Q_heuristic_all,
                 Wq_reflip[head_idx, dim_idx, :] = W_row_quant[0]
 
                 if debug:
-                    print(f"    Row {dim_idx}: correction={correction:.6f}, flips={row_stats['total_flips']}")
+                    print(f"    Dim {dim_idx}: correction={correction:.6f}, flips={row_stats['total_flips']}")
             except Exception as e:
                 if debug:
-                    print(f"  Warning: Failed to flip row {dim_idx} in head {head_idx}: {e}")
+                    print(f"  Warning: Failed to flip dim {dim_idx} in head {head_idx}: {e}")
                 continue
 
-    # CRITICAL FIX: Don't re-quantize! Wq_reflip is already refined from heuristic quantization
-    # Just return the refined weights directly
+    # Return refined weights
     Wq_quant_reflip = Wq_reflip
 
-    # For compatibility, create dummy scales/zp (not used since weights are already quantized)
+    # Dummy scales/zp for compatibility
     Wq_scales = np.ones((num_heads, head_dim, hidden_dim // group_size))
     Wq_zp = np.zeros((num_heads, head_dim, hidden_dim // group_size))
-    Wq_int = Wq_reflip  # Already in FP form from heuristic
+    Wq_int = Wq_reflip
 
-    # Wk remains the same (use heuristic version)
+    # Wk remains the same
     Wk_quant_reflip = Wk_heuristic
     Wk_scales = np.ones((head_dim, hidden_dim // group_size))
     Wk_zp = np.zeros((head_dim, hidden_dim // group_size))
     Wk_int = Wk_heuristic
 
     reflip_stats = {
-        'critical_dims_per_head': [len(dims) for dims in all_critical_dims],
-        'total_critical_dims': sum(len(dims) for dims in all_critical_dims),
-        'critical_dim_pct': critical_dim_pct,
-        'knee_tolerance': knee_tolerance
+        'moderate_dims_per_head': [len(dims) for dims in all_moderate_dims],
+        'total_moderate_dims': sum(len(dims) for dims in all_moderate_dims),
+        'moderate_dim_pct': critical_dim_pct,
+        'knee_tolerance': knee_tolerance,
+        'score_errors': all_score_errors  # Store for analysis
     }
 
     return (Wq_quant_reflip, Wq_scales, Wq_zp, Wq_int,
@@ -479,8 +503,8 @@ def main():
     print(f"        Error before flip: {Wk_flip_stats['error_before_flip']:.6f}")
     print(f"        Error after flip:  {Wk_flip_stats['error_after_flip']:.6f}")
 
-    # Strategy 3: ReFlip (targeted error correction on critical dimensions)
-    print("\n  [2c] Applying REFLIP correction (targeted critical dimensions)...")
+    # Strategy 3: ReFlip (targeted error correction on attention scores)
+    print("\n  [2c] Applying REFLIP correction (attention score error redistribution)...")
 
     # Compute Q_orig and Q_heuristic for all heads (needed for ReFlip)
     num_heads = Wq.shape[0]
@@ -491,12 +515,15 @@ def main():
         Q_orig_all[head_idx] = X @ Wq[head_idx].T  # [4096] @ [128, 4096]^T = [128]
         Q_heuristic_all[head_idx] = X @ Wq_quant_flip[head_idx].T
 
+    # Compute K_heuristic (needed for attention score calculation)
+    K_heuristic = X @ Wk_quant_flip.T  # [128]
+
     # Apply ReFlip (build on top of heuristic quantization)
     (Wq_quant_reflip, Wq_scales_reflip, Wq_zp_reflip, Wq_int_reflip,
      Wk_quant_reflip, Wk_scales_reflip, Wk_zp_reflip, Wk_int_reflip,
      reflip_stats) = quantize_qkv_reflip(
         Wq, Wk, X, Q_orig_all, Q_heuristic_all,
-        Wq_quant_flip, Wk_quant_flip,  # Pass heuristic-quantized weights
+        Wq_quant_flip, Wk_quant_flip, K_heuristic,  # Pass heuristic-quantized weights and K
         critical_dim_pct=args.critical_dim_pct,
         knee_tolerance=args.knee_tolerance,
         group_size=args.group_size,
@@ -506,10 +533,11 @@ def main():
     )
 
     print(f"\n  ReFlip statistics:")
-    print(f"    Total critical dims: {reflip_stats['total_critical_dims']} "
+    print(f"    Total moderate dims: {reflip_stats['total_moderate_dims']} "
           f"across {num_heads} heads")
-    print(f"    Critical dims per head: {reflip_stats['critical_dims_per_head']}")
-    print(f"    Target percentage: {reflip_stats['critical_dim_pct']*100:.1f}%")
+    print(f"    Moderate dims per head: {reflip_stats['moderate_dims_per_head']}")
+    print(f"    Target percentage: {reflip_stats['moderate_dim_pct']*100:.1f}%")
+    print(f"    Attention score errors to correct: {reflip_stats['score_errors']}")
 
     # Compute weight quantization errors
     print("\n[3] Weight quantization errors:")
@@ -1025,8 +1053,9 @@ def main():
     print(f"  3. ReFlip quantization:")
     print(f"     - Mean attention score error: {np.mean(np.abs(errors_reflip)):.6f} "
           f"({np.mean(np.abs(rel_errors_reflip)):.4f}%)")
-    print(f"     - Protected {reflip_stats['total_critical_dims']} critical dimensions "
-          f"({reflip_stats['critical_dim_pct']*100:.1f}% target)")
+    print(f"     - Corrected {reflip_stats['total_moderate_dims']} moderate dimensions "
+          f"({reflip_stats['moderate_dim_pct']*100:.1f}% target)")
+    print(f"     - Attention score errors: {[f'{e:.6f}' for e in reflip_stats['score_errors']]}")
     print(f"\n  Improvements:")
     print(f"     - Nearest → Heuristic: {np.mean(improvements_h):.2f}% average error reduction")
     print(f"     - Nearest → ReFlip:    {np.mean(improvements_r):.2f}% average error reduction")
