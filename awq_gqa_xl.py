@@ -131,6 +131,24 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
 
         # Storage for GQA refinement (only if enabled)
         self.original_state_dict = None  # Store original weights before quantization
+        self.gqa_js_means = {}  # Store James-Stein means from AWQ quantization
+
+    def quantize_layer(self, name, module):
+        """
+        Override to store James-Stein means for GQA layers (only if refinement enabled).
+
+        This avoids recomputing the mean during refinement.
+        """
+        # If refinement enabled and this is a GQA layer, store the JS mean
+        if self.apply_gqa_reflip and is_gqa_layer(name):
+            # Get JS mean from activation stats (computed by parent)
+            _, js_mean = self.get_activation_stats(name)
+            if js_mean is not None:
+                # Store on CPU to save memory
+                self.gqa_js_means[name] = js_mean.cpu().float()
+
+        # Call parent to do the actual quantization
+        super().quantize_layer(name, module)
 
     def quantize_model_sequential(self, calibration_data, n_samples=500):
         """
@@ -223,15 +241,10 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
                 continue
 
             try:
-                # Re-capture activations for this group only
-                activations = self.capture_activations_for_group(projs, calibration_data, n_samples)
-
-                # Apply refinement
-                self.refine_attention_group(attn_group, projs, activations)
+                # Apply refinement using stored JS means (no activation recapture needed!)
+                self.refine_attention_group(attn_group, projs)
                 refined_count += 1
 
-                # Clear activations immediately
-                del activations
                 torch.cuda.empty_cache()
                 gc.collect()
 
@@ -244,113 +257,37 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
         print(f"\n  ✓ Refined {refined_count}/{len(attn_groups)} attention groups")
         print("=" * 80)
 
-    def capture_activations_for_group(self, projs, calibration_data, n_samples):
-        """
-        Re-capture activations for a specific attention group.
+        # Clear stored JS means (no longer needed)
+        self.gqa_js_means.clear()
 
-        Args:
-            projs: Dictionary of {q_proj, k_proj, v_proj} tuples
-            calibration_data: Calibration text data
-            n_samples: Number of samples to use
-
-        Returns:
-            dict: {layer_name: activations}
-        """
-        # Create temporary storage for this group
-        temp_activation_data = {}
-
-        def get_temp_hook(name):
-            def hook(_module, input, _output):
-                if name not in temp_activation_data:
-                    temp_activation_data[name] = []
-                if isinstance(input, tuple):
-                    inp = input[0]
-                else:
-                    inp = input
-
-                # Subsample tokens if needed
-                if inp.dim() == 3 and inp.shape[1] > self.max_tokens_per_sample:
-                    seq_len = inp.shape[1]
-                    indices = torch.randperm(seq_len)[:self.max_tokens_per_sample]
-                    indices = indices.sort()[0]
-                    inp = inp[:, indices, :]
-
-                # Store on CPU to save GPU memory
-                temp_activation_data[name].append(inp.detach().cpu().float())
-            return hook
-
-        # Register hooks for Q and K projections only
-        hooks = []
-        for proj_type in ['q_proj', 'k_proj']:
-            if proj_type in projs:
-                name, module = projs[proj_type]
-                handle = module.register_forward_hook(get_temp_hook(name))
-                hooks.append(handle)
-
-        # Run forward passes to capture activations
-        self.model.eval()
-        with torch.no_grad():
-            for text in calibration_data[:n_samples]:
-                if isinstance(text, str):
-                    inputs = self.tokenizer(text, return_tensors='pt',
-                                          max_length=self.max_tokens_per_sample,
-                                          truncation=True).to(self.device)
-                    self.model(**inputs, use_cache=False)
-
-        # Remove hooks
-        for handle in hooks:
-            handle.remove()
-
-        # Return captured activations
-        return temp_activation_data
-
-    def refine_attention_group(self, attn_group, projs, activations):
+    def refine_attention_group(self, attn_group, projs):
         """
         Apply ReFlip refinement to a single attention group (Q, K, V).
 
         This method:
         1. Extracts original and AWQ-quantized weights
-        2. Prepares activations
+        2. Uses pre-computed James-Stein means (from AWQ quantization)
         3. Calls fast ReFlip to refine Q projections
         4. Updates model weights with refined versions
         """
         q_name, q_module = projs['q_proj']
         k_name, k_module = projs['k_proj']
 
-        # Check if we have original weights
+        # Check if we have original weights and stored JS means
         q_weight_key = q_name + '.weight'
         k_weight_key = k_name + '.weight'
 
         if (q_weight_key not in self.original_state_dict or
             k_weight_key not in self.original_state_dict or
-            q_name not in activations or
-            k_name not in activations):
+            q_name not in self.gqa_js_means or
+            k_name not in self.gqa_js_means):
             print(f"      ⚠️  Missing data for {attn_group}, skipping")
             return
 
-        # ===== 1. Prepare Activations =====
-        X_q_list = activations[q_name]
-        X_concat = []
-        for x in X_q_list:
-            if x.dim() == 3:
-                x_flat = x.reshape(-1, x.shape[-1])
-            else:
-                x_flat = x
-            X_concat.append(x_flat)
-
-        X_all = torch.cat(X_concat, dim=0)  # [total_samples, hidden_dim]
-
-        # Compute raw mean activation
-        raw_mean = X_all.mean(dim=0).cpu().float()  # [hidden_dim]
-
-        # Apply James-Stein estimator (same as AWQ)
-        if self.use_james_stein:
-            js_mean = compute_james_stein_mean(raw_mean)
-            X = js_mean.numpy()
-        else:
-            X = raw_mean.numpy()
-
-        del X_concat, X_all, raw_mean
+        # ===== 1. Use Pre-Computed James-Stein Mean (from AWQ quantization) =====
+        # NO NEED to re-capture activations or recompute mean!
+        # We already computed the JS mean during AWQ quantization
+        X = self.gqa_js_means[q_name].numpy()  # [hidden_dim]
 
         # ===== 2. Extract Original Weights =====
         Wq_orig = self.original_state_dict[q_weight_key].cpu().float().numpy()
