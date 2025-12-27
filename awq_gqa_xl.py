@@ -554,14 +554,11 @@ def main():
     # Quantize model (includes GQA ReFlip if enabled)
     quantizer.quantize_model_sequential(calib_texts, n_samples=args.n_calib)
 
-    # Save quantized model
+    # Save quantized model (exactly as awq_js_xl.py)
     os.makedirs(args.output_dir, exist_ok=True)
-    quantizer.save_quantized_model(args.output_dir)
-
-    print("\n" + "=" * 80)
-    print("✓ AWQ-GQA Quantization Complete!")
-    print(f"  Saved to: {args.output_dir}")
-    print("=" * 80)
+    model.save_pretrained(args.output_dir)
+    tokenizer.save_pretrained(args.output_dir)
+    print(f"\n✅ Saved to {args.output_dir}")
 
 
 if __name__ == '__main__':
