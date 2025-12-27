@@ -377,9 +377,15 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
 
         # ===== 5. Vectorized Q/K Projections (GPU) =====
         Q_orig_all = torch.einsum('bghd,d->bgh', Wq_orig_4d, X)  # [num_k, gqa_ratio, head_dim]
-        Q_heuristic_all = torch.einsum('bghd,d->bgh',
-                                         Wq_int_4d.float().sub(Wq_zp_4d).mul(Wq_scales_4d.repeat_interleave(self.group_size, dim=3)[:,:,:,:hidden_dim]),
-                                         X)
+
+        # Expand scales and zp to full hidden_dim BEFORE operations
+        scales_expanded = Wq_scales_4d.repeat_interleave(self.group_size, dim=3)[:,:,:,:hidden_dim]
+        zp_expanded = Wq_zp_4d.repeat_interleave(self.group_size, dim=3)[:,:,:,:hidden_dim]
+
+        # Dequantize: W = (W_int - zp) * scale
+        Wq_dequant_4d = (Wq_int_4d.float() - zp_expanded) * scales_expanded
+        Q_heuristic_all = torch.einsum('bghd,d->bgh', Wq_dequant_4d, X)
+
         K_orig_all = torch.einsum('b1hd,d->b1h', Wk_orig_4d, X)  # [num_k, 1, head_dim]
 
         # ===== 6. Apply Batched ReFlip =====
