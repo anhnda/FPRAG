@@ -90,7 +90,7 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
     - ReFlip refinement after AWQ quantization
     """
 
-    def __init__(self, model_path, device="cuda", bits=4, n_grid=20,
+    def __init__(self, model, tokenizer, device="cuda", bits=4, n_grid=20,
                  group_size=128, use_heuristic=True, knee_tolerance=0.1,
                  max_tokens_per_sample=512, layer_batch_size=16, lmhead_chunks=4,
                  max_flip_percent=0.05, use_james_stein=True,
@@ -100,30 +100,14 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
         Initialize AWQ-GQA Quantizer.
 
         Args:
-            model_path: Path to model or HuggingFace model name
+            model: Pre-loaded model
+            tokenizer: Pre-loaded tokenizer
             (other args same as JamesSteinHeuristicAWQQuantizerXL)
             apply_gqa_reflip: Enable GQA ReFlip refinement
             gqa_critical_dim_pct: Percentage of moderate dimensions for ReFlip
             gqa_max_flip_pct: Max flip percentage for ReFlip
         """
-        # Load model and tokenizer
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-
-        print(f"\nLoading model and tokenizer from: {model_path}")
-        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-            print("  -> Set pad_token = eos_token")
-
-        model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            torch_dtype=torch.bfloat16,
-            device_map="auto",
-            trust_remote_code=True
-        )
-        model.eval()
-
-        # Initialize parent class
+        # Initialize parent class (same as awq_js_xl.py)
         super().__init__(
             model=model,
             tokenizer=tokenizer,
@@ -555,9 +539,25 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Create quantizer with GQA support
+    # Load model and tokenizer (same as awq_js_xl.py)
+    print(f"\nLoading model and tokenizer from: {args.model_path}")
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        print("  -> Set pad_token = eos_token")
+
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_path,
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+        trust_remote_code=True
+    )
+    model.eval()
+
+    # Create quantizer with GQA support (same signature as parent)
     quantizer = AWQGQAQuantizer(
-        model_path=args.model_path,
+        model=model,
+        tokenizer=tokenizer,
         device=device,
         bits=args.bits,
         n_grid=args.n_grid,
