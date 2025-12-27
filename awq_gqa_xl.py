@@ -28,7 +28,7 @@ from tqdm import tqdm
 import gc
 
 # Import AWQ quantizer from awq_js_xl
-from awq_js_xl import AWQQuantizer, find_knee_point
+from awq_js_xl import JamesSteinHeuristicAWQQuantizerXL, find_knee_point
 
 # Import ReFlip function from fast_quantize_qkv
 from fast_quantize_qkv import quantize_qkv_reflip_fast
@@ -79,11 +79,11 @@ def get_layer_group(layer_name):
     return None
 
 
-class AWQGQAQuantizer(AWQQuantizer):
+class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
     """
     Extended AWQ Quantizer with GQA ReFlip refinement.
 
-    Inherits from AWQQuantizer and adds:
+    Inherits from JamesSteinHeuristicAWQQuantizerXL and adds:
     - GQA layer detection
     - Activation data preservation for GQA layers
     - ReFlip refinement after AWQ quantization
