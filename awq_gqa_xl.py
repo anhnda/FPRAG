@@ -486,7 +486,7 @@ def main():
                         help="Disable James-Stein estimator")
     parser.add_argument("--knee-tolerance", type=float, default=0.000,
                         help="Tolerance offset for Kneedle algorithm (default: 0.0)")
-    parser.add_argument("--max-flip-percent", type=float, default=0.05,
+    parser.add_argument("--max-flip-percent", type=float, default=0.01,
                         help="Max percentage of weights to flip per channel (default: 0.05)")
     parser.add_argument("--max-tokens-per-sample", type=int, default=2048,
                         help="Max tokens per calibration sample (default: 2048)")
