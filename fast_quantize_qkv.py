@@ -35,8 +35,8 @@ from quantize_qkv import quantize_weight_groupwise_int4_with_flip
 def quantize_qkv_reflip_fast(Wq, Wk, X, Q_orig_all, Q_heuristic_all,
                               Wq_heuristic, Wk_heuristic, K_heuristic,
                               Wq_int_heuristic, Wq_scales_heuristic, Wq_zp_heuristic,
-                              critical_dim_pct=0.15, knee_tolerance=0.0,
-                              group_size=128, max_flip_pct=0.05,
+                              critical_dim_pct=0.1, knee_tolerance=0.0,
+                              group_size=128, max_flip_pct=0.1,
                               correction_scale=1.0, debug=False):
     """
     FAST vectorized ReFlip implementation.
