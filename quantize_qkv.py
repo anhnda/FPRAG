@@ -396,7 +396,7 @@ def quantize_qkv_reflip(Wq, Wk, X, Q_orig_all, Q_heuristic_all,
                 flip_direction = -1 if K_value > 0 else 1
 
             # GREEDY FLIP SELECTION (like AWQ heuristic in awq_js_xl.py)
-            # Goal: Minimize error at this dimension by selecting optimal flips
+            # Goal: Change Q[dim_idx] by the amount needed to correct this dimension's portion of total error
 
             # Current Q value at this dimension (using current quantized weights)
             scales_row = Wq_scales_heuristic[head_idx, dim_idx, :]
@@ -407,8 +407,18 @@ def quantize_qkv_reflip(Wq, Wk, X, Q_orig_all, Q_heuristic_all,
             W_current = (Wq_int_reflip[head_idx, dim_idx, :] - zp_expanded) * scales_expanded
             Q_current = X @ W_current  # Current Q[dim_idx]
 
-            # Current error contribution at this dimension
-            error_current = (Q_current - Q_orig[dim_idx]) * K_value
+            # Target Q value: correct this dimension's portion of total score error
+            # dim_corrections[i] is the change in (Q[i] * K[i]) we want
+            # So: delta_Q[i] * K[i] = dim_corrections[i]
+            # Therefore: delta_Q[i] = dim_corrections[i] / K[i]
+            if abs(K_value) < 1e-10:
+                continue  # Skip if K is too small (division by zero)
+
+            delta_Q_target = correction / K_value
+            Q_target = Q_current + delta_Q_target
+
+            # Current error from target
+            error_current = Q_current - Q_target
 
             # Calculate impact of each potential flip
             flip_impacts = np.zeros(hidden_dim)
@@ -423,8 +433,9 @@ def quantize_qkv_reflip(Wq, Wk, X, Q_orig_all, Q_heuristic_all,
                     valid_flips[j] = True
                     # Impact of this flip on Q[dim_idx]
                     delta_Q = flip_direction * scales_expanded[j] * X[j]
-                    # Impact on error contribution
-                    flip_impacts[j] = delta_Q * K_value
+                    # Impact on error from target (error = Q_current - Q_target)
+                    # We want to reduce |error|, so impact should move Q_current toward Q_target
+                    flip_impacts[j] = delta_Q  # Direct impact on Q
 
             # Sort by impact that reduces error (greedy selection)
             # We want flips that move error_current toward 0
@@ -463,11 +474,12 @@ def quantize_qkv_reflip(Wq, Wk, X, Q_orig_all, Q_heuristic_all,
             total_flips += flips_applied
 
             if debug:
-                error_after = error_current + cumsum_impacts[best_k]
-                print(f"    Dim {dim_idx}: error_before={error_current:.6f}, "
-                      f"error_after={error_after:.6f}, "
-                      f"K[{dim_idx}]={K_value:.6f}, "
-                      f"flip_dir={'+1' if flip_direction > 0 else '-1'}, "
+                Q_after = Q_current + cumsum_impacts[best_k]
+                error_after = Q_after - Q_target
+                print(f"    Dim {dim_idx}: Q_current={Q_current:.6f}, "
+                      f"Q_target={Q_target:.6f}, "
+                      f"Q_after={Q_after:.6f}, "
+                      f"error_reduction={abs(error_current) - abs(error_after):.6f}, "
                       f"flips={flips_applied} (optimal={best_k})")
 
     # Dequantize the modified integer weights
