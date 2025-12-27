@@ -395,37 +395,80 @@ def quantize_qkv_reflip(Wq, Wk, X, Q_orig_all, Q_heuristic_all,
             else:  # Need to decrease score (delta_score_needed < 0)
                 flip_direction = -1 if K_value > 0 else 1
 
-            # Calculate number of flips based on correction magnitude
-            num_flips = int(abs(correction) * correction_scale * hidden_dim * max_flip_pct)
-            num_flips = min(num_flips, int(hidden_dim * max_flip_pct))  # Cap at max_flip_pct
-            num_flips = max(num_flips, 1)  # At least 1 flip
+            # GREEDY FLIP SELECTION (like AWQ heuristic in awq_js_xl.py)
+            # Goal: Minimize error at this dimension by selecting optimal flips
 
-            # Select weights to flip: prioritize high |X| impact
-            # Sort by |X| descending to get most impactful weights
-            flip_candidates = np.argsort(-X_abs)  # Descending order
+            # Current Q value at this dimension (using current quantized weights)
+            scales_row = Wq_scales_heuristic[head_idx, dim_idx, :]
+            zp_row = Wq_zp_heuristic[head_idx, dim_idx, :]
+            scales_expanded = np.repeat(scales_row, group_size)[:hidden_dim]
+            zp_expanded = np.repeat(zp_row, group_size)[:hidden_dim]
 
-            # Apply flips to top candidates
-            flips_applied = 0
-            for weight_idx in flip_candidates[:num_flips * 2]:  # Try more candidates in case some are invalid
-                if flips_applied >= num_flips:
-                    break
+            W_current = (Wq_int_reflip[head_idx, dim_idx, :] - zp_expanded) * scales_expanded
+            Q_current = X @ W_current  # Current Q[dim_idx]
 
-                # Get current quantized value
-                current_qval = Wq_int_reflip[head_idx, dim_idx, weight_idx]
+            # Current error contribution at this dimension
+            error_current = (Q_current - Q_orig[dim_idx]) * K_value
+
+            # Calculate impact of each potential flip
+            flip_impacts = np.zeros(hidden_dim)
+            valid_flips = np.zeros(hidden_dim, dtype=bool)
+
+            for j in range(hidden_dim):
+                current_qval = Wq_int_reflip[head_idx, dim_idx, j]
                 new_qval = current_qval + flip_direction
 
-                # Check if flip is valid (must stay in [0, 15] range)
+                # Check if flip is valid
                 if 0 <= new_qval <= 15:
-                    Wq_int_reflip[head_idx, dim_idx, weight_idx] = new_qval
+                    valid_flips[j] = True
+                    # Impact of this flip on Q[dim_idx]
+                    delta_Q = flip_direction * scales_expanded[j] * X[j]
+                    # Impact on error contribution
+                    flip_impacts[j] = delta_Q * K_value
+
+            # Sort by impact that reduces error (greedy selection)
+            # We want flips that move error_current toward 0
+            target_sign = -np.sign(error_current)
+            beneficial_flips = (np.sign(flip_impacts) == target_sign) & valid_flips
+
+            if not beneficial_flips.any():
+                continue  # No beneficial flips available
+
+            # Sort beneficial flips by magnitude of impact (descending)
+            flip_scores = np.abs(flip_impacts) * beneficial_flips
+            sorted_indices = np.argsort(-flip_scores)  # Descending
+
+            # Greedy selection: find optimal K flips that minimize residual error
+            cumsum_impacts = np.zeros(hidden_dim + 1)
+            for k in range(1, hidden_dim + 1):
+                if beneficial_flips[sorted_indices[k-1]]:
+                    cumsum_impacts[k] = cumsum_impacts[k-1] + flip_impacts[sorted_indices[k-1]]
+
+            # Find K that minimizes |error_current + cumsum_impacts[K]|
+            residuals = np.abs(error_current + cumsum_impacts)
+            best_k = np.argmin(residuals)
+
+            # Cap at max_flip_pct
+            max_flips = int(hidden_dim * max_flip_pct)
+            best_k = min(best_k, max_flips)
+
+            # Apply the optimal flips
+            flips_applied = 0
+            for k in range(best_k):
+                j = sorted_indices[k]
+                if beneficial_flips[j]:
+                    Wq_int_reflip[head_idx, dim_idx, j] += flip_direction
                     flips_applied += 1
 
             total_flips += flips_applied
 
             if debug:
-                print(f"    Dim {dim_idx}: score_err={score_error:.6f}, "
+                error_after = error_current + cumsum_impacts[best_k]
+                print(f"    Dim {dim_idx}: error_before={error_current:.6f}, "
+                      f"error_after={error_after:.6f}, "
                       f"K[{dim_idx}]={K_value:.6f}, "
                       f"flip_dir={'+1' if flip_direction > 0 else '-1'}, "
-                      f"flips={flips_applied}/{num_flips} requested")
+                      f"flips={flips_applied} (optimal={best_k})")
 
     # Dequantize the modified integer weights
     # Expand scales and zero points to match weight dimensions
