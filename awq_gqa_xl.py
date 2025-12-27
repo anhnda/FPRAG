@@ -21,6 +21,7 @@ Usage:
 import torch
 import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from datasets import load_dataset
 import argparse
 import os
 import numpy as np
@@ -514,18 +515,39 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
 
 def main():
     parser = argparse.ArgumentParser(description='AWQ-GQA: Combined Quantization')
-    parser.add_argument('--model-path', type=str, default='./models/Llama-3-8B',
-                        help='Model name or path')
-    parser.add_argument('--output-dir', type=str, default='./quantized_models/llama3_awq_gqa',
-                        help='Output directory for quantized model')
-    parser.add_argument('--n-calib', type=int, default=128,
-                        help='Number of calibration samples')
-    parser.add_argument('--n-grid', type=int, default=20,
-                        help='Number of grid points for alpha search')
-    parser.add_argument('--group-size', type=int, default=128,
-                        help='Group size for quantization')
-    parser.add_argument('--layer-batch-size', type=int, default=50,
-                        help='Number of layers per batch')
+
+    # All arguments from awq_js_xl.py
+    parser.add_argument("--n-calib", type=int, default=128, help="Number of calibration samples")
+    parser.add_argument("--n-grid", type=int, default=20)
+    parser.add_argument("--group-size", type=int, default=128)
+    parser.add_argument("--bits", type=int, default=4, choices=[3, 4], help="Quantization bit width (default: 4)")
+    parser.add_argument("--use-heuristic", action="store_true", default=True,
+                        help="Use heuristic flip correction (default: True)")
+    parser.add_argument("--no-heuristic", dest="use_heuristic", action="store_false",
+                        help="Disable heuristic flip correction")
+    parser.add_argument("--use-james-stein", action="store_true", default=True,
+                        help="Use James-Stein estimator for activation means (default: True)")
+    parser.add_argument("--no-james-stein", dest="use_james_stein", action="store_false",
+                        help="Disable James-Stein estimator")
+    parser.add_argument("--knee-tolerance", type=float, default=0.000,
+                        help="Tolerance offset for Kneedle algorithm (default: 0.0)")
+    parser.add_argument("--max-flip-percent", type=float, default=0.05,
+                        help="Max percentage of weights to flip per channel (default: 0.05)")
+    parser.add_argument("--max-tokens-per-sample", type=int, default=2048,
+                        help="Max tokens per calibration sample (default: 2048)")
+    parser.add_argument("--layer-batch-size", type=int, default=16,
+                        help="Number of layers to quantize per batch (default: 16)")
+    parser.add_argument("--lmhead-chunks", type=int, default=4,
+                        help="Number of chunks to split lm_head into (default: 4)")
+    parser.add_argument("--output-dir", type=str, default="./quantized_models/llama3_awq_gqa")
+    parser.add_argument("--model-path", type=str, default="./models/Llama-3-8B",
+                        help="Path to model or HuggingFace model name")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--calib-dataset", type=str, default="c4",
+                        choices=["c4", "wikitext2", "wikitext2-simple"],
+                        help="Calibration dataset to use")
+    parser.add_argument("--cache-dir", type=str, default="./calibration_cache",
+                        help="Directory to cache calibration data")
 
     # GQA ReFlip options
     parser.add_argument('--apply-gqa-reflip', action='store_true',
@@ -534,13 +556,6 @@ def main():
                         help='Percentage of moderate dimensions for ReFlip')
     parser.add_argument('--gqa-max-flip-pct', type=float, default=0.05,
                         help='Max flip percentage for ReFlip')
-
-    # AWQ options
-    parser.add_argument('--use-heuristic', action='store_true', default=True,
-                        help='Use heuristic flip correction')
-    parser.add_argument('--calib-dataset', type=str, default='c4',
-                        choices=['c4', 'wikitext2', 'wikitext2-simple'],
-                        help='Calibration dataset')
 
     args = parser.parse_args()
 
@@ -556,38 +571,41 @@ def main():
         print(f"    - Max flip %: {args.gqa_max_flip_pct}")
     print("=" * 80)
 
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     # Create quantizer with GQA support
     quantizer = AWQGQAQuantizer(
         model_path=args.model_path,
-        device="cuda" if torch.cuda.is_available() else "cpu",
-        bits=4,
+        device=device,
+        bits=args.bits,
         n_grid=args.n_grid,
         group_size=args.group_size,
         use_heuristic=args.use_heuristic,
+        knee_tolerance=args.knee_tolerance,
+        max_tokens_per_sample=args.max_tokens_per_sample,
         layer_batch_size=args.layer_batch_size,
+        lmhead_chunks=args.lmhead_chunks,
+        max_flip_percent=args.max_flip_percent,
+        use_james_stein=args.use_james_stein,
         apply_gqa_reflip=args.apply_gqa_reflip,
         gqa_critical_dim_pct=args.gqa_critical_dim_pct,
         gqa_max_flip_pct=args.gqa_max_flip_pct
     )
 
-    # Load calibration data
+    # Load calibration data (exactly as in awq_js_xl.py)
     from calibration_utils import get_c4_calibration_data, get_wikitext2_calibration_data
 
-    if args.calib_dataset == 'c4':
-        calib_data = get_c4_calibration_data(
-            quantizer.tokenizer,
-            n_samples=args.n_calib,
-            block_size=512
-        )
+    print(f"\nLoading calibration dataset: {args.calib_dataset}")
+    if args.calib_dataset == "c4":
+        calib_texts = get_c4_calibration_data(quantizer.tokenizer, n_samples=args.n_calib, seqlen=2048, seed=args.seed, cache_dir=args.cache_dir)
+    elif args.calib_dataset == "wikitext2-simple":
+        dataset = load_dataset('wikitext', 'wikitext-2-raw-v1', split='train')
+        calib_texts = [item['text'] for item in dataset if len(item['text'].strip()) > 100][:args.n_calib]
     else:
-        calib_data = get_wikitext2_calibration_data(
-            quantizer.tokenizer,
-            n_samples=args.n_calib,
-            simple_mode=(args.calib_dataset == 'wikitext2-simple')
-        )
+        calib_texts = get_wikitext2_calibration_data(quantizer.tokenizer, n_samples=args.n_calib, seqlen=2048, seed=args.seed, cache_dir=args.cache_dir)
 
     # Quantize model (includes GQA ReFlip if enabled)
-    quantizer.quantize_model_sequential(calib_data, n_samples=args.n_calib)
+    quantizer.quantize_model_sequential(calib_texts, n_samples=args.n_calib)
 
     # Save quantized model
     os.makedirs(args.output_dir, exist_ok=True)
