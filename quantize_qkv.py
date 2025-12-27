@@ -349,9 +349,12 @@ def quantize_qkv_reflip(Wq, Wk, X, Q_orig_all, Q_heuristic_all,
             print(f"  Sum of corrections: {dim_corrections.sum():.6f} (should ≈ {score_error:.6f})")
 
     # Step 3: Apply DISCRETE INTEGER FLIPS (±1) to correct Q dimensions
-    # Goal: For dimension i, change Q[i] by dim_corrections[i] using ±1 integer flips
+    # Goal: Reduce attention score error = (Q·K)_orig - (Q·K)_heuristic
     # Strategy:
-    #   - Flip direction: sign(dim_corrections[i]) determines +1 or -1
+    #   - Flip direction: sign(-score_error) * sign(K[dim_idx])
+    #     Because: score = Σ(Q[i] * K[i]), to change score we need:
+    #     - If need to increase score and K[i]>0: increase Q[i] (+1 flip)
+    #     - If need to increase score and K[i]<0: decrease Q[i] (-1 flip)
     #   - Flip selection: Choose weights with highest |X| impact
     #   - Flip count: Proportional to |correction| * correction_scale
 
@@ -367,17 +370,30 @@ def quantize_qkv_reflip(Wq, Wk, X, Q_orig_all, Q_heuristic_all,
     for head_idx in range(num_heads):
         moderate_indices = all_moderate_dims[head_idx]
         dim_corrections = all_dim_corrections[head_idx]
+        score_error = all_score_errors[head_idx]
 
         if len(moderate_indices) == 0:
             continue
 
+        # Compute K_orig for this analysis (needed for flip direction)
+        # K_orig was already computed earlier, but we need it here
         # For each moderate dimension, apply integer flips
         for i, (dim_idx, correction) in enumerate(zip(moderate_indices, dim_corrections)):
             if abs(correction) < 1e-10:  # Skip negligible corrections
                 continue
 
-            # Determine flip direction: +1 if correction > 0, -1 if correction < 0
-            flip_direction = 1 if correction > 0 else -1
+            # CRITICAL: Flip direction depends on BOTH error sign AND K sign
+            # We want: delta_score = -score_error (to reduce error)
+            # Since score = Q @ K, we need: delta_Q[i] * K[i] to contribute to delta_score
+            # So: flip_direction = sign(-score_error) * sign(K[i])
+            delta_score_needed = -score_error
+            K_value = K_orig[dim_idx]  # K value at this dimension
+
+            # Determine flip direction based on desired score change and K sign
+            if delta_score_needed > 0:  # Need to increase score
+                flip_direction = 1 if K_value > 0 else -1
+            else:  # Need to decrease score
+                flip_direction = -1 if K_value > 0 else 1
 
             # Calculate number of flips based on correction magnitude
             num_flips = int(abs(correction) * correction_scale * hidden_dim * max_flip_pct)
@@ -406,7 +422,8 @@ def quantize_qkv_reflip(Wq, Wk, X, Q_orig_all, Q_heuristic_all,
             total_flips += flips_applied
 
             if debug:
-                print(f"    Dim {dim_idx}: correction={correction:.6f}, "
+                print(f"    Dim {dim_idx}: score_err={score_error:.6f}, "
+                      f"K[{dim_idx}]={K_value:.6f}, "
                       f"flip_dir={'+1' if flip_direction > 0 else '-1'}, "
                       f"flips={flips_applied}/{num_flips} requested")
 
