@@ -368,6 +368,13 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
         print(f"\n  ✓ Refined {refined_count}/{len(attn_groups)} attention groups")
         print("=" * 80)
 
+        # Clear all remaining GQA storage
+        self.gqa_activations.clear()
+        self.gqa_original_weights.clear()
+        self.gqa_quant_artifacts.clear()
+        torch.cuda.empty_cache()
+        gc.collect()
+
     def refine_attention_group(self, attn_group, projs):
         """
         Apply ReFlip refinement to a single attention group (Q, K, V).
@@ -402,6 +409,7 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
         X_all = torch.cat(X_concat, dim=0)  # [total_samples, hidden_dim]
         # Use mean activation as representative (standard AWQ practice)
         X = X_all.mean(dim=0).cpu().float().numpy()  # [hidden_dim]
+        del X_concat, X_all  # Free memory
 
         # ===== 2. Extract Original Weights =====
         Wq_orig = self.gqa_original_weights[q_name].cpu().float().numpy()  # [out_features, in_features]
@@ -411,18 +419,8 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
         Wq_awq = q_module.weight.data.cpu().float().numpy()  # Dequantized AWQ weights
         Wk_awq = k_module.weight.data.cpu().float().numpy()
 
-        # ===== 4. Extract INT4 Artifacts from AWQ =====
-        q_artifacts = self.gqa_quant_artifacts[q_name]
-        Wq_int_awq = q_artifacts['W_int'].cpu().numpy().astype(np.int32)  # [out_features, in_features]
-        Wq_scales = q_artifacts['scales'].cpu().numpy()  # [out_features, n_groups]
-        Wq_zp = q_artifacts['zp'].cpu().numpy()
-
-        # Note: AWQ stored INT4 of SCALED weights (W × AWQ_scale)
-        # But we need to work with the final weights (after AWQ descaling)
-        # So we need to re-quantize the AWQ-dequantized weights
-
-        # Actually, let's use a simpler approach: directly quantize the AWQ output
-        # This ensures we're refining what's actually in the model
+        # Note: AWQ stored INT4 of SCALED weights, but we need final weights
+        # Re-quantize the AWQ-dequantized weights to get clean INT4 representation
         from utils_qkv import quantize_weight_groupwise_int4
 
         # Re-quantize AWQ weights to get clean INT4 representation
@@ -507,10 +505,36 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
             print(f"        Total flips: {reflip_stats['total_flips']}")
             print(f"        Flip rate: {reflip_stats['flip_rate_pct']:.3f}%")
 
+            # Free intermediate numpy arrays
+            del (Wq_orig, Wk_orig, Wq_awq, Wk_awq, Wq_heuristic, Wk_heuristic,
+                 Wq_int_heuristic, Wq_scales_clean, Wq_zp_clean,
+                 Wq_orig_3d, Wk_orig_3d, Wq_heuristic_3d, Wk_heuristic_3d,
+                 Wq_int_heuristic_3d, Wq_scales_3d, Wq_zp_3d,
+                 Q_orig_all, Q_heuristic_all, K_heuristic,
+                 Wq_refined, Wq_refined_2d, X)
+
         except Exception as e:
             print(f"      ⚠️  ReFlip failed for {attn_group}: {e}")
             import traceback
             traceback.print_exc()
+
+        finally:
+            # Free memory immediately after processing this attention group
+            if q_name in self.gqa_activations:
+                del self.gqa_activations[q_name]
+            if k_name in self.gqa_activations:
+                del self.gqa_activations[k_name]
+            if q_name in self.gqa_original_weights:
+                del self.gqa_original_weights[q_name]
+            if k_name in self.gqa_original_weights:
+                del self.gqa_original_weights[k_name]
+            if q_name in self.gqa_quant_artifacts:
+                del self.gqa_quant_artifacts[q_name]
+            if k_name in self.gqa_quant_artifacts:
+                del self.gqa_quant_artifacts[k_name]
+
+            torch.cuda.empty_cache()
+            gc.collect()
 
 
 def main():
