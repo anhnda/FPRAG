@@ -462,8 +462,8 @@ def main():
                         help="Max tokens per calibration sample (default: 2048)")
     parser.add_argument("--layer-batch-size", type=int, default=16,
                         help="Number of layers to quantize per batch (default: 16)")
-    parser.add_argument("--lmhead-chunks", type=int, default=4,
-                        help="Number of chunks to split lm_head into (default: 4)")
+    parser.add_argument("--lmhead-chunks", type=int, default=8,
+                        help="Number of chunks to split lm_head into (default: 8)")
     parser.add_argument("--output-dir", type=str, default="./quantized_models/llama3_awq_gqa")
     parser.add_argument("--model-path", type=str, default="./models/Llama-3-8B",
                         help="Path to model or HuggingFace model name")
