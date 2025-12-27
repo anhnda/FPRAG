@@ -135,52 +135,13 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
         self.gqa_original_weights = {}  # Original FP weights before quantization
 
     def quantize_layer(self, name, module):
-        """
-        Override to store original weights for GQA layers before quantization.
-        """
-        # Check if this is lm_head - if so, clear all caches first
-        is_lmhead = 'lm_head' in name.lower() or name.endswith('lm_head')
-        if is_lmhead:
-            # Aggressive memory cleanup before lm_head
-            print(f"\n  🧹 Cleaning memory before lm_head...")
-
-            # Clear any stored GQA data (shouldn't exist if ReFlip disabled, but just in case)
-            if hasattr(self, 'gqa_original_weights'):
-                self.gqa_original_weights.clear()
-            if hasattr(self, 'gqa_activations'):
-                self.gqa_activations.clear()
-
-            # Clear activation data
-            if hasattr(self, 'activation_data'):
-                self.activation_data.clear()
-
-            # Aggressive GPU cache clearing
-            torch.cuda.empty_cache()
-            gc.collect()
-            torch.cuda.empty_cache()  # Double clear
-
-            import time
-            time.sleep(0.5)  # Give GPU time to release memory
-
-            if torch.cuda.is_available():
-                print(f"     GPU memory: {torch.cuda.memory_allocated()/1e9:.2f} GB allocated, "
-                      f"{torch.cuda.memory_reserved()/1e9:.2f} GB reserved")
-
-        # Save original weights for GQA layers BEFORE quantization
+        """Store original weights for GQA layers if ReFlip enabled."""
+        # Only store original weights if ReFlip is enabled
         if self.apply_gqa_reflip and is_gqa_layer(name):
             self.gqa_original_weights[name] = module.weight.data.clone().cpu()
 
-        # Call parent's standard quantization (preserves lm_head chunking)
+        # Call parent (exactly as awq_js_xl.py would)
         super().quantize_layer(name, module)
-
-    def calibrate_layer_batch(self, batch_layers, calibration_data, n_samples):
-        """
-        Override to preserve activations for GQA layers.
-        """
-        # Call parent calibration
-        # NOTE: We DON'T preserve activations here to save memory
-        # They will be re-captured during ReFlip refinement
-        super().calibrate_layer_batch(batch_layers, calibration_data, n_samples)
 
     def quantize_model_sequential(self, calibration_data, n_samples=500):
         """
