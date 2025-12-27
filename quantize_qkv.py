@@ -383,16 +383,16 @@ def quantize_qkv_reflip(Wq, Wk, X, Q_orig_all, Q_heuristic_all,
                 continue
 
             # CRITICAL: Flip direction depends on BOTH error sign AND K sign
-            # We want: delta_score = -score_error (to reduce error)
+            # error = score_orig - score_heuristic
+            # To correct: we need delta_score = score_orig - score_heuristic = error
             # Since score = Q @ K, we need: delta_Q[i] * K[i] to contribute to delta_score
-            # So: flip_direction = sign(-score_error) * sign(K[i])
-            delta_score_needed = -score_error
+            delta_score_needed = score_error  # NOT -score_error!
             K_value = K_orig[dim_idx]  # K value at this dimension
 
             # Determine flip direction based on desired score change and K sign
             if delta_score_needed > 0:  # Need to increase score
                 flip_direction = 1 if K_value > 0 else -1
-            else:  # Need to decrease score
+            else:  # Need to decrease score (delta_score_needed < 0)
                 flip_direction = -1 if K_value > 0 else 1
 
             # Calculate number of flips based on correction magnitude
