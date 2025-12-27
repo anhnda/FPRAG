@@ -229,36 +229,40 @@ def quantize_weight_groupwise_int4_with_flip(W, activation_means, group_size=128
 
 def quantize_qkv_reflip(Wq, Wk, X, Q_orig_all, Q_heuristic_all,
                          Wq_heuristic, Wk_heuristic, K_heuristic,
+                         Wq_int_heuristic, Wq_scales_heuristic, Wq_zp_heuristic,
                          critical_dim_pct=0.15, knee_tolerance=0.0,
                          group_size=128, max_flip_pct=0.05,
                          correction_scale=1.0, debug=False):
     """
-    ReFlip: Targeted error correction on attention scores.
+    ReFlip: Targeted error correction on attention scores using discrete integer flips.
 
     Strategy:
-    1. Compute attention score error per head: score_error = (Q·K)_quant - (Q·K)_orig (4 scalars)
+    1. Compute attention score error per head: score_error = (Q·K)_orig - (Q·K)_quant (4 scalars)
     2. Identify moderate dimensions using Kneedle on sorted |Q_orig| (start from knee, take next 5%)
     3. Redistribute scalar error to moderate dimensions proportionally to Q values
-    4. Apply weighted heuristic flip to correct Wq for selected dimensions
+    4. Apply DISCRETE INTEGER FLIPS (±1) to quantized INT4 weights based on correction direction
 
     Args:
-        Wq: Query weights [num_heads, head_dim, hidden_dim] = [4, 128, 4096]
-        Wk: Key weights [head_dim, hidden_dim] = [128, 4096]
+        Wq: Original query weights [num_heads, head_dim, hidden_dim] = [4, 128, 4096]
+        Wk: Original key weights [head_dim, hidden_dim] = [128, 4096]
         X: Input activation vector [hidden_dim] = [4096]
         Q_orig_all: Original Q vectors for all heads [num_heads, head_dim]
         Q_heuristic_all: Heuristic quantized Q vectors [num_heads, head_dim]
-        Wq_heuristic: Heuristic quantized Wq weights (starting point)
+        Wq_heuristic: Heuristic quantized Wq weights (dequantized, starting point)
         Wk_heuristic: Heuristic quantized Wk weights (starting point)
         K_heuristic: Heuristic quantized K vector [head_dim]
+        Wq_int_heuristic: Integer quantized Wq [num_heads, head_dim, hidden_dim] in [0,15]
+        Wq_scales_heuristic: Quantization scales [num_heads, head_dim, n_groups]
+        Wq_zp_heuristic: Zero points [num_heads, head_dim, n_groups]
         critical_dim_pct: Percentage of moderate dims to select (default: 0.05 = 5%)
         knee_tolerance: Tolerance for Kneedle algorithm (default: 0.0)
         group_size: Quantization group size (default: 128)
-        max_flip_pct: Max flip percentage for heuristic (default: 0.05 = 5%)
-        correction_scale: Scaling factor for error correction weighting (default: 1.0)
+        max_flip_pct: Max percentage of weights to flip per dimension (default: 0.05 = 5%)
+        correction_scale: Controls number of flips (default: 1.0)
         debug: Print debug information
 
     Returns:
-        Wq_quant_reflip: ReFlip quantized Wq weights
+        Wq_quant_reflip: ReFlip quantized Wq weights (dequantized)
         Wk_quant_reflip: ReFlip quantized Wk weights (same as heuristic)
         flip_stats_reflip: Statistics about the ReFlip correction
     """
@@ -344,12 +348,21 @@ def quantize_qkv_reflip(Wq, Wk, X, Q_orig_all, Q_heuristic_all,
             print(f"  Dim corrections (first 5): {dim_corrections[:5]}")
             print(f"  Sum of corrections: {dim_corrections.sum():.6f} (should ≈ {score_error:.6f})")
 
-    # Step 3: Apply direct weight adjustments to correct Q dimensions
-    # Goal: For dimension i, change Q[i] = X @ Wq[head, i, :] by dim_corrections[i]
-    # Method: Redistribute correction across weight dimensions proportionally to X values
+    # Step 3: Apply DISCRETE INTEGER FLIPS (±1) to correct Q dimensions
+    # Goal: For dimension i, change Q[i] by dim_corrections[i] using ±1 integer flips
+    # Strategy:
+    #   - Flip direction: sign(dim_corrections[i]) determines +1 or -1
+    #   - Flip selection: Choose weights with highest |X| impact
+    #   - Flip count: Proportional to |correction| * correction_scale
+
+    # Copy integer representation to modify
+    Wq_int_reflip = Wq_int_heuristic.copy()
+
+    # Prepare scales/zp expanded to full dimension for dequantization
+    n_groups = hidden_dim // group_size
 
     X_abs = np.abs(X)
-    X_abs_sum = X_abs.sum()
+    total_flips = 0
 
     for head_idx in range(num_heads):
         moderate_indices = all_moderate_dims[head_idx]
@@ -358,30 +371,69 @@ def quantize_qkv_reflip(Wq, Wk, X, Q_orig_all, Q_heuristic_all,
         if len(moderate_indices) == 0:
             continue
 
-        # For each moderate dimension, adjust Wq[head, dim, :] directly
+        # For each moderate dimension, apply integer flips
         for i, (dim_idx, correction) in enumerate(zip(moderate_indices, dim_corrections)):
-            # Redistribute correction to weight dimensions proportionally to |X|
-            # delta_W[j] = correction * (|X[j]| / sum(|X|)) * sign(X[j])
-            # This ensures: X @ delta_W ≈ correction
+            if abs(correction) < 1e-10:  # Skip negligible corrections
+                continue
 
-            # Apply correction with proper sign
-            W_adjustment = correction * (X_abs / X_abs_sum) * np.sign(X) * correction_scale
+            # Determine flip direction: +1 if correction > 0, -1 if correction < 0
+            flip_direction = 1 if correction > 0 else -1
 
-            # Apply adjustment to quantized weights
-            Wq_reflip[head_idx, dim_idx, :] += W_adjustment
+            # Calculate number of flips based on correction magnitude
+            num_flips = int(abs(correction) * correction_scale * hidden_dim * max_flip_pct)
+            num_flips = min(num_flips, int(hidden_dim * max_flip_pct))  # Cap at max_flip_pct
+            num_flips = max(num_flips, 1)  # At least 1 flip
+
+            # Select weights to flip: prioritize high |X| impact
+            # Sort by |X| descending to get most impactful weights
+            flip_candidates = np.argsort(-X_abs)  # Descending order
+
+            # Apply flips to top candidates
+            flips_applied = 0
+            for weight_idx in flip_candidates[:num_flips * 2]:  # Try more candidates in case some are invalid
+                if flips_applied >= num_flips:
+                    break
+
+                # Get current quantized value
+                current_qval = Wq_int_reflip[head_idx, dim_idx, weight_idx]
+                new_qval = current_qval + flip_direction
+
+                # Check if flip is valid (must stay in [0, 15] range)
+                if 0 <= new_qval <= 15:
+                    Wq_int_reflip[head_idx, dim_idx, weight_idx] = new_qval
+                    flips_applied += 1
+
+            total_flips += flips_applied
 
             if debug:
-                actual_change = X @ W_adjustment
-                print(f"    Dim {dim_idx}: target={correction:.6f}, actual={actual_change:.6f}, "
-                      f"adjustment_norm={np.linalg.norm(W_adjustment):.6f}")
+                print(f"    Dim {dim_idx}: correction={correction:.6f}, "
+                      f"flip_dir={'+1' if flip_direction > 0 else '-1'}, "
+                      f"flips={flips_applied}/{num_flips} requested")
+
+    # Dequantize the modified integer weights
+    # Expand scales and zero points to match weight dimensions
+    Wq_reflip = np.zeros_like(Wq_int_reflip, dtype=np.float32)
+
+    for head_idx in range(num_heads):
+        for dim_idx in range(head_dim):
+            # Get scales and zero points for this dimension
+            scales_row = Wq_scales_heuristic[head_idx, dim_idx, :]  # [n_groups]
+            zp_row = Wq_zp_heuristic[head_idx, dim_idx, :]  # [n_groups]
+
+            # Expand to full dimension (repeat each group's scale/zp)
+            scales_expanded = np.repeat(scales_row, group_size)[:hidden_dim]
+            zp_expanded = np.repeat(zp_row, group_size)[:hidden_dim]
+
+            # Dequantize: W = (W_int - zp) * scale
+            Wq_reflip[head_idx, dim_idx, :] = (Wq_int_reflip[head_idx, dim_idx, :] - zp_expanded) * scales_expanded
 
     # Return refined weights
     Wq_quant_reflip = Wq_reflip
 
-    # Dummy scales/zp for compatibility
-    Wq_scales = np.ones((num_heads, head_dim, hidden_dim // group_size))
-    Wq_zp = np.zeros((num_heads, head_dim, hidden_dim // group_size))
-    Wq_int = Wq_reflip
+    # Return actual scales/zp and integer representation
+    Wq_scales = Wq_scales_heuristic
+    Wq_zp = Wq_zp_heuristic
+    Wq_int = Wq_int_reflip
 
     # Wk remains the same
     Wk_quant_reflip = Wk_heuristic
@@ -394,7 +446,9 @@ def quantize_qkv_reflip(Wq, Wk, X, Q_orig_all, Q_heuristic_all,
         'total_moderate_dims': sum(len(dims) for dims in all_moderate_dims),
         'moderate_dim_pct': critical_dim_pct,
         'knee_tolerance': knee_tolerance,
-        'score_errors': all_score_errors  # Store for analysis
+        'score_errors': all_score_errors,  # Store for analysis
+        'total_flips': total_flips,  # Number of integer flips applied
+        'flip_rate_pct': (total_flips / (num_heads * head_dim * hidden_dim) * 100)
     }
 
     return (Wq_quant_reflip, Wq_scales, Wq_zp, Wq_int,
@@ -522,6 +576,7 @@ def main():
      reflip_stats) = quantize_qkv_reflip(
         Wq, Wk, X, Q_orig_all, Q_heuristic_all,
         Wq_quant_flip, Wk_quant_flip, K_heuristic,  # Pass heuristic-quantized weights and K
+        Wq_int_flip, Wq_scales_flip, Wq_zp_flip,  # Pass integer representation and scales
         critical_dim_pct=args.critical_dim_pct,
         knee_tolerance=args.knee_tolerance,
         group_size=args.group_size,
@@ -536,6 +591,8 @@ def main():
     print(f"    Moderate dims per head: {reflip_stats['moderate_dims_per_head']}")
     print(f"    Target percentage: {reflip_stats['moderate_dim_pct']*100:.1f}%")
     print(f"    Attention score errors to correct: {reflip_stats['score_errors']}")
+    print(f"    Total integer flips applied: {reflip_stats['total_flips']} "
+          f"({reflip_stats['flip_rate_pct']:.4f}% of weights)")
 
     # Compute weight quantization errors
     print("\n[3] Weight quantization errors:")
