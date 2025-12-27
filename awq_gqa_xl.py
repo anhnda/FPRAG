@@ -275,40 +275,97 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
         flip_impacts = target_direction * scales_critical * X_expanded * K_critical.unsqueeze(-1)
         # Shape: [total_heads, num_critical, hidden_dim]
 
-        # ===== 6. Validity and Scoring =====
-        can_flip_up = (Wq_int_critical < 15).float()
-        can_flip_down = (Wq_int_critical > 0).float()
+        # ===== 6. Compute Q Errors Per Dimension (for optimal-K selection) =====
+        # Dequantize current Q weights for error calculation
+        Wq_current_critical = (Wq_int_critical.float() -
+                                torch.gather(zp_expanded, 1, critical_indices.unsqueeze(-1).expand(-1, -1, hidden_dim))) * \
+                               scales_critical
 
-        # If impact > 0, it helps us (we can flip +1)
-        # If impact < 0, we need to flip -1 (which gives -impact > 0)
-        can_flip = torch.where(flip_impacts > 0, can_flip_up, can_flip_down)
+        Q_current_per_dim = (Wq_current_critical * X_expanded).sum(dim=2)  # [total_heads, num_critical]
+        Q_target_per_dim = torch.gather(Q_target, 1, critical_indices)     # [total_heads, num_critical]
+        K_critical_1d = K_critical  # [total_heads, num_critical]
 
-        flip_scores = flip_impacts.abs() * can_flip
+        # Error per dimension in Q space (Current - Target, following fast_quantize_qkv.py convention)
+        error_currents = Q_current_per_dim - Q_target_per_dim  # [total_heads, num_critical]
 
-        # ===== 7. Select Best Flips (Vectorized TopK) =====
+        # ===== 7. Determine Flip Directions and Validity =====
+        # Following fast_quantize_qkv.py logic (lines 157-161)
+        score_errors_expanded = score_errors.unsqueeze(1).expand(-1, num_critical)  # [total_heads, num_critical]
+
+        # If score needs to increase (>0) and K>0: flip +1 increases Q*K
+        # If score needs to increase (>0) and K<0: flip -1 decreases Q, but Q*K still increases
+        flip_direction_base = torch.where(
+            score_errors_expanded > 0,
+            torch.where(K_critical_1d > 0, 1, -1),
+            torch.where(K_critical_1d > 0, -1, 1)
+        ).unsqueeze(-1)  # [total_heads, num_critical, 1]
+
+        # ===== 8. Calculate Flip Impacts and Filter Beneficial =====
+        # Impact of flipping in the base direction
+        flip_impacts_directed = flip_direction_base * scales_critical * X_expanded  # [total_heads, num_critical, hidden_dim]
+
+        # Validity: can we flip?
+        can_flip_base = torch.where(
+            flip_direction_base > 0,
+            (Wq_int_critical < 15).unsqueeze(-1),
+            (Wq_int_critical > 0).unsqueeze(-1)
+        ).float().squeeze(-1).unsqueeze(-1).expand_as(flip_impacts_directed)
+
+        # Beneficial: does this flip help reduce |error|?
+        # Following fast_quantize_qkv.py line 184-185: target_sign = -sign(error_current)
+        target_sign = -torch.sign(error_currents).unsqueeze(-1)  # [total_heads, num_critical, 1]
+        beneficial_mask = (torch.sign(flip_impacts_directed) == target_sign) & (can_flip_base > 0)
+
+        # ===== 9. Optimal-K Selection Per Dimension (FOLLOWING fast_quantize_qkv.py lines 194-214) =====
         max_flips_per_dim = max(int(hidden_dim * self.gqa_max_flip_pct), 1)
-        best_scores, best_flip_indices = torch.topk(flip_scores, k=max_flips_per_dim, dim=2)
-        # Shape: [total_heads, num_critical, max_flips_per_dim]
 
-        # ===== 8. Apply Flips (Vectorized Scatter) =====
-        # Determine flip direction: +1 or -1
-        flip_directions = torch.sign(torch.gather(flip_impacts, 2, best_flip_indices))
+        # Score and sort
+        flip_scores = flip_impacts_directed.abs() * beneficial_mask.float()
+        sorted_scores, sorted_indices = torch.sort(flip_scores, dim=2, descending=True)
 
-        # Apply flips
-        Wq_int_critical.scatter_add_(2, best_flip_indices, flip_directions)
+        # Gather impacts in sorted order
+        batch_idx = torch.arange(total_heads, device=flip_impacts_directed.device).view(-1, 1, 1).expand(-1, num_critical, hidden_dim)
+        dim_idx = torch.arange(num_critical, device=flip_impacts_directed.device).view(1, -1, 1).expand(total_heads, -1, hidden_dim)
+        impacts_sorted = flip_impacts_directed[batch_idx, dim_idx, sorted_indices]
+        beneficial_sorted = beneficial_mask[batch_idx, dim_idx, sorted_indices].float()
+
+        # Cumsum only for beneficial (line 199-200)
+        impacts_beneficial = impacts_sorted * beneficial_sorted
+        cumsum_impacts = torch.cat([torch.zeros(total_heads, num_critical, 1, device=impacts_beneficial.device),
+                                     torch.cumsum(impacts_beneficial, dim=2)], dim=2)  # [total_heads, num_critical, hidden_dim+1]
+
+        # Find optimal K per dimension (line 203-204)
+        residuals = torch.abs(error_currents.unsqueeze(-1) + cumsum_impacts)  # [total_heads, num_critical, hidden_dim+1]
+        best_k_per_dim = torch.argmin(residuals, dim=2)  # [total_heads, num_critical]
+
+        # Cap at max (line 207-208)
+        best_k_per_dim = torch.clamp(best_k_per_dim, max=max_flips_per_dim)
+
+        # ===== 10. Apply Optimal Flips (line 211-213) =====
+        total_flips = 0
+        for head_idx in range(total_heads):
+            for dim_idx in range(num_critical):
+                k = best_k_per_dim[head_idx, dim_idx].item()
+                if k > 0:
+                    # Get indices where beneficial_sorted is True for first k positions
+                    flip_indices = sorted_indices[head_idx, dim_idx, :k][beneficial_sorted[head_idx, dim_idx, :k] > 0]
+                    if len(flip_indices) > 0:
+                        direction = flip_direction_base[head_idx, dim_idx, 0].item()
+                        Wq_int_critical[head_idx, dim_idx, flip_indices] += direction
+                        total_flips += len(flip_indices)
+
         Wq_int_critical.clamp_(0, 15)
 
-        # ===== 9. Scatter Back to Full Tensor =====
+        # ===== 11. Scatter Back to Full Tensor =====
         critical_indices_expanded = critical_indices.unsqueeze(-1).expand(-1, -1, hidden_dim)
         Wq_int_flat.scatter_(1, critical_indices_expanded, Wq_int_critical)
 
-        # ===== 10. Dequantize and Reshape =====
+        # ===== 12. Dequantize and Reshape =====
         Wq_dequant_flat = (Wq_int_flat - zp_expanded) * scales_expanded
         Wq_refined_4d = Wq_dequant_flat.view(num_k_heads, gqa_ratio, head_dim, hidden_dim)
 
         # Stats
-        total_flips = (best_scores > 0).sum().item()
-        avg_flip_rate = total_flips / (total_heads * num_critical * max_flips_per_dim) * 100
+        avg_flip_rate = total_flips / (total_heads * num_critical * max_flips_per_dim) * 100 if max_flips_per_dim > 0 else 0
 
         stats = {
             'total_flips': total_flips,
