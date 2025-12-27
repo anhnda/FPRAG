@@ -1008,7 +1008,7 @@ def main():
                        help="Max tokens to store per sample (default: 2048)")
     parser.add_argument("--layer-batch-size", type=int, default=16,
                        help="Number of layers to process per batch (default: 16)")
-    parser.add_argument("--lmhead-chunks", type=int, default=4,
+    parser.add_argument("--lmhead-chunks", type=int, default=8,
                        help="Number of chunks to split lm_head into (default: 4, higher = less memory)")
     parser.add_argument("--output-dir", type=str, default="./quantized_models/model_awq_js_xl")
     parser.add_argument("--model-path", type=str, default="./models/Mistral-7B-v0.3",
