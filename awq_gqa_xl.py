@@ -89,10 +89,57 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
     - ReFlip refinement after AWQ quantization
     """
 
-    def __init__(self, *args, apply_gqa_reflip=False, gqa_critical_dim_pct=0.15,
-                 gqa_max_flip_pct=0.05, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self, model_path, device="cuda", bits=4, n_grid=20,
+                 group_size=128, use_heuristic=True, knee_tolerance=0.1,
+                 max_tokens_per_sample=512, layer_batch_size=16, lmhead_chunks=4,
+                 max_flip_percent=0.05, use_james_stein=True,
+                 apply_gqa_reflip=False, gqa_critical_dim_pct=0.15,
+                 gqa_max_flip_pct=0.05):
+        """
+        Initialize AWQ-GQA Quantizer.
 
+        Args:
+            model_path: Path to model or HuggingFace model name
+            (other args same as JamesSteinHeuristicAWQQuantizerXL)
+            apply_gqa_reflip: Enable GQA ReFlip refinement
+            gqa_critical_dim_pct: Percentage of moderate dimensions for ReFlip
+            gqa_max_flip_pct: Max flip percentage for ReFlip
+        """
+        # Load model and tokenizer
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        print(f"\nLoading model and tokenizer from: {model_path}")
+        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+            print("  -> Set pad_token = eos_token")
+
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+            trust_remote_code=True
+        )
+        model.eval()
+
+        # Initialize parent class
+        super().__init__(
+            model=model,
+            tokenizer=tokenizer,
+            device=device,
+            bits=bits,
+            n_grid=n_grid,
+            group_size=group_size,
+            use_heuristic=use_heuristic,
+            knee_tolerance=knee_tolerance,
+            max_tokens_per_sample=max_tokens_per_sample,
+            layer_batch_size=layer_batch_size,
+            lmhead_chunks=lmhead_chunks,
+            max_flip_percent=max_flip_percent,
+            use_james_stein=use_james_stein
+        )
+
+        # GQA-specific attributes
         self.apply_gqa_reflip = apply_gqa_reflip
         self.gqa_critical_dim_pct = gqa_critical_dim_pct
         self.gqa_max_flip_pct = gqa_max_flip_pct
@@ -511,10 +558,11 @@ def main():
 
     # Create quantizer with GQA support
     quantizer = AWQGQAQuantizer(
-        args.model_path,
-        w_bit=4,
-        group_size=args.group_size,
+        model_path=args.model_path,
+        device="cuda" if torch.cuda.is_available() else "cpu",
+        bits=4,
         n_grid=args.n_grid,
+        group_size=args.group_size,
         use_heuristic=args.use_heuristic,
         layer_batch_size=args.layer_batch_size,
         apply_gqa_reflip=args.apply_gqa_reflip,
