@@ -149,138 +149,17 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
         self.gqa_layers = {}  # {layer_group: {q_proj, k_proj, v_proj}}
         self.gqa_activations = {}  # Preserve activations for GQA layers
         self.gqa_original_weights = {}  # Original FP weights before quantization
-        self.gqa_quant_artifacts = {}  # INT4, scales, zp from AWQ
-
-    def quantize_weight_heuristic_groupwise_extended(self, W, group_activation_means, apply_heuristic=True):
-        """
-        Extended version that returns INT4 representation in addition to dequantized weights.
-
-        Returns:
-            tuple: (W_dequant, outlier_percent, flip_stats, W_int, scales, zp)
-        """
-        out_features, in_features = W.shape
-        device = W.device
-
-        # Padding
-        n_groups = (in_features + self.group_size - 1) // self.group_size
-        padded_in_features = n_groups * self.group_size
-
-        if padded_in_features > in_features:
-            W_padded = torch.zeros(out_features, padded_in_features, device=device, dtype=W.dtype)
-            W_padded[:, :in_features] = W
-            act_padded = torch.zeros(padded_in_features, device=device, dtype=W.dtype)
-            act_padded[:in_features] = group_activation_means
-        else:
-            W_padded = W
-            act_padded = group_activation_means
-
-        # Reshape to groups
-        W_g = W_padded.reshape(out_features, n_groups, self.group_size)
-
-        # Asymmetric Quantization
-        w_min = W_g.min(dim=2, keepdim=True)[0]
-        w_max = W_g.max(dim=2, keepdim=True)[0]
-        max_int = 2**self.bits - 1
-
-        scale = (w_max - w_min) / max_int
-        scale = scale.clamp(min=1e-8)
-        zp = torch.round(-w_min / scale).clamp(0, max_int)
-
-        # Expand to full size
-        scale_flat = scale.repeat(1, 1, self.group_size).reshape(out_features, padded_in_features)
-        zp_flat = zp.repeat(1, 1, self.group_size).reshape(out_features, padded_in_features)
-
-        # Initial Quantization
-        W_div = W_padded / scale_flat
-        W_int = torch.round(W_div + zp_flat).clamp(0, max_int)
-
-        if not apply_heuristic:
-            W_dequant = (W_int - zp_flat) * scale_flat
-            if padded_in_features > in_features:
-                W_dequant = W_dequant[:, :in_features]
-                W_int = W_int[:, :in_features]
-
-            flip_stats = {'total': 0, 'per_channel_mean': 0}
-            # Return with INT4 artifacts
-            return W_dequant.to(W.dtype), None, flip_stats, W_int, scale, zp
-
-        # Call parent heuristic method for the full quantization with flips
-        W_dequant, outlier_pct, flip_stats = super().quantize_weight_heuristic_groupwise(
-            W, group_activation_means, apply_heuristic=True
-        )
-
-        # Re-compute W_int after flips (approximate from dequantized version)
-        # This is needed because parent method doesn't return W_int
-        W_padded_final = torch.zeros(out_features, padded_in_features, device=device, dtype=W.dtype)
-        if padded_in_features > in_features:
-            W_padded_final[:, :in_features] = W_dequant
-        else:
-            W_padded_final = W_dequant
-
-        W_int_final = torch.round(W_padded_final / scale_flat + zp_flat).clamp(0, max_int)
-        if padded_in_features > in_features:
-            W_int_final = W_int_final[:, :in_features]
-
-        return W_dequant, outlier_pct, flip_stats, W_int_final, scale, zp
 
     def quantize_layer(self, name, module):
         """
-        Override to preserve INT4 artifacts and original weights for GQA layers.
+        Override to store original weights for GQA layers before quantization.
         """
         # Save original weights for GQA layers BEFORE quantization
         if self.apply_gqa_reflip and is_gqa_layer(name):
             self.gqa_original_weights[name] = module.weight.data.clone().cpu()
 
-        # Perform AWQ quantization
-        best_scales, best_alpha, best_error = self.search_best_scale(name, module)
-
-        W = module.weight.data
-        original_dtype = W.dtype
-        W_scaled = W * best_scales.unsqueeze(0)
-
-        _, js_mean = self.get_activation_stats(name)
-        if js_mean is not None:
-            scaled_act_mean = (js_mean.to(self.device).to(W.dtype) / best_scales)
-        else:
-            scaled_act_mean = torch.zeros(W.shape[1], device=W.device, dtype=W.dtype)
-
-        # Use extended version for GQA layers to get INT4 artifacts
-        if self.apply_gqa_reflip and is_gqa_layer(name):
-            W_quant, outlier_pct, flip_stats, W_int, scales_grouped, zp_grouped = \
-                self.quantize_weight_heuristic_groupwise_extended(
-                    W_scaled, scaled_act_mean, apply_heuristic=self.use_heuristic
-                )
-
-            # Store INT4 artifacts (scaled weights)
-            self.gqa_quant_artifacts[name] = {
-                'W_int': W_int.cpu(),  # INT4 values of SCALED weights
-                'scales': scales_grouped.cpu(),  # Group-wise scales
-                'zp': zp_grouped.cpu(),  # Group-wise zero points
-                'awq_scales': best_scales.cpu(),  # AWQ input scaling factors
-            }
-        else:
-            # Standard quantization for non-GQA layers
-            W_quant, outlier_pct, flip_stats = self.quantize_weight_heuristic_groupwise(
-                W_scaled, scaled_act_mean, apply_heuristic=self.use_heuristic
-            )
-
-        # Apply AWQ descaling and store
-        W_final = (W_quant / best_scales.unsqueeze(0)).to(original_dtype)
-        module.weight.data = W_final
-
-        self.layer_scales[name] = {
-            'scales': best_scales.cpu(),
-            'alpha': best_alpha,
-            'error': best_error,
-            'outlier_percent': outlier_pct if outlier_pct is not None else 0.0,
-            'flip_stats': flip_stats
-        }
-
-        del best_scales, scaled_act_mean, W_scaled, W_quant, W_final
-        if name in self.activation_data and not (self.apply_gqa_reflip and is_gqa_layer(name)):
-            del self.activation_data[name]
-        torch.cuda.empty_cache()
-        gc.collect()
+        # Call parent's standard quantization (preserves lm_head chunking)
+        super().quantize_layer(name, module)
 
     def calibrate_layer_batch(self, batch_layers, calibration_data, n_samples):
         """
@@ -295,17 +174,19 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
         """
         Override to add GQA ReFlip refinement after AWQ quantization.
         """
-        print("\n" + "=" * 80)
-        print("AWQ-GQA: Combined Quantization Pipeline")
-        print("=" * 80)
-        print(f"  Step 1: AWQ quantization for all layers")
-        print(f"  Step 2: GQA ReFlip refinement (enabled: {self.apply_gqa_reflip})")
-        print("=" * 80)
+        # Only show custom banner if ReFlip is enabled
+        if self.apply_gqa_reflip:
+            print("\n" + "=" * 80)
+            print("AWQ-GQA: Combined Quantization Pipeline")
+            print("=" * 80)
+            print(f"  Step 1: AWQ quantization for all layers")
+            print(f"  Step 2: GQA ReFlip refinement (enabled: True)")
+            print("=" * 80)
 
         # Step 1: Standard AWQ quantization
         super().quantize_model_sequential(calibration_data, n_samples)
 
-        # Step 2: GQA ReFlip refinement
+        # Step 2: GQA ReFlip refinement (only if enabled)
         if self.apply_gqa_reflip:
             self.apply_gqa_reflip_refinement(calibration_data, n_samples)
 
@@ -380,7 +261,6 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
         # Clear all remaining GQA storage
         self.gqa_activations.clear()
         self.gqa_original_weights.clear()
-        self.gqa_quant_artifacts.clear()
         torch.cuda.empty_cache()
         gc.collect()
 
