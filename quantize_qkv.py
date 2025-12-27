@@ -231,7 +231,7 @@ def quantize_qkv_reflip(Wq, Wk, X, Q_orig_all, Q_heuristic_all,
                          Wq_heuristic, Wk_heuristic,
                          critical_dim_pct=0.15, knee_tolerance=0.0,
                          group_size=128, max_flip_pct=0.05,
-                         correction_scale=10.0, debug=False):
+                         correction_scale=1.0, debug=False):
     """
     ReFlip: Targeted error correction on critical head dimensions.
 
@@ -254,7 +254,7 @@ def quantize_qkv_reflip(Wq, Wk, X, Q_orig_all, Q_heuristic_all,
         knee_tolerance: Tolerance for Kneedle algorithm (default: 0.0)
         group_size: Quantization group size (default: 128)
         max_flip_pct: Max flip percentage for heuristic (default: 0.05 = 5%)
-        correction_scale: Scaling factor for error correction weighting (default: 10.0)
+        correction_scale: Scaling factor for error correction weighting (default: 1.0)
         debug: Print debug information
 
     Returns:
@@ -391,8 +391,8 @@ def main():
                         help='Quantization group size (default: 128)')
     parser.add_argument('--max-flip-pct', type=float, default=0.05,
                         help='Max flip percentage for ReFlip (default: 0.05 = 5%%)')
-    parser.add_argument('--correction-scale', type=float, default=10.0,
-                        help='Error correction scaling factor for ReFlip (default: 10.0)')
+    parser.add_argument('--correction-scale', type=float, default=1.0,
+                        help='Error correction scaling factor for ReFlip (default: 1.0)')
     parser.add_argument('--debug', action='store_true',
                         help='Print debug information')
     args = parser.parse_args()
