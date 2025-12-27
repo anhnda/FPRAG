@@ -12,8 +12,8 @@ This provides:
 
 Usage:
     python awq_gqa_xl.py \
-        --model openbmb/MiniCPM-2B-sft-bf16 \
-        --output-dir ./quantized_models/minicpm_awq_gqa \
+        --model-path ./models/Llama-3-8B \
+        --output-dir ./quantized_models/llama3_awq_gqa \
         --n-calib 128 \
         --apply-gqa-reflip  # Enable GQA ReFlip refinement
 """
@@ -467,9 +467,9 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
 
 def main():
     parser = argparse.ArgumentParser(description='AWQ-GQA: Combined Quantization')
-    parser.add_argument('--model', type=str, default='openbmb/MiniCPM-2B-sft-bf16',
+    parser.add_argument('--model-path', type=str, default='./models/Llama-3-8B',
                         help='Model name or path')
-    parser.add_argument('--output-dir', type=str, default='./quantized_models/minicpm_awq_gqa',
+    parser.add_argument('--output-dir', type=str, default='./quantized_models/llama3_awq_gqa',
                         help='Output directory for quantized model')
     parser.add_argument('--n-calib', type=int, default=128,
                         help='Number of calibration samples')
@@ -500,7 +500,7 @@ def main():
     print("\n" + "=" * 80)
     print("AWQ-GQA: Combined Quantization with GQA ReFlip Refinement")
     print("=" * 80)
-    print(f"  Model: {args.model}")
+    print(f"  Model: {args.model_path}")
     print(f"  Output: {args.output_dir}")
     print(f"  Calibration samples: {args.n_calib}")
     print(f"  GQA ReFlip: {'Enabled' if args.apply_gqa_reflip else 'Disabled'}")
@@ -511,7 +511,7 @@ def main():
 
     # Create quantizer with GQA support
     quantizer = AWQGQAQuantizer(
-        args.model,
+        args.model_path,
         w_bit=4,
         group_size=args.group_size,
         n_grid=args.n_grid,

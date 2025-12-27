@@ -66,7 +66,7 @@ self.gqa_activations = {}       # Preserved activations for ReFlip
 ### Basic Usage
 ```bash
 python awq_gqa_xl.py \
-    --model openbmb/MiniCPM-2B-sft-bf16 \
+    --model-path openbmb/MiniCPM-2B-sft-bf16 \
     --output-dir ./quantized_models/minicpm_awq_gqa \
     --n-calib 128 \
     --apply-gqa-reflip
@@ -75,7 +75,7 @@ python awq_gqa_xl.py \
 ### With Custom ReFlip Parameters
 ```bash
 python awq_gqa_xl.py \
-    --model openbmb/MiniCPM-2B-sft-bf16 \
+    --model-path openbmb/MiniCPM-2B-sft-bf16 \
     --output-dir ./quantized_models/minicpm_awq_gqa \
     --n-calib 128 \
     --apply-gqa-reflip \
@@ -86,7 +86,7 @@ python awq_gqa_xl.py \
 ### AWQ Only (No ReFlip)
 ```bash
 python awq_gqa_xl.py \
-    --model openbmb/MiniCPM-2B-sft-bf16 \
+    --model-path openbmb/MiniCPM-2B-sft-bf16 \
     --output-dir ./quantized_models/minicpm_awq \
     --n-calib 128
 ```
@@ -99,7 +99,7 @@ python awq_gqa_xl.py \
 - `--gqa-max-flip-pct`: Maximum percentage of weights to flip per dimension (default: 0.05)
 
 ### AWQ Parameters
-- `--model`: Model name or path
+- `--model-path`: Model name or path
 - `--output-dir`: Output directory for quantized model
 - `--n-calib`: Number of calibration samples (default: 128)
 - `--n-grid`: Grid search points for alpha (default: 20)
