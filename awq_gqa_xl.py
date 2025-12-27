@@ -305,11 +305,14 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
         flip_impacts_directed = flip_direction_base * scales_critical * X_expanded  # [total_heads, num_critical, hidden_dim]
 
         # Validity: can we flip?
+        # flip_direction_base: [total_heads, num_critical, 1]
+        # Wq_int_critical: [total_heads, num_critical, hidden_dim]
+        # Broadcasting will expand flip_direction_base to match Wq_int_critical
         can_flip_base = torch.where(
             flip_direction_base > 0,
-            (Wq_int_critical < 15).unsqueeze(-1),
-            (Wq_int_critical > 0).unsqueeze(-1)
-        ).float().squeeze(-1).unsqueeze(-1).expand_as(flip_impacts_directed)
+            Wq_int_critical < 15,
+            Wq_int_critical > 0
+        ).float()  # [total_heads, num_critical, hidden_dim]
 
         # Beneficial: does this flip help reduce |error|?
         # Following fast_quantize_qkv.py line 184-185: target_sign = -sign(error_current)
