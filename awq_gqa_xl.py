@@ -129,10 +129,11 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
         self.gqa_critical_dim_pct = gqa_critical_dim_pct
         self.gqa_max_flip_pct = gqa_max_flip_pct
 
-        # Store GQA layer info for refinement
-        self.gqa_layers = {}  # {layer_group: {q_proj, k_proj, v_proj}}
-        self.gqa_activations = {}  # Preserve activations for GQA layers
-        self.gqa_original_weights = {}  # Original FP weights before quantization
+        # Only create storage if ReFlip is enabled
+        if self.apply_gqa_reflip:
+            self.gqa_layers = {}  # {layer_group: {q_proj, k_proj, v_proj}}
+            self.gqa_activations = {}  # Preserve activations for GQA layers
+            self.gqa_original_weights = {}  # Original FP weights before quantization
 
     def quantize_layer(self, name, module):
         """Store original weights for GQA layers if ReFlip enabled."""
@@ -231,9 +232,11 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
         print(f"\n  ✓ Refined {refined_count}/{len(attn_groups)} attention groups")
         print("=" * 80)
 
-        # Clear all remaining GQA storage
-        self.gqa_activations.clear()
-        self.gqa_original_weights.clear()
+        # Clear all remaining GQA storage (if exists)
+        if hasattr(self, 'gqa_activations'):
+            self.gqa_activations.clear()
+        if hasattr(self, 'gqa_original_weights'):
+            self.gqa_original_weights.clear()
         torch.cuda.empty_cache()
         gc.collect()
 
@@ -431,10 +434,11 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
 
         finally:
             # Free memory - delete original weights (activations already deleted in outer loop)
-            if q_name in self.gqa_original_weights:
-                del self.gqa_original_weights[q_name]
-            if k_name in self.gqa_original_weights:
-                del self.gqa_original_weights[k_name]
+            if hasattr(self, 'gqa_original_weights'):
+                if q_name in self.gqa_original_weights:
+                    del self.gqa_original_weights[q_name]
+                if k_name in self.gqa_original_weights:
+                    del self.gqa_original_weights[k_name]
 
             torch.cuda.empty_cache()
             gc.collect()
