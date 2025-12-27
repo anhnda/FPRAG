@@ -341,20 +341,25 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
         # Cap at max (line 207-208)
         best_k_per_dim = torch.clamp(best_k_per_dim, max=max_flips_per_dim)
 
-        # ===== 10. Apply Optimal Flips (line 211-213) =====
-        total_flips = 0
-        for head_idx in range(total_heads):
-            for dim_idx in range(num_critical):
-                k = best_k_per_dim[head_idx, dim_idx].item()
-                if k > 0:
-                    # Get indices where beneficial_sorted is True for first k positions
-                    flip_indices = sorted_indices[head_idx, dim_idx, :k][beneficial_sorted[head_idx, dim_idx, :k] > 0]
-                    if len(flip_indices) > 0:
-                        direction = flip_direction_base[head_idx, dim_idx, 0].item()
-                        Wq_int_critical[head_idx, dim_idx, flip_indices] += direction
-                        total_flips += len(flip_indices)
+        # ===== 10. Apply Optimal Flips (Vectorized - Single Kernel Launch) =====
+        # Slice to maximum possible flips
+        limit = max_flips_per_dim
+        indices_top = sorted_indices[:, :, :limit]      # [total_heads, num_critical, limit]
+        beneficial_top = beneficial_sorted[:, :, :limit]  # [total_heads, num_critical, limit]
 
+        # Create mask: position < best_k AND beneficial
+        range_k = torch.arange(limit, device=best_k_per_dim.device).view(1, 1, -1)
+        active_mask = (range_k < best_k_per_dim.unsqueeze(-1)) & (beneficial_top > 0)
+
+        # Prepare updates: direction * mask
+        updates = flip_direction_base * active_mask.float()  # [total_heads, num_critical, limit]
+
+        # Apply all flips at once (single GPU kernel)
+        Wq_int_critical.scatter_add_(dim=2, index=indices_top, src=updates)
         Wq_int_critical.clamp_(0, 15)
+
+        # Stats
+        total_flips = active_mask.sum().item()
 
         # ===== 11. Scatter Back to Full Tensor =====
         critical_indices_expanded = critical_indices.unsqueeze(-1).expand(-1, -1, hidden_dim)
