@@ -154,6 +154,34 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
         """
         Override to store original weights for GQA layers before quantization.
         """
+        # Check if this is lm_head - if so, clear all caches first
+        is_lmhead = 'lm_head' in name.lower() or name.endswith('lm_head')
+        if is_lmhead:
+            # Aggressive memory cleanup before lm_head
+            print(f"\n  🧹 Cleaning memory before lm_head...")
+
+            # Clear any stored GQA data (shouldn't exist if ReFlip disabled, but just in case)
+            if hasattr(self, 'gqa_original_weights'):
+                self.gqa_original_weights.clear()
+            if hasattr(self, 'gqa_activations'):
+                self.gqa_activations.clear()
+
+            # Clear activation data
+            if hasattr(self, 'activation_data'):
+                self.activation_data.clear()
+
+            # Aggressive GPU cache clearing
+            torch.cuda.empty_cache()
+            gc.collect()
+            torch.cuda.empty_cache()  # Double clear
+
+            import time
+            time.sleep(0.5)  # Give GPU time to release memory
+
+            if torch.cuda.is_available():
+                print(f"     GPU memory: {torch.cuda.memory_allocated()/1e9:.2f} GB allocated, "
+                      f"{torch.cuda.memory_reserved()/1e9:.2f} GB reserved")
+
         # Save original weights for GQA layers BEFORE quantization
         if self.apply_gqa_reflip and is_gqa_layer(name):
             self.gqa_original_weights[name] = module.weight.data.clone().cpu()
@@ -318,8 +346,7 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
 
         # Check if we have all required data
         if (q_name not in self.gqa_activations or k_name not in self.gqa_activations or
-            q_name not in self.gqa_original_weights or k_name not in self.gqa_original_weights or
-            q_name not in self.gqa_quant_artifacts or k_name not in self.gqa_quant_artifacts):
+            q_name not in self.gqa_original_weights or k_name not in self.gqa_original_weights):
             return  # Skip if data not available
 
         # ===== 1. Prepare Activations =====
