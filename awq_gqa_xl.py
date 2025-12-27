@@ -31,34 +31,17 @@ import gc
 # Import AWQ quantizer from awq_js_xl
 from awq_js_xl import JamesSteinHeuristicAWQQuantizerXL, compute_james_stein_mean
 
-# Import ReFlip function from fast_quantize_qkv
-from fast_quantize_qkv import quantize_qkv_reflip_fast
-
 
 def is_gqa_layer(layer_name):
-    """
-    Detect if a layer is part of Group-Query Attention.
-
-    GQA layers typically have names like:
-    - model.layers.0.self_attn.q_proj
-    - model.layers.0.self_attn.k_proj
-    - model.layers.0.self_attn.v_proj
-    """
+    """Detect if a layer is part of Group-Query Attention."""
     gqa_keywords = ['q_proj', 'k_proj', 'v_proj', 'query', 'key', 'value']
-    layer_lower = layer_name.lower()
-
-    return any(keyword in layer_lower for keyword in gqa_keywords)
+    return any(keyword in layer_name.lower() for keyword in gqa_keywords)
 
 
 def get_layer_group(layer_name):
-    """
-    Extract layer group from name (e.g., 'model.layers.0.self_attn').
-
-    Returns: (layer_idx, attn_group) or None
-    """
+    """Extract layer group from name (e.g., 'model.layers.0.self_attn')."""
     parts = layer_name.split('.')
 
-    # Find layer index
     layer_idx = None
     for i, part in enumerate(parts):
         if part == 'layers' and i + 1 < len(parts):
@@ -71,7 +54,6 @@ def get_layer_group(layer_name):
     if layer_idx is None:
         return None
 
-    # Get attention group (everything before q_proj/k_proj/v_proj)
     if 'self_attn' in parts:
         attn_idx = parts.index('self_attn')
         attn_group = '.'.join(parts[:attn_idx + 1])
@@ -81,87 +63,43 @@ def get_layer_group(layer_name):
 
 
 class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
-    """
-    Extended AWQ Quantizer with GQA ReFlip refinement.
-
-    Inherits from JamesSteinHeuristicAWQQuantizerXL and adds:
-    - GQA layer detection
-    - Model state preservation (only if ReFlip enabled)
-    - ReFlip refinement after AWQ quantization
-    """
+    """Extended AWQ Quantizer with GQA ReFlip refinement."""
 
     def __init__(self, model, tokenizer, device="cuda", bits=4, n_grid=20,
                  group_size=128, use_heuristic=True, knee_tolerance=0.1,
-                 max_tokens_per_sample=512, layer_batch_size=16, lmhead_chunks=4,
+                 max_tokens_per_sample=512, layer_batch_size=16, lmhead_chunks=8,
                  max_flip_percent=0.05, use_james_stein=True,
                  apply_gqa_reflip=False, gqa_critical_dim_pct=0.15,
                  gqa_max_flip_pct=0.05):
-        """
-        Initialize AWQ-GQA Quantizer.
 
-        Args:
-            model: Pre-loaded model
-            tokenizer: Pre-loaded tokenizer
-            (other args same as JamesSteinHeuristicAWQQuantizerXL)
-            apply_gqa_reflip: Enable GQA ReFlip refinement
-            gqa_critical_dim_pct: Percentage of moderate dimensions for ReFlip
-            gqa_max_flip_pct: Max flip percentage for ReFlip
-        """
-        # Initialize parent class (same as awq_js_xl.py)
         super().__init__(
-            model=model,
-            tokenizer=tokenizer,
-            device=device,
-            bits=bits,
-            n_grid=n_grid,
-            group_size=group_size,
-            use_heuristic=use_heuristic,
-            knee_tolerance=knee_tolerance,
-            max_tokens_per_sample=max_tokens_per_sample,
-            layer_batch_size=layer_batch_size,
-            lmhead_chunks=lmhead_chunks,
-            max_flip_percent=max_flip_percent,
+            model=model, tokenizer=tokenizer, device=device, bits=bits, n_grid=n_grid,
+            group_size=group_size, use_heuristic=use_heuristic, knee_tolerance=knee_tolerance,
+            max_tokens_per_sample=max_tokens_per_sample, layer_batch_size=layer_batch_size,
+            lmhead_chunks=lmhead_chunks, max_flip_percent=max_flip_percent,
             use_james_stein=use_james_stein
         )
 
-        # GQA-specific attributes
         self.apply_gqa_reflip = apply_gqa_reflip
         self.gqa_critical_dim_pct = gqa_critical_dim_pct
         self.gqa_max_flip_pct = gqa_max_flip_pct
-
-        # Storage for GQA refinement (only if enabled)
-        self.original_state_dict = None  # Store original weights before quantization
-        self.gqa_js_means = {}  # Store James-Stein means from AWQ quantization
+        self.original_state_dict = None
+        self.gqa_js_means = {}
 
     def quantize_layer(self, name, module):
-        """
-        Override to store James-Stein means for GQA layers (only if refinement enabled).
-
-        This avoids recomputing the mean during refinement.
-        """
-        # If refinement enabled and this is a GQA layer, store the JS mean
+        """Override to store James-Stein means for GQA layers."""
         if self.apply_gqa_reflip and is_gqa_layer(name):
-            # Get JS mean from activation stats (computed by parent)
             _, js_mean = self.get_activation_stats(name)
             if js_mean is not None:
-                # Store on CPU to save memory
                 self.gqa_js_means[name] = js_mean.cpu().float()
-
-        # Call parent to do the actual quantization
         super().quantize_layer(name, module)
 
     def quantize_model_sequential(self, calibration_data, n_samples=500):
-        """
-        Override to add GQA ReFlip refinement after AWQ quantization.
-
-        CRITICAL: When apply_gqa_reflip=False, this behaves EXACTLY like parent class.
-        """
+        """Override to add GQA ReFlip refinement after AWQ quantization."""
         if not self.apply_gqa_reflip:
-            # NO CHANGES - call parent directly
             super().quantize_model_sequential(calibration_data, n_samples)
             return
 
-        # ===== GQA ReFlip Mode =====
         print("\n" + "=" * 80)
         print("AWQ-GQA: Combined Quantization Pipeline")
         print("=" * 80)
@@ -170,44 +108,28 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
         print(f"  Step 3: GQA ReFlip refinement")
         print("=" * 80)
 
-        # Step 1: Save original state dict (only GQA layers to save memory)
+        # Step 1: Save original weights
         print("\n[Step 1] Saving original GQA layer weights...")
         self.original_state_dict = {}
         for name, module in self.model.named_modules():
             if isinstance(module, nn.Linear) and is_gqa_layer(name):
-                # Store on CPU to save GPU memory
                 self.original_state_dict[name + '.weight'] = module.weight.data.clone().cpu()
+        print(f"  ✓ Saved {len(self.original_state_dict)} GQA layer weights")
 
-        num_saved = len(self.original_state_dict)
-        print(f"  ✓ Saved {num_saved} GQA layer weights")
-
-        # Step 2: Standard AWQ quantization
+        # Step 2: AWQ quantization
         print("\n[Step 2] Running AWQ quantization...")
         super().quantize_model_sequential(calibration_data, n_samples)
 
         # Step 3: GQA ReFlip refinement
         print("\n[Step 3] Applying GQA ReFlip refinement...")
-        self.apply_gqa_reflip_refinement(calibration_data, n_samples)
+        self.apply_gqa_reflip_refinement()
 
-        # Clean up
         self.original_state_dict = None
         torch.cuda.empty_cache()
         gc.collect()
 
-    def apply_gqa_reflip_refinement(self, calibration_data, n_samples):
-        """
-        Apply ReFlip refinement to GQA layers.
-
-        For each attention layer:
-        1. Group Q, K, V projections
-        2. Re-capture activations (on-demand)
-        3. Apply ReFlip to correct attention score errors
-        4. Update quantized weights
-
-        Args:
-            calibration_data: Same calibration data used for AWQ
-            n_samples: Number of calibration samples
-        """
+    def apply_gqa_reflip_refinement(self):
+        """Apply ReFlip refinement to GQA layers."""
         print("\n" + "=" * 80)
         print("GQA ReFlip Refinement")
         print("=" * 80)
@@ -219,11 +141,9 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
                 group_info = get_layer_group(name)
                 if group_info:
                     _, attn_group = group_info
-
                     if attn_group not in attn_groups:
                         attn_groups[attn_group] = {}
 
-                    # Identify projection type
                     if 'q_proj' in name.lower() or 'query' in name.lower():
                         attn_groups[attn_group]['q_proj'] = (name, module)
                     elif 'k_proj' in name.lower() or 'key' in name.lower():
@@ -235,45 +155,173 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
 
         refined_count = 0
         for attn_group, projs in tqdm(attn_groups.items(), desc="  Refining GQA layers"):
-            # Check if we have all required projections
             if 'q_proj' not in projs or 'k_proj' not in projs:
                 print(f"    ⚠️  Skipping {attn_group}: Missing Q or K projection")
                 continue
 
             try:
-                # Apply refinement using stored JS means (no activation recapture needed!)
                 self.refine_attention_group(attn_group, projs)
                 refined_count += 1
-
                 torch.cuda.empty_cache()
                 gc.collect()
-
             except Exception as e:
                 print(f"    ⚠️  Error refining {attn_group}: {e}")
                 import traceback
                 traceback.print_exc()
-                continue
 
         print(f"\n  ✓ Refined {refined_count}/{len(attn_groups)} attention groups")
         print("=" * 80)
 
-        # Clear stored JS means (no longer needed)
         self.gqa_js_means.clear()
 
-    def refine_attention_group(self, attn_group, projs):
+    def infer_head_dim(self, k_out):
         """
-        Apply ReFlip refinement to a single attention group (Q, K, V).
+        Infer head dimension from K output features.
+        FIXED: Checks largest dimensions first (256 before 64) to avoid incorrect splitting.
 
-        This method:
-        1. Extracts original and AWQ-quantized weights
-        2. Uses pre-computed James-Stein means (from AWQ quantization)
-        3. Calls fast ReFlip to refine Q projections
-        4. Updates model weights with refined versions
+        Why this matters:
+        - For Llama-3 (head_dim=128, k_out=1024):
+          - WRONG (ascending): Checks 64 first → 1024%64==0 → Splits into 16 fake heads
+          - RIGHT (descending): Checks 128 first → 1024%128==0 → Correct 8 heads
         """
+        # Try to get from model config first
+        if hasattr(self.model, 'config') and hasattr(self.model.config, 'head_dim'):
+            return self.model.config.head_dim
+
+        # CRITICAL: Check in descending order to avoid incorrect head splitting
+        possible_head_dims = [256, 128, 96, 80, 64]  # FIXED: Descending order is crucial
+        for hd in possible_head_dims:
+            if k_out % hd == 0:
+                return hd
+
+        return k_out
+
+    def quantize_qkv_reflip_batched(self, Wq_orig_4d, Wk_orig_4d,
+                                      Wq_int_heuristic_4d, Wq_scales_4d, Wq_zp_4d,
+                                      Q_orig_all, Q_heuristic_all, K_orig_all, X, group_size):
+        """
+        Fully Vectorized ReFlip following fast_quantize_qkv.py logic.
+
+        CORRECTED:
+        - Error sign: Positive error = need to increase score
+        - Dimension ordering: Largest first to avoid incorrect splits
+        - K broadcasting: Proper unsqueeze + expand
+        """
+        num_k_heads, gqa_ratio, head_dim, hidden_dim = Wq_orig_4d.shape
+        total_heads = num_k_heads * gqa_ratio
+
+        # ===== 1. Flatten to [Total_Heads, Head_Dim, Hidden_Dim] =====
+        Wq_int_flat = Wq_int_heuristic_4d.contiguous().view(total_heads, head_dim, hidden_dim).float()
+        Wq_scales_flat = Wq_scales_4d.contiguous().view(total_heads, head_dim, -1)
+        Wq_zp_flat = Wq_zp_4d.contiguous().view(total_heads, head_dim, -1)
+
+        # ===== 2. Compute Q/K Values and Errors (Vectorized) =====
+        # K_values: [total_heads, head_dim] - Each K head repeated gqa_ratio times
+        K_values = K_orig_all.squeeze(2).unsqueeze(1).expand(num_k_heads, gqa_ratio, head_dim).reshape(total_heads, head_dim)
+
+        Q_target = Q_orig_all.contiguous().view(total_heads, head_dim)
+        Q_current = Q_heuristic_all.contiguous().view(total_heads, head_dim)
+
+        # Attention scores: Q @ K (element-wise multiply and sum)
+        scores_target = (Q_target * K_values).sum(dim=1)  # [total_heads]
+        scores_current = (Q_current * K_values).sum(dim=1)  # [total_heads]
+
+        # Error = Target - Current
+        # Positive error means we need to INCREASE the score
+        score_errors = scores_target - scores_current  # [total_heads]
+
+        # ===== 3. Identify Critical Dimensions (Vectorized TopK) =====
+        num_critical = max(int(head_dim * self.gqa_critical_dim_pct), 1)
+        Q_magnitudes = Q_target.abs()
+        _, critical_indices = torch.topk(Q_magnitudes, k=num_critical, dim=1)  # [total_heads, num_critical]
+
+        # ===== 4. Gather Critical Dimension Data =====
+        def gather_2d(tensor_3d, indices_2d):
+            """Gather along dim=1"""
+            expanded_indices = indices_2d.unsqueeze(-1).expand(-1, -1, tensor_3d.size(2))
+            return torch.gather(tensor_3d, 1, expanded_indices)
+
+        # Expand scales and zp to full hidden_dim
+        scales_expanded = Wq_scales_flat.repeat_interleave(group_size, dim=2)[:, :, :hidden_dim]
+        zp_expanded = Wq_zp_flat.repeat_interleave(group_size, dim=2)[:, :, :hidden_dim]
+
+        # Gather critical dimensions
+        Wq_int_critical = gather_2d(Wq_int_flat, critical_indices)
+        scales_critical = gather_2d(scales_expanded, critical_indices)
+        K_critical = torch.gather(K_values, 1, critical_indices)  # [total_heads, num_critical]
+
+        # ===== 5. Compute Flip Impacts (CORRECTED SIGN LOGIC) =====
+        X_expanded = X.view(1, 1, -1)  # [1, 1, hidden_dim]
+
+        # ========== CRITICAL FIX: SIGN LOGIC ==========
+        # Previous bug: target_direction = -torch.sign(score_errors) ← INCORRECT!
+        # Correct:      target_direction = torch.sign(score_errors)
+        #
+        # Why this matters:
+        #   If Error > 0 (Target > Current), we need to INCREASE the score
+        #   → We want flips that result in POSITIVE impact
+        #   → target_direction should be POSITIVE (+1)
+        #
+        #   If Error < 0 (Target < Current), we need to DECREASE the score
+        #   → We want flips that result in NEGATIVE impact
+        #   → target_direction should be NEGATIVE (-1)
+        #
+        # Therefore: target_direction = sign(error) [NO NEGATION!]
+        # =============================================
+        target_direction = torch.sign(score_errors).view(total_heads, 1, 1)  # [total_heads, 1, 1]
+
+        # Flip impact: direction * scale * X * K_dim
+        flip_impacts = target_direction * scales_critical * X_expanded * K_critical.unsqueeze(-1)
+        # Shape: [total_heads, num_critical, hidden_dim]
+
+        # ===== 6. Validity and Scoring =====
+        can_flip_up = (Wq_int_critical < 15).float()
+        can_flip_down = (Wq_int_critical > 0).float()
+
+        # If impact > 0, it helps us (we can flip +1)
+        # If impact < 0, we need to flip -1 (which gives -impact > 0)
+        can_flip = torch.where(flip_impacts > 0, can_flip_up, can_flip_down)
+
+        flip_scores = flip_impacts.abs() * can_flip
+
+        # ===== 7. Select Best Flips (Vectorized TopK) =====
+        max_flips_per_dim = max(int(hidden_dim * self.gqa_max_flip_pct), 1)
+        best_scores, best_flip_indices = torch.topk(flip_scores, k=max_flips_per_dim, dim=2)
+        # Shape: [total_heads, num_critical, max_flips_per_dim]
+
+        # ===== 8. Apply Flips (Vectorized Scatter) =====
+        # Determine flip direction: +1 or -1
+        flip_directions = torch.sign(torch.gather(flip_impacts, 2, best_flip_indices))
+
+        # Apply flips
+        Wq_int_critical.scatter_add_(2, best_flip_indices, flip_directions)
+        Wq_int_critical.clamp_(0, 15)
+
+        # ===== 9. Scatter Back to Full Tensor =====
+        critical_indices_expanded = critical_indices.unsqueeze(-1).expand(-1, -1, hidden_dim)
+        Wq_int_flat.scatter_(1, critical_indices_expanded, Wq_int_critical)
+
+        # ===== 10. Dequantize and Reshape =====
+        Wq_dequant_flat = (Wq_int_flat - zp_expanded) * scales_expanded
+        Wq_refined_4d = Wq_dequant_flat.view(num_k_heads, gqa_ratio, head_dim, hidden_dim)
+
+        # Stats
+        total_flips = (best_scores > 0).sum().item()
+        avg_flip_rate = total_flips / (total_heads * num_critical * max_flips_per_dim) * 100
+
+        stats = {
+            'total_flips': total_flips,
+            'avg_flip_rate': avg_flip_rate
+        }
+
+        return Wq_refined_4d, stats
+
+    def refine_attention_group(self, attn_group, projs):
+        """Optimized GQA refinement using 4D tensor batching."""
         q_name, q_module = projs['q_proj']
         k_name, k_module = projs['k_proj']
 
-        # Check if we have original weights and stored JS means
+        # Validate we have required data
         q_weight_key = q_name + '.weight'
         k_weight_key = k_name + '.weight'
 
@@ -284,95 +332,78 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
             print(f"      ⚠️  Missing data for {attn_group}, skipping")
             return
 
-        # ===== 1. Use Pre-Computed James-Stein Mean (from AWQ quantization) =====
-        # NO NEED to re-capture activations or recompute mean!
-        # We already computed the JS mean during AWQ quantization
-        X = self.gqa_js_means[q_name].numpy()  # [hidden_dim]
+        # ===== 1. Setup GPU Tensors =====
+        device = q_module.weight.device
+        dtype = torch.float32
 
-        # ===== 2. Extract Original Weights =====
-        Wq_orig = self.original_state_dict[q_weight_key].cpu().float().numpy()
-        Wk_orig = self.original_state_dict[k_weight_key].cpu().float().numpy()
+        Wq_orig = self.original_state_dict[q_weight_key].to(device).to(dtype)
+        Wk_orig = self.original_state_dict[k_weight_key].to(device).to(dtype)
+        X = self.gqa_js_means[q_name].to(device).to(dtype)
 
-        # ===== 3. Extract AWQ-Quantized Weights (Current State) =====
-        Wq_awq = q_module.weight.data.cpu().float().numpy()
-        Wk_awq = k_module.weight.data.cpu().float().numpy()
+        # ===== 2. Detect GQA Structure =====
+        q_out, hidden_dim = Wq_orig.shape
+        k_out = Wk_orig.shape[0]
 
-        # Re-quantize AWQ weights to get clean INT4 representation
+        head_dim = self.infer_head_dim(k_out)
+        num_k_heads = k_out // head_dim
+        num_q_heads = q_out // head_dim
+        gqa_ratio = num_q_heads // num_k_heads
+
+        if num_q_heads % num_k_heads != 0:
+            print(f"      ⚠️  Q heads ({num_q_heads}) not divisible by K heads ({num_k_heads})")
+            return
+
+        print(f"      GQA: {num_q_heads} Q heads, {num_k_heads} K heads, ratio {gqa_ratio}:1, head_dim={head_dim}")
+
+        # ===== 3. Prepare AWQ-Quantized Weights =====
+        Wq_awq = q_module.weight.data.to(dtype)
+
         from utils_qkv import quantize_weight_groupwise_int4
 
-        Wq_heuristic, Wq_scales_clean, Wq_zp_clean, Wq_int_heuristic = \
-            quantize_weight_groupwise_int4(Wq_awq, group_size=self.group_size, method='nearest')
-        Wk_heuristic, _, _, _ = quantize_weight_groupwise_int4(Wk_awq, group_size=self.group_size)
+        Wq_heuristic_np, Wq_scales_np, Wq_zp_np, Wq_int_np = \
+            quantize_weight_groupwise_int4(Wq_awq.cpu().numpy(), group_size=self.group_size, method='nearest')
 
-        # ===== 4. Reshape to Multi-Head Format =====
-        # For GQA: Q and K may have different output dimensions
-        # Q: [q_out, hidden_dim], K: [k_out, hidden_dim]
-        # Simplified: Treat entire Q weight matrix as single head
-        num_heads = 1
-        head_dim = Wq_orig.shape[0]  # Q output features
-        hidden_dim = Wq_orig.shape[1]  # Input features
+        Wq_int = torch.from_numpy(Wq_int_np).to(device)
+        Wq_scales = torch.from_numpy(Wq_scales_np).to(device).to(dtype)
+        Wq_zp = torch.from_numpy(Wq_zp_np).to(device).to(dtype)
 
-        # Reshape Q to 3D: [num_heads, head_dim, hidden_dim]
-        Wq_orig_3d = Wq_orig.reshape(num_heads, head_dim, hidden_dim)
-        Wq_heuristic_3d = Wq_heuristic.reshape(num_heads, head_dim, hidden_dim)
-        Wq_int_heuristic_3d = Wq_int_heuristic.reshape(num_heads, head_dim, hidden_dim)
+        # ===== 4. Reshape to 4D Batched Format =====
+        Wq_orig_4d = Wq_orig.view(num_k_heads, gqa_ratio, head_dim, hidden_dim)
+        Wk_orig_4d = Wk_orig.view(num_k_heads, 1, head_dim, hidden_dim)
 
-        # Keep K as 2D (fast_quantize_qkv expects 2D Wk)
-        # Wk: [k_out, hidden_dim] stays as-is
-        Wk_orig_2d = Wk_orig
-        Wk_heuristic_2d = Wk_heuristic
+        Wq_int_4d = Wq_int.view(num_k_heads, gqa_ratio, head_dim, hidden_dim)
+        Wq_scales_4d = Wq_scales.view(num_k_heads, gqa_ratio, head_dim, -1)
+        Wq_zp_4d = Wq_zp.view(num_k_heads, gqa_ratio, head_dim, -1)
 
-        # Reshape Q scales and zp to 3D
-        Wq_scales_3d = Wq_scales_clean.reshape(num_heads, head_dim, -1)
-        Wq_zp_3d = Wq_zp_clean.reshape(num_heads, head_dim, -1)
+        # ===== 5. Vectorized Q/K Projections (GPU) =====
+        Q_orig_all = torch.einsum('bghd,d->bgh', Wq_orig_4d, X)  # [num_k, gqa_ratio, head_dim]
+        Q_heuristic_all = torch.einsum('bghd,d->bgh',
+                                         Wq_int_4d.float().sub(Wq_zp_4d).mul(Wq_scales_4d.repeat_interleave(self.group_size, dim=3)[:,:,:,:hidden_dim]),
+                                         X)
+        K_orig_all = torch.einsum('b1hd,d->b1h', Wk_orig_4d, X)  # [num_k, 1, head_dim]
 
-        # ===== 5. Compute Q and K Values =====
-        Q_orig_all = np.zeros(num_heads * head_dim)
-        Q_heuristic_all = np.zeros(num_heads * head_dim)
-
-        for h in range(num_heads):
-            Q_orig_all[h*head_dim:(h+1)*head_dim] = X @ Wq_orig_3d[h].T
-            Q_heuristic_all[h*head_dim:(h+1)*head_dim] = X @ Wq_heuristic_3d[h].T
-
-        Q_orig_all = Q_orig_all.reshape(num_heads, head_dim)
-        Q_heuristic_all = Q_heuristic_all.reshape(num_heads, head_dim)
-
-        # K_heuristic: [k_out] for 2D Wk
-        K_heuristic = X @ Wk_heuristic_2d.T
-
-        # ===== 6. Apply ReFlip Refinement =====
+        # ===== 6. Apply Batched ReFlip =====
         try:
-            (Wq_refined, _, _, _,
-             _, _, _, _,
-             reflip_stats) = quantize_qkv_reflip_fast(
-                Wq=Wq_orig_3d,
-                Wk=Wk_orig_2d,  # Keep K as 2D
-                X=X,
+            Wq_refined_4d, stats = self.quantize_qkv_reflip_batched(
+                Wq_orig_4d=Wq_orig_4d,
+                Wk_orig_4d=Wk_orig_4d,
+                Wq_int_heuristic_4d=Wq_int_4d,
+                Wq_scales_4d=Wq_scales_4d,
+                Wq_zp_4d=Wq_zp_4d,
                 Q_orig_all=Q_orig_all,
                 Q_heuristic_all=Q_heuristic_all,
-                Wq_heuristic=Wq_heuristic_3d,
-                Wk_heuristic=Wk_heuristic_2d,  # Keep K as 2D
-                K_heuristic=K_heuristic,
-                Wq_int_heuristic=Wq_int_heuristic_3d,
-                Wq_scales_heuristic=Wq_scales_3d,
-                Wq_zp_heuristic=Wq_zp_3d,
-                critical_dim_pct=self.gqa_critical_dim_pct,
-                knee_tolerance=0.0,
-                group_size=self.group_size,
-                max_flip_pct=self.gqa_max_flip_pct,
-                correction_scale=1.0,
-                debug=False
+                K_orig_all=K_orig_all,
+                X=X,
+                group_size=self.group_size
             )
 
             # ===== 7. Update Model Weights =====
-            Wq_refined_2d = Wq_refined.reshape(head_dim, hidden_dim)
-            q_module.weight.data = torch.from_numpy(Wq_refined_2d).to(
-                q_module.weight.dtype
-            ).to(q_module.weight.device)
+            Wq_refined_2d = Wq_refined_4d.view(q_out, hidden_dim)
+            q_module.weight.data.copy_(Wq_refined_2d.to(q_module.weight.dtype))
 
-            print(f"      ✓ Refined {attn_group}")
-            print(f"        Total flips: {reflip_stats['total_flips']}")
-            print(f"        Flip rate: {reflip_stats['flip_rate_pct']:.3f}%")
+            print(f"      ✓ Refined {attn_group} ({num_k_heads} GQA groups)")
+            print(f"        Total flips: {stats['total_flips']}")
+            print(f"        Avg flip rate: {stats['avg_flip_rate']:.3f}%")
 
         except Exception as e:
             print(f"      ⚠️  ReFlip failed for {attn_group}: {e}")
@@ -384,45 +415,31 @@ def main():
     parser = argparse.ArgumentParser(description='AWQ-GQA: Combined Quantization')
 
     # All arguments from awq_js_xl.py
-    parser.add_argument("--n-calib", type=int, default=128, help="Number of calibration samples")
+    parser.add_argument("--n-calib", type=int, default=128)
     parser.add_argument("--n-grid", type=int, default=20)
     parser.add_argument("--group-size", type=int, default=128)
-    parser.add_argument("--bits", type=int, default=4, choices=[3, 4], help="Quantization bit width (default: 4)")
-    parser.add_argument("--use-heuristic", action="store_true", default=True,
-                        help="Use heuristic flip correction (default: True)")
-    parser.add_argument("--no-heuristic", dest="use_heuristic", action="store_false",
-                        help="Disable heuristic flip correction")
-    parser.add_argument("--use-james-stein", action="store_true", default=True,
-                        help="Use James-Stein estimator for activation means (default: True)")
-    parser.add_argument("--no-james-stein", dest="use_james_stein", action="store_false",
-                        help="Disable James-Stein estimator")
-    parser.add_argument("--knee-tolerance", type=float, default=0.000,
-                        help="Tolerance offset for Kneedle algorithm (default: 0.0)")
-    parser.add_argument("--max-flip-percent", type=float, default=0.05,
-                        help="Max percentage of weights to flip per channel (default: 0.05)")
-    parser.add_argument("--max-tokens-per-sample", type=int, default=2048,
-                        help="Max tokens per calibration sample (default: 2048)")
-    parser.add_argument("--layer-batch-size", type=int, default=16,
-                        help="Number of layers to quantize per batch (default: 16)")
-    parser.add_argument("--lmhead-chunks", type=int, default=8,
-                        help="Number of chunks to split lm_head into (default: 8)")
+    parser.add_argument("--bits", type=int, default=4, choices=[3, 4])
+    parser.add_argument("--use-heuristic", action="store_true", default=True)
+    parser.add_argument("--no-heuristic", dest="use_heuristic", action="store_false")
+    parser.add_argument("--use-james-stein", action="store_true", default=True)
+    parser.add_argument("--no-james-stein", dest="use_james_stein", action="store_false")
+    parser.add_argument("--knee-tolerance", type=float, default=0.000)
+    parser.add_argument("--max-flip-percent", type=float, default=0.05)
+    parser.add_argument("--max-tokens-per-sample", type=int, default=2048)
+    parser.add_argument("--layer-batch-size", type=int, default=16)
+    parser.add_argument("--lmhead-chunks", type=int, default=8)
     parser.add_argument("--output-dir", type=str, default="./quantized_models/llama3_awq_gqa")
-    parser.add_argument("--model-path", type=str, default="./models/Llama-3-8B",
-                        help="Path to model or HuggingFace model name")
+    parser.add_argument("--model-path", type=str, default="./models/Llama-3-8B")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--calib-dataset", type=str, default="c4",
-                        choices=["c4", "wikitext2", "wikitext2-simple"],
-                        help="Calibration dataset to use")
-    parser.add_argument("--cache-dir", type=str, default="./calibration_cache",
-                        help="Directory to cache calibration data")
+                        choices=["c4", "wikitext2", "wikitext2-simple"])
+    parser.add_argument("--cache-dir", type=str, default="./calibration_cache")
 
     # GQA ReFlip options
     parser.add_argument('--apply-gqa-reflip', action='store_true',
                         help='Apply ReFlip refinement to GQA layers')
-    parser.add_argument('--gqa-critical-dim-pct', type=float, default=0.15,
-                        help='Percentage of moderate dimensions for ReFlip')
-    parser.add_argument('--gqa-max-flip-pct', type=float, default=0.05,
-                        help='Max flip percentage for ReFlip')
+    parser.add_argument('--gqa-critical-dim-pct', type=float, default=0.15)
+    parser.add_argument('--gqa-max-flip-pct', type=float, default=0.05)
 
     args = parser.parse_args()
 
@@ -440,7 +457,7 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Load model and tokenizer (same as awq_js_xl.py)
+    # Load model and tokenizer
     print(f"\nLoading model and tokenizer from: {args.model_path}")
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
     if tokenizer.pad_token is None:
@@ -475,7 +492,7 @@ def main():
         gqa_max_flip_pct=args.gqa_max_flip_pct
     )
 
-    # Load calibration data (exactly as in awq_js_xl.py)
+    # Load calibration data
     from calibration_utils import get_c4_calibration_data, get_wikitext2_calibration_data
 
     print(f"\nLoading calibration dataset: {args.calib_dataset}")
@@ -487,10 +504,10 @@ def main():
     else:
         calib_texts = get_wikitext2_calibration_data(quantizer.tokenizer, n_samples=args.n_calib, seqlen=2048, seed=args.seed, cache_dir=args.cache_dir)
 
-    # Quantize model (includes GQA ReFlip if enabled)
+    # Quantize model
     quantizer.quantize_model_sequential(calib_texts, n_samples=args.n_calib)
 
-    # Save quantized model (exactly as awq_js_xl.py)
+    # Save quantized model
     os.makedirs(args.output_dir, exist_ok=True)
     model.save_pretrained(args.output_dir)
     tokenizer.save_pretrained(args.output_dir)
