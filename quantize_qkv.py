@@ -531,13 +531,13 @@ def quantize_qkv_reflip(Wq, Wk, X, Q_orig_all, Q_heuristic_all,
 def main():
     # Parse command-line arguments
     parser = argparse.ArgumentParser(description='INT4 Quantization with ReFlip Strategy')
-    parser.add_argument('--critical-dim-pct', type=float, default=0.15,
+    parser.add_argument('--critical-dim-pct', type=float, default=0.1,
                         help='Percentage of head dimensions to protect in ReFlip (default: 0.15 = 15%%)')
     parser.add_argument('--knee-tolerance', type=float, default=0.0,
                         help='Tolerance offset for Kneedle algorithm (default: 0.0)')
     parser.add_argument('--group-size', type=int, default=128,
                         help='Quantization group size (default: 128)')
-    parser.add_argument('--max-flip-pct', type=float, default=0.05,
+    parser.add_argument('--max-flip-pct', type=float, default=0.1,
                         help='Max flip percentage for ReFlip (default: 0.05 = 5%%)')
     parser.add_argument('--correction-scale', type=float, default=1.0,
                         help='Error correction scaling factor for ReFlip (default: 1.0)')
