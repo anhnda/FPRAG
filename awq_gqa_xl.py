@@ -27,10 +27,9 @@ import os
 import numpy as np
 from tqdm import tqdm
 import gc
-import copy
 
 # Import AWQ quantizer from awq_js_xl
-from awq_js_xl import JamesSteinHeuristicAWQQuantizerXL, find_knee_point, compute_james_stein_mean
+from awq_js_xl import JamesSteinHeuristicAWQQuantizerXL, compute_james_stein_mean
 
 # Import ReFlip function from fast_quantize_qkv
 from fast_quantize_qkv import quantize_qkv_reflip_fast
@@ -201,7 +200,7 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
             if isinstance(module, nn.Linear) and is_gqa_layer(name):
                 group_info = get_layer_group(name)
                 if group_info:
-                    layer_idx, attn_group = group_info
+                    _, attn_group = group_info
 
                     if attn_group not in attn_groups:
                         attn_groups[attn_group] = {}
@@ -257,8 +256,6 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
         Returns:
             dict: {layer_name: activations}
         """
-        activations = {}
-
         # Create temporary storage for this group
         temp_activation_data = {}
 
@@ -371,17 +368,24 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
         Wk_heuristic, _, _, _ = quantize_weight_groupwise_int4(Wk_awq, group_size=self.group_size)
 
         # ===== 4. Reshape to Multi-Head Format =====
-        # Simplified: Treat entire weight matrix as single head
+        # For GQA: Q and K may have different output dimensions
+        # Q: [q_out, hidden_dim], K: [k_out, hidden_dim]
+        # Simplified: Treat entire Q weight matrix as single head
         num_heads = 1
-        head_dim = Wq_orig.shape[0]
-        hidden_dim = Wq_orig.shape[1]
+        head_dim = Wq_orig.shape[0]  # Q output features
+        hidden_dim = Wq_orig.shape[1]  # Input features
 
+        # Reshape Q to 3D: [num_heads, head_dim, hidden_dim]
         Wq_orig_3d = Wq_orig.reshape(num_heads, head_dim, hidden_dim)
-        Wk_orig_3d = Wk_orig.reshape(num_heads, Wk_orig.shape[0], hidden_dim)
         Wq_heuristic_3d = Wq_heuristic.reshape(num_heads, head_dim, hidden_dim)
-        Wk_heuristic_3d = Wk_heuristic.reshape(num_heads, Wk_orig.shape[0], hidden_dim)
         Wq_int_heuristic_3d = Wq_int_heuristic.reshape(num_heads, head_dim, hidden_dim)
 
+        # Keep K as 2D (fast_quantize_qkv expects 2D Wk)
+        # Wk: [k_out, hidden_dim] stays as-is
+        Wk_orig_2d = Wk_orig
+        Wk_heuristic_2d = Wk_heuristic
+
+        # Reshape Q scales and zp to 3D
         Wq_scales_3d = Wq_scales_clean.reshape(num_heads, head_dim, -1)
         Wq_zp_3d = Wq_zp_clean.reshape(num_heads, head_dim, -1)
 
@@ -396,20 +400,21 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
         Q_orig_all = Q_orig_all.reshape(num_heads, head_dim)
         Q_heuristic_all = Q_heuristic_all.reshape(num_heads, head_dim)
 
-        K_heuristic = X @ Wk_heuristic.T
+        # K_heuristic: [k_out] for 2D Wk
+        K_heuristic = X @ Wk_heuristic_2d.T
 
         # ===== 6. Apply ReFlip Refinement =====
         try:
-            (Wq_refined, Wq_scales_out, Wq_zp_out, Wq_int_out,
-             Wk_refined, Wk_scales_out, Wk_zp_out, Wk_int_out,
+            (Wq_refined, _, _, _,
+             _, _, _, _,
              reflip_stats) = quantize_qkv_reflip_fast(
                 Wq=Wq_orig_3d,
-                Wk=Wk_orig_3d,
+                Wk=Wk_orig_2d,  # Keep K as 2D
                 X=X,
                 Q_orig_all=Q_orig_all,
                 Q_heuristic_all=Q_heuristic_all,
                 Wq_heuristic=Wq_heuristic_3d,
-                Wk_heuristic=Wk_heuristic_3d,
+                Wk_heuristic=Wk_heuristic_2d,  # Keep K as 2D
                 K_heuristic=K_heuristic,
                 Wq_int_heuristic=Wq_int_heuristic_3d,
                 Wq_scales_heuristic=Wq_scales_3d,
