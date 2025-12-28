@@ -88,6 +88,7 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
         self.gqa_heuristic_int_weights = {}  # Store heuristic integer weights
         self.gqa_heuristic_scales = {}
         self.gqa_heuristic_zp = {}
+        self.gqa_awq_scales = {}  # Store AWQ best_scales
 
     def quantize_layer(self, name, module):
         """Override to store James-Stein means AND heuristic integer weights for GQA layers."""
@@ -116,6 +117,7 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
             self.gqa_heuristic_int_weights[name + '.weight'] = W_int.cpu()
             self.gqa_heuristic_scales[name + '.weight'] = scales.cpu()
             self.gqa_heuristic_zp[name + '.weight'] = zp.cpu()
+            self.gqa_awq_scales[name + '.weight'] = best_scales.cpu()  # CRITICAL: Store AWQ scales!
 
             # Apply the quantized weights to the module (same as parent class)
             W_final = (W_quant / best_scales.unsqueeze(0)).to(W.dtype)
@@ -574,7 +576,9 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
         if (q_weight_key not in self.original_state_dict or
             k_weight_key not in self.original_state_dict or
             q_name not in self.gqa_js_means or
-            k_name not in self.gqa_js_means):
+            k_name not in self.gqa_js_means or
+            q_weight_key not in self.gqa_awq_scales or
+            k_weight_key not in self.gqa_awq_scales):
             print(f"      ⚠️  Missing data for {attn_group}, skipping")
             return
 
@@ -582,9 +586,21 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
         device = q_module.weight.device
         dtype = torch.float32
 
-        Wq_orig = self.original_state_dict[q_weight_key].to(device).to(dtype)
-        Wk_orig = self.original_state_dict[k_weight_key].to(device).to(dtype)
+        Wq_orig_unscaled = self.original_state_dict[q_weight_key].to(device).to(dtype)
+        Wk_orig_unscaled = self.original_state_dict[k_weight_key].to(device).to(dtype)
         X = self.gqa_js_means[q_name].to(device).to(dtype)
+        X_k = self.gqa_js_means[k_name].to(device).to(dtype)
+
+        # CRITICAL: Apply AWQ scaling to match quantized weights (for both Q and K)
+        awq_scales_q = self.gqa_awq_scales[q_weight_key].to(device).to(dtype)
+        awq_scales_k = self.gqa_awq_scales[k_weight_key].to(device).to(dtype)
+
+        Wq_orig = Wq_orig_unscaled * awq_scales_q.unsqueeze(0)  # Scale to match W_int
+        Wk_orig = Wk_orig_unscaled * awq_scales_k.unsqueeze(0)  # Scale to match W_int
+
+        # CRITICAL: Inversely scale activations to preserve W @ X = (W * s) @ (X / s)
+        X_scaled_q = X / awq_scales_q
+        X_scaled_k = X_k / awq_scales_k
 
         # ===== 2. Detect GQA Structure =====
         q_out, hidden_dim = Wq_orig.shape
@@ -618,7 +634,8 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
         Wq_zp_4d = Wq_zp.view(num_k_heads, gqa_ratio, head_dim, -1)
 
         # ===== 5. Vectorized Q/K Projections (GPU) =====
-        Q_orig_all = torch.einsum('bghd,d->bgh', Wq_orig_4d, X)  # [num_k, gqa_ratio, head_dim]
+        # CRITICAL: Use inversely scaled activations to match AWQ quantization: (W * s) @ (X / s) = W @ X
+        Q_orig_all = torch.einsum('bghd,d->bgh', Wq_orig_4d, X_scaled_q)  # [num_k, gqa_ratio, head_dim]
 
         # Expand scales and zp to full hidden_dim BEFORE operations
         scales_expanded = Wq_scales_4d.repeat_interleave(self.group_size, dim=3)[:,:,:,:hidden_dim]
@@ -626,9 +643,9 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
 
         # Dequantize: W = (W_int - zp) * scale
         Wq_dequant_4d = (Wq_int_4d.float() - zp_expanded) * scales_expanded
-        Q_heuristic_all = torch.einsum('bghd,d->bgh', Wq_dequant_4d, X)
+        Q_heuristic_all = torch.einsum('bghd,d->bgh', Wq_dequant_4d, X_scaled_q)
 
-        K_orig_all = torch.einsum('bshd,d->bsh', Wk_orig_4d, X)  # [num_k, s=1, head_dim]
+        K_orig_all = torch.einsum('bshd,d->bsh', Wk_orig_4d, X_scaled_k)  # [num_k, s=1, head_dim]
 
         # ===== 6. Apply Batched ReFlip =====
         try:
@@ -641,13 +658,15 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
                 Q_orig_all=Q_orig_all,
                 Q_heuristic_all=Q_heuristic_all,
                 K_orig_all=K_orig_all,
-                X=X,
+                X=X_scaled_q,  # CRITICAL: Pass inversely scaled Q activations
                 group_size=self.group_size
             )
 
             # ===== 7. Update Model Weights =====
             Wq_refined_2d = Wq_refined_4d.view(q_out, hidden_dim)
-            q_module.weight.data.copy_(Wq_refined_2d.to(q_module.weight.dtype))
+            # CRITICAL: Unscale before storing (weights were scaled for quantization)
+            Wq_refined_unscaled = Wq_refined_2d / awq_scales_q.unsqueeze(0)
+            q_module.weight.data.copy_(Wq_refined_unscaled.to(q_module.weight.dtype))
 
             print(f"      ✓ Refined {attn_group} ({num_k_heads} GQA groups)")
             print(f"        Total moderate dims: {stats['total_moderate_dims']}")
