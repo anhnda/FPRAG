@@ -202,10 +202,10 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
         """
         Fully Vectorized ReFlip following fast_quantize_qkv.py logic.
 
-        CORRECTED:
-        - Error sign: Positive error = need to increase score
-        - Dimension ordering: Largest first to avoid incorrect splits
-        - K broadcasting: Proper unsqueeze + expand
+        FIXED:
+        - Uses Kneedle algorithm to find moderate dimensions (not TopK)
+        - Redistributes score error proportionally to moderate dimensions
+        - Computes targets based on redistributed corrections
         """
         num_k_heads, gqa_ratio, head_dim, hidden_dim = Wq_orig_4d.shape
         total_heads = num_k_heads * gqa_ratio
@@ -231,153 +231,168 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
         # Positive error means we need to INCREASE the score
         score_errors = scores_target - scores_current  # [total_heads]
 
-        # ===== 3. Identify Critical Dimensions (Vectorized TopK) =====
-        num_critical = max(int(head_dim * self.gqa_critical_dim_pct), 1)
-        Q_magnitudes = Q_target.abs()
-        _, critical_indices = torch.topk(Q_magnitudes, k=num_critical, dim=1)  # [total_heads, num_critical]
+        # ===== 3. FIXED: Identify MODERATE Dimensions using Kneedle Algorithm =====
+        # Import kneedle function
+        from utils_qkv import find_knee_point
 
-        # ===== 4. Gather Critical Dimension Data =====
-        def gather_2d(tensor_3d, indices_2d):
-            """Gather along dim=1"""
-            expanded_indices = indices_2d.unsqueeze(-1).expand(-1, -1, tensor_3d.size(2))
-            return torch.gather(tensor_3d, 1, expanded_indices)
+        # Process each head to find moderate dimensions
+        all_moderate_indices = []
+        all_dim_corrections = []
 
+        for head_idx in range(total_heads):
+            Q_orig = Q_target[head_idx].cpu().numpy()
+            score_error = score_errors[head_idx].item()
+
+            # Sort by |Q_orig| magnitude (descending)
+            sorted_indices_desc = np.argsort(np.abs(Q_orig))[::-1]
+            sorted_magnitudes = np.abs(Q_orig[sorted_indices_desc])
+
+            # Apply Kneedle to find knee point (transition from high to moderate)
+            first_half = sorted_magnitudes[:head_dim // 2]
+            knee_idx = find_knee_point(first_half[::-1], tolerance_offset=self.knee_tolerance)
+            knee_idx = len(first_half) - knee_idx - 1  # Convert back to descending index
+
+            # Select MODERATE dimensions: starting from knee, take next critical_dim_pct %
+            num_moderate = max(int(self.gqa_critical_dim_pct * head_dim), 1)
+            moderate_start = knee_idx
+            moderate_end = min(moderate_start + num_moderate, head_dim)
+            moderate_indices = sorted_indices_desc[moderate_start:moderate_end]
+
+            all_moderate_indices.append(moderate_indices)
+
+            # ===== 4. FIXED: Proportional Error Redistribution =====
+            if len(moderate_indices) > 0:
+                Q_moderate = Q_orig[moderate_indices]
+                Q_moderate_abs = np.abs(Q_moderate)
+                Q_moderate_sum = Q_moderate_abs.sum()
+
+                if Q_moderate_sum > 1e-10:
+                    # Proportional redistribution: correction[i] = score_error * (|Q[i]| / sum(|Q[moderate]|))
+                    dim_corrections = score_error * (Q_moderate_abs / Q_moderate_sum)
+                else:
+                    # Uniform distribution if all values are near zero
+                    dim_corrections = np.full(len(moderate_indices), score_error / len(moderate_indices))
+            else:
+                dim_corrections = np.array([])
+
+            all_dim_corrections.append(dim_corrections)
+
+        # ===== 5. FIXED: Apply Integer Flips Based on Redistributed Corrections =====
         # Expand scales and zp to full hidden_dim
         scales_expanded = Wq_scales_flat.repeat_interleave(group_size, dim=2)[:, :, :hidden_dim]
         zp_expanded = Wq_zp_flat.repeat_interleave(group_size, dim=2)[:, :, :hidden_dim]
 
-        # Gather critical dimensions
-        Wq_int_critical = gather_2d(Wq_int_flat, critical_indices)
-        scales_critical = gather_2d(scales_expanded, critical_indices)
-        K_critical = torch.gather(K_values, 1, critical_indices)  # [total_heads, num_critical]
-
-        # ===== 5. Compute Flip Impacts (CORRECTED SIGN LOGIC) =====
         X_expanded = X.view(1, 1, -1)  # [1, 1, hidden_dim]
+        total_flips = 0
 
-        # ========== CRITICAL FIX: SIGN LOGIC ==========
-        # Previous bug: target_direction = -torch.sign(score_errors) ← INCORRECT!
-        # Correct:      target_direction = torch.sign(score_errors)
-        #
-        # Why this matters:
-        #   If Error > 0 (Target > Current), we need to INCREASE the score
-        #   → We want flips that result in POSITIVE impact
-        #   → target_direction should be POSITIVE (+1)
-        #
-        #   If Error < 0 (Target < Current), we need to DECREASE the score
-        #   → We want flips that result in NEGATIVE impact
-        #   → target_direction should be NEGATIVE (-1)
-        #
-        # Therefore: target_direction = sign(error) [NO NEGATION!]
-        # =============================================
-        target_direction = torch.sign(score_errors).view(total_heads, 1, 1)  # [total_heads, 1, 1]
+        # Process each head and its moderate dimensions
+        for head_idx in range(total_heads):
+            moderate_indices = all_moderate_indices[head_idx]
+            dim_corrections = all_dim_corrections[head_idx]
+            score_error = score_errors[head_idx].item()
 
-        # Flip impact: direction * scale * X * K_dim
-        flip_impacts = target_direction * scales_critical * X_expanded * K_critical.unsqueeze(-1)
-        # Shape: [total_heads, num_critical, hidden_dim]
+            if len(moderate_indices) == 0:
+                continue
 
-        # ===== 6. Compute Q Errors Per Dimension (for optimal-K selection) =====
-        # Dequantize current Q weights for error calculation
-        Wq_current_critical = (Wq_int_critical.float() -
-                                torch.gather(zp_expanded, 1, critical_indices.unsqueeze(-1).expand(-1, -1, hidden_dim))) * \
-                               scales_critical
+            # Process each moderate dimension
+            for i, dim_idx in enumerate(moderate_indices):
+                correction = dim_corrections[i]
+                if abs(correction) < 1e-10:
+                    continue
 
-        Q_current_per_dim = (Wq_current_critical * X_expanded).sum(dim=2)  # [total_heads, num_critical]
-        Q_target_per_dim = torch.gather(Q_target, 1, critical_indices)     # [total_heads, num_critical]
-        K_critical_1d = K_critical  # [total_heads, num_critical]
+                # Get K value for this dimension
+                K_value = K_values[head_idx, dim_idx].item()
+                if abs(K_value) < 1e-10:
+                    continue
 
-        # Error per dimension in Q space (Current - Target, following fast_quantize_qkv.py convention)
-        error_currents = Q_current_per_dim - Q_target_per_dim  # [total_heads, num_critical]
+                # ===== 5a. FIXED: Compute Target Q Based on Redistributed Correction =====
+                # Get scales and zero points for this dimension
+                scales_row = scales_expanded[head_idx, dim_idx, :]  # [hidden_dim]
+                zp_row = zp_expanded[head_idx, dim_idx, :]  # [hidden_dim]
 
-        # ===== 7. Determine Flip Directions and Validity =====
-        # Following fast_quantize_qkv.py logic (lines 157-161)
-        score_errors_expanded = score_errors.unsqueeze(1).expand(-1, num_critical)  # [total_heads, num_critical]
+                # Compute current Q value
+                W_current = (Wq_int_flat[head_idx, dim_idx, :] - zp_row) * scales_row
+                Q_current = (X_expanded.squeeze() * W_current).sum().item()
 
-        # If score needs to increase (>0) and K>0: flip +1 increases Q*K
-        # If score needs to increase (>0) and K<0: flip -1 decreases Q, but Q*K still increases
-        flip_direction_base = torch.where(
-            score_errors_expanded > 0,
-            torch.where(K_critical_1d > 0, 1, -1),
-            torch.where(K_critical_1d > 0, -1, 1)
-        ).unsqueeze(-1)  # [total_heads, num_critical, 1]
+                # Target: dim_corrections[i] is the change in (Q[i] * K[i]) we want
+                # Therefore: delta_Q[i] = dim_corrections[i] / K[i]
+                delta_Q_target = correction / K_value
+                Q_target_dim = Q_current + delta_Q_target
 
-        # ===== 8. Calculate Flip Impacts and Filter Beneficial =====
-        # Impact of flipping in the base direction
-        flip_impacts_directed = flip_direction_base * scales_critical * X_expanded  # [total_heads, num_critical, hidden_dim]
+                # Current error from target
+                error_current = Q_current - Q_target_dim
 
-        # Validity: can we flip?
-        # flip_direction_base: [total_heads, num_critical, 1]
-        # Wq_int_critical: [total_heads, num_critical, hidden_dim]
-        # Broadcasting will expand flip_direction_base to match Wq_int_critical
-        can_flip_base = torch.where(
-            flip_direction_base > 0,
-            Wq_int_critical < 15,
-            Wq_int_critical > 0
-        ).float()  # [total_heads, num_critical, hidden_dim]
+                # ===== 5b. Determine Flip Direction (Following fast_quantize_qkv.py lines 393-396) =====
+                # To correct: we need delta_score = score_error
+                # Since score = Q @ K, we need: delta_Q[i] * K[i] to contribute to delta_score
+                delta_score_needed = score_error
 
-        # Beneficial: does this flip help reduce |error|?
-        # Following fast_quantize_qkv.py line 184-185: target_sign = -sign(error_current)
-        target_sign = -torch.sign(error_currents).unsqueeze(-1)  # [total_heads, num_critical, 1]
-        beneficial_mask = (torch.sign(flip_impacts_directed) == target_sign) & (can_flip_base > 0)
+                if delta_score_needed > 0:  # Need to increase score
+                    flip_direction = 1 if K_value > 0 else -1
+                else:  # Need to decrease score
+                    flip_direction = -1 if K_value > 0 else 1
 
-        # ===== 9. Optimal-K Selection Per Dimension (FOLLOWING fast_quantize_qkv.py lines 194-214) =====
-        max_flips_per_dim = max(int(hidden_dim * self.gqa_max_flip_pct), 1)
+                # ===== 5c. Greedy Flip Selection (Following fast_quantize_qkv.py lines 424-473) =====
+                current_qvals = Wq_int_flat[head_idx, dim_idx, :].cpu().numpy()
+                new_qvals = current_qvals + flip_direction
 
-        # Score and sort
-        flip_scores = flip_impacts_directed.abs() * beneficial_mask.float()
-        sorted_scores, sorted_indices = torch.sort(flip_scores, dim=2, descending=True)
+                # Validity check
+                valid_flips = (new_qvals >= 0) & (new_qvals <= 15)
 
-        # Gather impacts in sorted order
-        batch_idx = torch.arange(total_heads, device=flip_impacts_directed.device).view(-1, 1, 1).expand(-1, num_critical, hidden_dim)
-        dim_idx = torch.arange(num_critical, device=flip_impacts_directed.device).view(1, -1, 1).expand(total_heads, -1, hidden_dim)
-        impacts_sorted = flip_impacts_directed[batch_idx, dim_idx, sorted_indices]
-        beneficial_sorted = beneficial_mask[batch_idx, dim_idx, sorted_indices].float()
+                # Calculate impact of each flip
+                X_np = X.cpu().numpy()
+                scales_np = scales_row.cpu().numpy()
+                flip_impacts = flip_direction * scales_np * X_np
 
-        # Cumsum only for beneficial (line 199-200)
-        impacts_beneficial = impacts_sorted * beneficial_sorted
-        cumsum_impacts = torch.cat([torch.zeros(total_heads, num_critical, 1, device=impacts_beneficial.device),
-                                     torch.cumsum(impacts_beneficial, dim=2)], dim=2)  # [total_heads, num_critical, hidden_dim+1]
+                # Filter to beneficial flips (reduce |error|)
+                target_sign = -np.sign(error_current)
+                beneficial_flips = (np.sign(flip_impacts) == target_sign) & valid_flips
 
-        # Find optimal K per dimension (line 203-204)
-        residuals = torch.abs(error_currents.unsqueeze(-1) + cumsum_impacts)  # [total_heads, num_critical, hidden_dim+1]
-        best_k_per_dim = torch.argmin(residuals, dim=2)  # [total_heads, num_critical]
+                if not beneficial_flips.any():
+                    continue
 
-        # Cap at max (line 207-208)
-        best_k_per_dim = torch.clamp(best_k_per_dim, max=max_flips_per_dim)
+                # Sort beneficial flips by magnitude
+                flip_scores = np.abs(flip_impacts) * beneficial_flips
+                sorted_indices = np.argsort(-flip_scores)  # Descending
 
-        # ===== 10. Apply Optimal Flips (Vectorized - Single Kernel Launch) =====
-        # Slice to maximum possible flips
-        limit = max_flips_per_dim
-        indices_top = sorted_indices[:, :, :limit]      # [total_heads, num_critical, limit]
-        beneficial_top = beneficial_sorted[:, :, :limit]  # [total_heads, num_critical, limit]
+                # Greedy selection: find optimal K flips that minimize residual error
+                cumsum_impacts = np.zeros(hidden_dim + 1)
+                for k in range(1, hidden_dim + 1):
+                    if beneficial_flips[sorted_indices[k-1]]:
+                        cumsum_impacts[k] = cumsum_impacts[k-1] + flip_impacts[sorted_indices[k-1]]
 
-        # Create mask: position < best_k AND beneficial
-        range_k = torch.arange(limit, device=best_k_per_dim.device).view(1, 1, -1)
-        active_mask = (range_k < best_k_per_dim.unsqueeze(-1)) & (beneficial_top > 0)
+                # Find K that minimizes |error_current + cumsum_impacts[K]|
+                residuals = np.abs(error_current + cumsum_impacts)
+                best_k = np.argmin(residuals)
 
-        # Prepare updates: direction * mask
-        updates = flip_direction_base * active_mask.float()  # [total_heads, num_critical, limit]
+                # Cap at max_flip_pct
+                max_flips = int(hidden_dim * self.gqa_max_flip_pct)
+                best_k = min(best_k, max_flips)
 
-        # Apply all flips at once (single GPU kernel)
-        Wq_int_critical.scatter_add_(dim=2, index=indices_top, src=updates)
-        Wq_int_critical.clamp_(0, 15)
+                # Apply the optimal flips
+                if best_k > 0:
+                    for k in range(best_k):
+                        j = sorted_indices[k]
+                        if beneficial_flips[j]:
+                            Wq_int_flat[head_idx, dim_idx, j] += flip_direction
+                            total_flips += 1
 
-        # Stats
-        total_flips = active_mask.sum().item()
+        # Clamp to valid range
+        Wq_int_flat.clamp_(0, 15)
 
-        # ===== 11. Scatter Back to Full Tensor =====
-        critical_indices_expanded = critical_indices.unsqueeze(-1).expand(-1, -1, hidden_dim)
-        Wq_int_flat.scatter_(1, critical_indices_expanded, Wq_int_critical)
-
-        # ===== 12. Dequantize and Reshape =====
+        # ===== 6. Dequantize and Reshape =====
         Wq_dequant_flat = (Wq_int_flat - zp_expanded) * scales_expanded
         Wq_refined_4d = Wq_dequant_flat.view(num_k_heads, gqa_ratio, head_dim, hidden_dim)
 
         # Stats
-        avg_flip_rate = total_flips / (total_heads * num_critical * max_flips_per_dim) * 100 if max_flips_per_dim > 0 else 0
+        total_moderate_dims = sum(len(indices) for indices in all_moderate_indices)
+        avg_flip_rate = total_flips / (total_heads * head_dim * hidden_dim) * 100 if total_heads > 0 else 0
 
         stats = {
             'total_flips': total_flips,
-            'avg_flip_rate': avg_flip_rate
+            'avg_flip_rate': avg_flip_rate,
+            'total_moderate_dims': total_moderate_dims,
+            'moderate_dims_per_head': [len(indices) for indices in all_moderate_indices]
         }
 
         return Wq_refined_4d, stats
@@ -474,6 +489,7 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
             q_module.weight.data.copy_(Wq_refined_2d.to(q_module.weight.dtype))
 
             print(f"      ✓ Refined {attn_group} ({num_k_heads} GQA groups)")
+            print(f"        Total moderate dims: {stats['total_moderate_dims']}")
             print(f"        Total flips: {stats['total_flips']}")
             print(f"        Avg flip rate: {stats['avg_flip_rate']:.3f}%")
 
