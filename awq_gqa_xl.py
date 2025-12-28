@@ -85,14 +85,166 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
         self.gqa_max_flip_pct = gqa_max_flip_pct
         self.original_state_dict = None
         self.gqa_js_means = {}
+        self.gqa_heuristic_int_weights = {}  # Store heuristic integer weights
+        self.gqa_heuristic_scales = {}
+        self.gqa_heuristic_zp = {}
 
     def quantize_layer(self, name, module):
-        """Override to store James-Stein means for GQA layers."""
+        """Override to store James-Stein means AND heuristic integer weights for GQA layers."""
         if self.apply_gqa_reflip and is_gqa_layer(name):
+            # Store JS means
             _, js_mean = self.get_activation_stats(name)
             if js_mean is not None:
                 self.gqa_js_means[name] = js_mean.cpu().float()
-        super().quantize_layer(name, module)
+
+            # CRITICAL: Quantize and store integer weights BEFORE parent class modifies them
+            best_scales, best_alpha, best_error = self.search_best_scale(name, module)
+            W = module.weight.data
+            W_scaled = W * best_scales.unsqueeze(0)
+
+            if js_mean is not None:
+                scaled_act_mean = (js_mean.to(self.device).to(W.dtype) / best_scales)
+            else:
+                scaled_act_mean = torch.zeros(W.shape[1], device=W.device, dtype=W.dtype)
+
+            # Call the quantization function directly to get integer weights
+            W_quant, scales, zp, W_int = self.quantize_weight_heuristic_with_int_output(
+                W_scaled, scaled_act_mean, apply_heuristic=self.use_heuristic
+            )
+
+            # Store the heuristic integer weights, scales, and zero points
+            self.gqa_heuristic_int_weights[name + '.weight'] = W_int.cpu()
+            self.gqa_heuristic_scales[name + '.weight'] = scales.cpu()
+            self.gqa_heuristic_zp[name + '.weight'] = zp.cpu()
+
+            # Apply the quantized weights to the module (same as parent class)
+            W_final = (W_quant / best_scales.unsqueeze(0)).to(W.dtype)
+            module.weight.data = W_final
+
+            # Store layer scales (same as parent class)
+            self.layer_scales[name] = {
+                'scales': best_scales.cpu(),
+                'alpha': best_alpha,
+                'error': best_error,
+            }
+
+            # Cleanup
+            del best_scales, scaled_act_mean, W_scaled, W_quant, W_final, W_int, scales, zp
+            if name in self.activation_data:
+                del self.activation_data[name]
+            torch.cuda.empty_cache()
+        else:
+            # For non-GQA layers, use parent class method
+            super().quantize_layer(name, module)
+
+    def quantize_weight_heuristic_with_int_output(self, W, group_activation_means, apply_heuristic=True):
+        """
+        Same as parent's quantize_weight_heuristic_groupwise, but also returns integer weights.
+
+        Returns:
+            tuple: (W_dequant, scales, zp, W_int)
+        """
+        out_features, in_features = W.shape
+        device = W.device
+
+        # Padding
+        n_groups = (in_features + self.group_size - 1) // self.group_size
+        padded_in_features = n_groups * self.group_size
+
+        if padded_in_features > in_features:
+            W_padded = torch.zeros(out_features, padded_in_features, device=device, dtype=W.dtype)
+            W_padded[:, :in_features] = W
+            act_padded = torch.zeros(padded_in_features, device=device, dtype=W.dtype)
+            act_padded[:in_features] = group_activation_means
+        else:
+            W_padded = W
+            act_padded = group_activation_means
+
+        # Reshape to groups
+        W_g = W_padded.reshape(out_features, n_groups, self.group_size)
+
+        # Asymmetric quantization
+        w_min = W_g.min(dim=2, keepdim=True)[0]
+        w_max = W_g.max(dim=2, keepdim=True)[0]
+        max_int = 2**self.bits - 1
+
+        scale = (w_max - w_min) / max_int
+        scale = scale.clamp(min=1e-8)
+        zp = torch.round(-w_min / scale).clamp(0, max_int)
+
+        # Expand to full size
+        scale_flat = scale.repeat(1, 1, self.group_size).reshape(out_features, padded_in_features)
+        zp_flat = zp.repeat(1, 1, self.group_size).reshape(out_features, padded_in_features)
+
+        # Initial quantization
+        W_div = W_padded / scale_flat
+        W_int = torch.round(W_div + zp_flat).clamp(0, max_int)
+
+        if apply_heuristic:
+            # Apply heuristic flips (same logic as parent class)
+            W_quant = (W_int - zp_flat) * scale_flat
+            W_diff = W_padded - W_quant
+            current_error = (W_diff * act_padded.unsqueeze(0)).sum(dim=1)
+
+            flip_dir = torch.sign(W_div + zp_flat - W_int)
+            flip_dir[flip_dir == 0] = 1.0
+            flip_impacts = act_padded.unsqueeze(0) * flip_dir * scale_flat
+
+            target_sign = torch.sign(current_error).unsqueeze(1)
+            valid_mask = (torch.sign(flip_impacts) == target_sign)
+
+            w_int_proposed = W_int + flip_dir
+            in_range = (w_int_proposed >= 0) & (w_int_proposed <= max_int)
+            valid_mask = valid_mask & in_range
+
+            # Dynamic outlier masking
+            outlier_threshold, _ = self.compute_dynamic_outlier_threshold(act_padded)
+            is_outlier = act_padded.abs() > outlier_threshold
+            valid_mask = valid_mask & (~is_outlier).unsqueeze(0)
+
+            # Sorting & optimization
+            rounding_costs = (W_div + zp_flat - W_int).abs()
+            rounding_costs_masked = rounding_costs.clone()
+            rounding_costs_masked[~valid_mask] = -1.0
+
+            sorted_indices = torch.argsort(rounding_costs_masked, dim=1, descending=True)
+            sorted_impacts = torch.gather(flip_impacts, 1, sorted_indices)
+            sorted_validity = torch.gather(valid_mask.long(), 1, sorted_indices)
+            sorted_impacts = sorted_impacts * sorted_validity
+
+            cumsum_impacts = torch.cumsum(sorted_impacts, dim=1)
+            residuals = torch.abs(current_error.unsqueeze(1) - cumsum_impacts)
+            error_unsqueezed = torch.abs(current_error).unsqueeze(1)
+            all_residuals = torch.cat([error_unsqueezed, residuals], dim=1)
+            best_k = torch.argmin(all_residuals, dim=1)
+
+            # Apply flips
+            idx_range = torch.arange(padded_in_features, device=device).unsqueeze(0)
+            flip_mask_sorted = idx_range < best_k.unsqueeze(1)
+            final_flips_sorted = flip_mask_sorted & (sorted_validity.bool())
+
+            sorted_flip_dir = torch.gather(flip_dir, 1, sorted_indices)
+            sorted_flip_dir[~final_flips_sorted] = 0.0
+
+            # Constraint: limit flips
+            max_flips_per_output = int(self.max_flip_percent * in_features)
+            cumsum_flips = final_flips_sorted.long().cumsum(dim=1)
+            within_limit = cumsum_flips <= max_flips_per_output
+            sorted_flip_dir[~within_limit] = 0.0
+
+            W_int.scatter_add_(1, sorted_indices, sorted_flip_dir)
+            W_int.clamp_(0, max_int)
+
+        # Dequantize
+        W_dequant = (W_int - zp_flat) * scale_flat
+
+        # Remove padding
+        if padded_in_features > in_features:
+            W_dequant = W_dequant[:, :in_features]
+            W_int = W_int[:, :in_features]
+
+        # Return scales and zp in group format [out_features, n_groups]
+        return W_dequant.to(W.dtype), scale.squeeze(-1), zp.squeeze(-1), W_int.to(torch.uint8)
 
     def quantize_model_sequential(self, calibration_data, n_samples=500):
         """Override to add GQA ReFlip refinement after AWQ quantization."""
@@ -449,17 +601,13 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
 
         print(f"      GQA: {num_q_heads} Q heads, {num_k_heads} K heads, ratio {gqa_ratio}:1, head_dim={head_dim}")
 
-        # ===== 3. Prepare AWQ-Quantized Weights =====
-        Wq_awq = q_module.weight.data.to(dtype)
-
-        from utils_qkv import quantize_weight_groupwise_int4
-
-        Wq_heuristic_np, Wq_scales_np, Wq_zp_np, Wq_int_np = \
-            quantize_weight_groupwise_int4(Wq_awq.cpu().numpy(), group_size=self.group_size, method='nearest')
-
-        Wq_int = torch.from_numpy(Wq_int_np).to(device)
-        Wq_scales = torch.from_numpy(Wq_scales_np).to(device).to(dtype)
-        Wq_zp = torch.from_numpy(Wq_zp_np).to(device).to(dtype)
+        # ===== 3. FIXED: Use Stored Heuristic Integer Weights =====
+        # CRITICAL: Use the heuristic integer weights from AWQ+Heuristic quantization,
+        # NOT re-quantized with nearest rounding!
+        print(f"      Using stored heuristic int weights (preserving heuristic flips)")
+        Wq_int = self.gqa_heuristic_int_weights[q_weight_key].to(device).to(dtype)
+        Wq_scales = self.gqa_heuristic_scales[q_weight_key].to(device).to(dtype)
+        Wq_zp = self.gqa_heuristic_zp[q_weight_key].to(device).to(dtype)
 
         # ===== 4. Reshape to 4D Batched Format =====
         Wq_orig_4d = Wq_orig.view(num_k_heads, gqa_ratio, head_dim, hidden_dim)
