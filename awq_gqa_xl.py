@@ -258,6 +258,12 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
             moderate_end = min(moderate_start + num_moderate, head_dim)
             moderate_indices = sorted_indices_desc[moderate_start:moderate_end]
 
+            # DEBUG: Print first head's info
+            if head_idx == 0:
+                print(f"        [DEBUG Head 0] Knee: {knee_idx}/{head_dim}, Moderate: {moderate_start}-{moderate_end} ({len(moderate_indices)} dims)")
+                print(f"        [DEBUG Head 0] Score error: {score_error:.6f}")
+                print(f"        [DEBUG Head 0] Q mag range: [{sorted_magnitudes[0]:.6f}, {sorted_magnitudes[knee_idx]:.6f}, ..., {sorted_magnitudes[-1]:.6f}]")
+
             all_moderate_indices.append(moderate_indices)
 
             # ===== 4. FIXED: Proportional Error Redistribution =====
@@ -356,10 +362,13 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
                 sorted_indices = np.argsort(-flip_scores)  # Descending
 
                 # Greedy selection: find optimal K flips that minimize residual error
-                cumsum_impacts = np.zeros(hidden_dim + 1)
-                for k in range(1, hidden_dim + 1):
-                    if beneficial_flips[sorted_indices[k-1]]:
-                        cumsum_impacts[k] = cumsum_impacts[k-1] + flip_impacts[sorted_indices[k-1]]
+                # VECTORIZED version matching fast_quantize_qkv.py
+                impacts_sorted = flip_impacts[sorted_indices]
+                beneficial_sorted = beneficial_flips[sorted_indices]
+
+                # Build cumsum only for beneficial flips
+                impacts_beneficial = impacts_sorted * beneficial_sorted
+                cumsum_impacts = np.concatenate([[0], np.cumsum(impacts_beneficial)])
 
                 # Find K that minimizes |error_current + cumsum_impacts[K]|
                 residuals = np.abs(error_current + cumsum_impacts)
@@ -369,13 +378,17 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
                 max_flips = int(hidden_dim * self.gqa_max_flip_pct)
                 best_k = min(best_k, max_flips)
 
-                # Apply the optimal flips
+                # DEBUG: Print first dimension's stats
+                if head_idx == 0 and i == 0:
+                    print(f"        [DEBUG Dim 0] error_current: {error_current:.6f}, beneficial: {beneficial_flips.sum()}/{len(beneficial_flips)}")
+                    print(f"        [DEBUG Dim 0] best_k: {best_k}/{max_flips}, residual: {residuals[best_k]:.6f}")
+
+                # Apply the optimal flips (matching fast_quantize_qkv.py line 211-214)
                 if best_k > 0:
-                    for k in range(best_k):
-                        j = sorted_indices[k]
-                        if beneficial_flips[j]:
-                            Wq_int_flat[head_idx, dim_idx, j] += flip_direction
-                            total_flips += 1
+                    flip_indices = sorted_indices[:best_k][beneficial_sorted[:best_k]]
+                    for j in flip_indices:
+                        Wq_int_flat[head_idx, dim_idx, j] += flip_direction
+                    total_flips += len(flip_indices)
 
         # Clamp to valid range
         Wq_int_flat.clamp_(0, 15)
