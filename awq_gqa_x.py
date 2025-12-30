@@ -442,6 +442,23 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
         print("GQA ReFlip Refinement")
         print("=" * 80)
 
+        # CRITICAL: Move GQA layers back to GPU if they were offloaded
+        print("\n  Ensuring GQA layers are on GPU...")
+        gqa_moved = 0
+        for name, module in self.model.named_modules():
+            if isinstance(module, nn.Linear) and is_gqa_layer(name):
+                if module.weight.device.type == 'cpu':
+                    module.weight.data = module.weight.data.to(self.device)
+                    if module.bias is not None:
+                        module.bias.data = module.bias.data.to(self.device)
+                    gqa_moved += 1
+
+        if gqa_moved > 0:
+            print(f"  ✓ Moved {gqa_moved} GQA layers back to GPU")
+            torch.cuda.empty_cache()
+        else:
+            print(f"  ✓ GQA layers already on GPU")
+
         # Group GQA layers by attention block
         attn_groups = {}
         for name, module in self.model.named_modules():
@@ -737,8 +754,21 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
             return
 
         # ===== 1. Setup GPU Tensors =====
-        device = q_module.weight.device
+        # CRITICAL: Always use self.device (GPU), not module.weight.device
+        # This ensures refinement runs on GPU even if layers were offloaded to CPU
+        device = self.device  # Force GPU
         dtype = torch.float32
+
+        # Ensure modules are on GPU
+        if q_module.weight.device.type != device.type:
+            q_module.weight.data = q_module.weight.data.to(device)
+            if q_module.bias is not None:
+                q_module.bias.data = q_module.bias.data.to(device)
+
+        if k_module.weight.device.type != device.type:
+            k_module.weight.data = k_module.weight.data.to(device)
+            if k_module.bias is not None:
+                k_module.bias.data = k_module.bias.data.to(device)
 
         Wq_orig_unscaled = self.original_state_dict[q_weight_key].to(device).to(dtype)
         Wk_orig_unscaled = self.original_state_dict[k_weight_key].to(device).to(dtype)
