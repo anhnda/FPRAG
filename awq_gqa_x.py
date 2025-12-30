@@ -90,7 +90,7 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
 
     def offload_other_layers_to_cpu(self, current_layer_name):
         """
-        NEW: Move all Linear layer weights to CPU except the current layer.
+        NEW: Move all Linear layer weights AND activation data to CPU except the current layer.
         This frees up VRAM for processing large lm_head without chunking.
         """
         print(f"\n{'=' * 80}")
@@ -100,6 +100,7 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
         offloaded_count = 0
         total_memory_freed = 0
 
+        # 1. Offload layer weights
         for name, module in self.model.named_modules():
             if not isinstance(module, nn.Linear):
                 continue
@@ -125,13 +126,36 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
             self.offloaded_layers[name] = True
             offloaded_count += 1
 
+        # 2. CRITICAL: Clear activation data for other layers
+        activation_cleared = 0
+        activation_memory_freed = 0
+
+        layers_to_clear = []
+        for layer_name in list(self.activation_data.keys()):
+            if layer_name != current_layer_name:
+                # Calculate memory before clearing
+                if layer_name in self.activation_data:
+                    act_data = self.activation_data[layer_name]
+                    if torch.is_tensor(act_data):
+                        activation_memory_freed += act_data.element_size() * act_data.nelement()
+                    layers_to_clear.append(layer_name)
+
+        # Clear the activation data
+        for layer_name in layers_to_clear:
+            del self.activation_data[layer_name]
+            activation_cleared += 1
+
         # Clear CUDA cache
         torch.cuda.empty_cache()
         gc.collect()
 
-        memory_freed_gb = total_memory_freed / (1024 ** 3)
-        print(f"  ✓ Offloaded {offloaded_count} layers to CPU")
-        print(f"  ✓ Freed ~{memory_freed_gb:.2f} GB VRAM")
+        weight_freed_gb = total_memory_freed / (1024 ** 3)
+        act_freed_gb = activation_memory_freed / (1024 ** 3)
+        total_freed_gb = weight_freed_gb + act_freed_gb
+
+        print(f"  ✓ Offloaded {offloaded_count} layer weights to CPU (~{weight_freed_gb:.2f} GB)")
+        print(f"  ✓ Cleared {activation_cleared} activation data (~{act_freed_gb:.2f} GB)")
+        print(f"  ✓ Total freed: ~{total_freed_gb:.2f} GB VRAM")
 
         if torch.cuda.is_available():
             current_vram = torch.cuda.memory_allocated() / (1024 ** 3)
@@ -144,6 +168,8 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
         """
         NEW: Override to offload other layers before processing lm_head.
         This maximizes VRAM available for lm_head processing.
+
+        Auto-adjusts num_chunks based on available VRAM if needed.
         """
         if num_chunks is None:
             num_chunks = self.lmhead_chunks
@@ -151,12 +177,42 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
         print(f"\n{'=' * 80}")
         print(f"[DETECTED] lm_head layer: {name}")
         print(f"  Shape: {module.weight.shape}")
-        print(f"  Size: {module.weight.element_size() * module.weight.nelement() / (1024**3):.2f} GB")
-        print(f"  Chunks: {num_chunks} ({'full' if num_chunks == 1 else 'chunked'})")
+        weight_size_gb = module.weight.element_size() * module.weight.nelement() / (1024**3)
+        print(f"  Size: {weight_size_gb:.2f} GB")
+        print(f"  Requested chunks: {num_chunks} ({'full' if num_chunks == 1 else 'chunked'})")
         print(f"{'=' * 80}")
 
         # Offload other layers to maximize VRAM for lm_head
         self.offload_other_layers_to_cpu(name)
+
+        # ADAPTIVE CHUNKING: Check if we have enough VRAM for requested chunks
+        if torch.cuda.is_available():
+            free_vram_gb = (torch.cuda.get_device_properties(0).total_memory -
+                           torch.cuda.memory_allocated()) / (1024**3)
+
+            # Estimate memory needed per chunk (empirical: ~2-3x weight size for processing)
+            out_features = module.weight.shape[0]
+            chunk_size = out_features // num_chunks
+            estimated_chunk_gb = (chunk_size * module.weight.shape[1] *
+                                 module.weight.element_size() / (1024**3)) * 3.0  # 3x for processing overhead
+
+            print(f"\n[Memory Check]")
+            print(f"  Free VRAM: {free_vram_gb:.2f} GB")
+            print(f"  Estimated per chunk: {estimated_chunk_gb:.2f} GB")
+
+            # If not enough memory, increase chunks
+            if estimated_chunk_gb > free_vram_gb * 0.8:  # Use 80% of free memory as safety margin
+                # Calculate needed chunks
+                needed_chunks = int(np.ceil(estimated_chunk_gb / (free_vram_gb * 0.8)))
+                if needed_chunks > num_chunks:
+                    old_chunks = num_chunks
+                    num_chunks = needed_chunks
+                    print(f"  ⚠️  Not enough VRAM for {old_chunks} chunk(s)")
+                    print(f"  ✓ Auto-adjusted to {num_chunks} chunks to fit in available VRAM")
+                else:
+                    print(f"  ✓ Sufficient VRAM for {num_chunks} chunk(s)")
+            else:
+                print(f"  ✓ Sufficient VRAM for {num_chunks} chunk(s)")
 
         print(f"\n[Processing] lm_head with {num_chunks} chunk(s)...")
         if num_chunks == 1:
@@ -164,7 +220,7 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
         else:
             print(f"  Processing lm_head in {num_chunks} chunks...\n")
 
-        # Call parent's lm_head processing
+        # Call parent's lm_head processing with adjusted chunks
         super().quantize_lmhead_half_by_half(name, module, debug=debug, num_chunks=num_chunks)
 
         print(f"\n{'=' * 80}")
