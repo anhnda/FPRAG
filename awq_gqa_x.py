@@ -92,12 +92,16 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
         """
         NEW: Move all Linear layer weights AND activation data to CPU except the current layer.
         This frees up VRAM for processing large lm_head without chunking.
+
+        CRITICAL: Does NOT offload GQA layers (q_proj, k_proj, v_proj) to avoid
+        any issues with GQA refinement later.
         """
         print(f"\n{'=' * 80}")
         print(f"[lm_head Special Handling] Offloading other layers to CPU")
         print(f"{'=' * 80}")
 
         offloaded_count = 0
+        gqa_skipped = 0
         total_memory_freed = 0
 
         # 1. Offload layer weights
@@ -107,6 +111,11 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
 
             # Skip current layer
             if name == current_layer_name:
+                continue
+
+            # CRITICAL: Skip GQA layers to avoid any corruption
+            if is_gqa_layer(name):
+                gqa_skipped += 1
                 continue
 
             # Check if already on CPU
@@ -154,6 +163,7 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
         total_freed_gb = weight_freed_gb + act_freed_gb
 
         print(f"  ✓ Offloaded {offloaded_count} layer weights to CPU (~{weight_freed_gb:.2f} GB)")
+        print(f"  ✓ Skipped {gqa_skipped} GQA layers (kept on GPU for refinement)")
         print(f"  ✓ Cleared {activation_cleared} activation data (~{act_freed_gb:.2f} GB)")
         print(f"  ✓ Total freed: ~{total_freed_gb:.2f} GB VRAM")
 
@@ -441,23 +451,7 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
         print("\n" + "=" * 80)
         print("GQA ReFlip Refinement")
         print("=" * 80)
-
-        # CRITICAL: Move GQA layers back to GPU if they were offloaded
-        print("\n  Ensuring GQA layers are on GPU...")
-        gqa_moved = 0
-        for name, module in self.model.named_modules():
-            if isinstance(module, nn.Linear) and is_gqa_layer(name):
-                if module.weight.device.type == 'cpu':
-                    module.weight.data = module.weight.data.to(self.device)
-                    if module.bias is not None:
-                        module.bias.data = module.bias.data.to(self.device)
-                    gqa_moved += 1
-
-        if gqa_moved > 0:
-            print(f"  ✓ Moved {gqa_moved} GQA layers back to GPU")
-            torch.cuda.empty_cache()
-        else:
-            print(f"  ✓ GQA layers already on GPU")
+        print("  (GQA layers kept on GPU during lm_head offloading)")
 
         # Group GQA layers by attention block
         attn_groups = {}
@@ -754,21 +748,9 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
             return
 
         # ===== 1. Setup GPU Tensors =====
-        # CRITICAL: Always use self.device (GPU), not module.weight.device
-        # This ensures refinement runs on GPU even if layers were offloaded to CPU
-        device = self.device  # Force GPU
+        # GQA layers are kept on GPU (not offloaded), so use their device
+        device = q_module.weight.device
         dtype = torch.float32
-
-        # Ensure modules are on GPU
-        if q_module.weight.device.type != device.type:
-            q_module.weight.data = q_module.weight.data.to(device)
-            if q_module.bias is not None:
-                q_module.bias.data = q_module.bias.data.to(device)
-
-        if k_module.weight.device.type != device.type:
-            k_module.weight.data = k_module.weight.data.to(device)
-            if k_module.bias is not None:
-                k_module.bias.data = k_module.bias.data.to(device)
 
         Wq_orig_unscaled = self.original_state_dict[q_weight_key].to(device).to(dtype)
         Wk_orig_unscaled = self.original_state_dict[k_weight_key].to(device).to(dtype)
