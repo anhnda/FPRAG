@@ -88,10 +88,6 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
         self.gqa_awq_scales = {}  # Store AWQ best_scales
         self.offloaded_layers = {}  # NEW: Track offloaded layers
 
-    def is_lm_head(self, name):
-        """NEW: Detect if this is the lm_head layer."""
-        return 'lm_head' in name.lower()
-
     def offload_other_layers_to_cpu(self, current_layer_name):
         """
         NEW: Move all Linear layer weights to CPU except the current layer.
@@ -144,22 +140,39 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
 
         print(f"{'=' * 80}\n")
 
+    def quantize_lmhead_half_by_half(self, name, module, debug=False, num_chunks=None):
+        """
+        NEW: Override to offload other layers before processing lm_head.
+        This maximizes VRAM available for lm_head processing.
+        """
+        if num_chunks is None:
+            num_chunks = self.lmhead_chunks
+
+        print(f"\n{'=' * 80}")
+        print(f"[DETECTED] lm_head layer: {name}")
+        print(f"  Shape: {module.weight.shape}")
+        print(f"  Size: {module.weight.element_size() * module.weight.nelement() / (1024**3):.2f} GB")
+        print(f"  Chunks: {num_chunks} ({'full' if num_chunks == 1 else 'chunked'})")
+        print(f"{'=' * 80}")
+
+        # Offload other layers to maximize VRAM for lm_head
+        self.offload_other_layers_to_cpu(name)
+
+        print(f"\n[Processing] lm_head with {num_chunks} chunk(s)...")
+        if num_chunks == 1:
+            print(f"  Processing full lm_head without chunking (may take several minutes)...\n")
+        else:
+            print(f"  Processing lm_head in {num_chunks} chunks...\n")
+
+        # Call parent's lm_head processing
+        super().quantize_lmhead_half_by_half(name, module, debug=debug, num_chunks=num_chunks)
+
+        print(f"\n{'=' * 80}")
+        print(f"[COMPLETED] lm_head quantization")
+        print(f"{'=' * 80}\n")
+
     def quantize_layer(self, name, module):
         """Override to store James-Stein means AND heuristic integer weights for GQA layers."""
-        # NEW: Check if this is lm_head and offload other layers
-        if self.is_lm_head(name):
-            print(f"\n{'=' * 80}")
-            print(f"[DETECTED] lm_head layer: {name}")
-            print(f"  Shape: {module.weight.shape}")
-            print(f"  Size: {module.weight.element_size() * module.weight.nelement() / (1024**3):.2f} GB")
-            print(f"{'=' * 80}")
-
-            # Offload other layers to maximize VRAM for lm_head
-            self.offload_other_layers_to_cpu(name)
-
-            print(f"\n[Processing] Full lm_head without chunking...")
-            print(f"  This may take several minutes depending on vocab size...\n")
-
         # Original logic from awq_gqa_xl.py
         if self.apply_gqa_reflip and is_gqa_layer(name):
             # Store JS means
@@ -207,12 +220,6 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
         else:
             # For non-GQA layers, use parent class method
             super().quantize_layer(name, module)
-
-        # NEW: Report completion if this was lm_head
-        if self.is_lm_head(name):
-            print(f"\n{'=' * 80}")
-            print(f"[COMPLETED] lm_head quantization")
-            print(f"{'=' * 80}\n")
 
     def quantize_weight_heuristic_with_int_output(self, W, group_activation_means, apply_heuristic=True):
         """
