@@ -187,28 +187,44 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
 
         # ADAPTIVE CHUNKING: Check if we have enough VRAM for requested chunks
         if torch.cuda.is_available():
-            free_vram_gb = (torch.cuda.get_device_properties(0).total_memory -
-                           torch.cuda.memory_allocated()) / (1024**3)
+            # CRITICAL: Use mem_get_info() for ACTUAL free memory (not theoretical)
+            # This accounts for fragmentation and reserved memory
+            free_vram_bytes, total_vram_bytes = torch.cuda.mem_get_info()
+            free_vram_gb = free_vram_bytes / (1024**3)
+            total_vram_gb = total_vram_bytes / (1024**3)
 
-            # Estimate memory needed per chunk (empirical: ~2-3x weight size for processing)
+            # Estimate memory needed per chunk (empirical: ~3-4x weight size for processing)
             out_features = module.weight.shape[0]
             chunk_size = out_features // num_chunks
-            estimated_chunk_gb = (chunk_size * module.weight.shape[1] *
-                                 module.weight.element_size() / (1024**3)) * 3.0  # 3x for processing overhead
+            weight_chunk_gb = (chunk_size * module.weight.shape[1] *
+                              module.weight.element_size() / (1024**3))
+            # Factor accounts for: grid search (20 alphas), activation data, intermediate tensors
+            estimated_chunk_gb = weight_chunk_gb * 4.0
 
             print(f"\n[Memory Check]")
-            print(f"  Free VRAM: {free_vram_gb:.2f} GB")
-            print(f"  Estimated per chunk: {estimated_chunk_gb:.2f} GB")
+            print(f"  Total VRAM: {total_vram_gb:.2f} GB")
+            print(f"  Actually free: {free_vram_gb:.2f} GB")
+            print(f"  Weight per chunk: {weight_chunk_gb:.2f} GB")
+            print(f"  Estimated per chunk: {estimated_chunk_gb:.2f} GB (with processing overhead)")
 
             # If not enough memory, increase chunks
-            if estimated_chunk_gb > free_vram_gb * 0.8:  # Use 80% of free memory as safety margin
-                # Calculate needed chunks
-                needed_chunks = int(np.ceil(estimated_chunk_gb / (free_vram_gb * 0.8)))
+            # Use 70% of free memory as safety margin (more conservative)
+            usable_vram_gb = free_vram_gb * 0.7
+
+            if estimated_chunk_gb > usable_vram_gb:
+                # Calculate needed chunks to fit in usable VRAM
+                needed_chunks = int(np.ceil(estimated_chunk_gb / usable_vram_gb))
                 if needed_chunks > num_chunks:
                     old_chunks = num_chunks
                     num_chunks = needed_chunks
-                    print(f"  ⚠️  Not enough VRAM for {old_chunks} chunk(s)")
+                    print(f"  ⚠️  Not enough VRAM for {old_chunks} chunk(s) (need {estimated_chunk_gb:.2f} GB, have {usable_vram_gb:.2f} GB usable)")
                     print(f"  ✓ Auto-adjusted to {num_chunks} chunks to fit in available VRAM")
+                    # Recalculate with new chunks
+                    chunk_size = out_features // num_chunks
+                    weight_chunk_gb = (chunk_size * module.weight.shape[1] *
+                                      module.weight.element_size() / (1024**3))
+                    estimated_chunk_gb = weight_chunk_gb * 4.0
+                    print(f"  ✓ New estimate: {estimated_chunk_gb:.2f} GB per chunk")
                 else:
                     print(f"  ✓ Sufficient VRAM for {num_chunks} chunk(s)")
             else:
