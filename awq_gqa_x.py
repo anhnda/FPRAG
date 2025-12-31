@@ -176,82 +176,15 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
 
     def quantize_lmhead_half_by_half(self, name, module, debug=False, num_chunks=None):
         """
-        NEW: Override to offload other layers before processing lm_head.
-        This maximizes VRAM available for lm_head processing.
+        DISABLED: Just call parent directly to match awq_gqa_xl.py exactly.
 
-        Auto-adjusts num_chunks based on available VRAM if needed.
+        All offloading and adaptive chunking disabled to ensure identical results.
         """
         if num_chunks is None:
             num_chunks = self.lmhead_chunks
 
-        print(f"\n{'=' * 80}")
-        print(f"[DETECTED] lm_head layer: {name}")
-        print(f"  Shape: {module.weight.shape}")
-        weight_size_gb = module.weight.element_size() * module.weight.nelement() / (1024**3)
-        print(f"  Size: {weight_size_gb:.2f} GB")
-        print(f"  Requested chunks: {num_chunks} ({'full' if num_chunks == 1 else 'chunked'})")
-        print(f"{'=' * 80}")
-
-        # Offload other layers to maximize VRAM for lm_head
-        self.offload_other_layers_to_cpu(name)
-
-        # ADAPTIVE CHUNKING: Check if we have enough VRAM for requested chunks
-        if torch.cuda.is_available():
-            # CRITICAL: Use mem_get_info() for ACTUAL free memory (not theoretical)
-            # This accounts for fragmentation and reserved memory
-            free_vram_bytes, total_vram_bytes = torch.cuda.mem_get_info()
-            free_vram_gb = free_vram_bytes / (1024**3)
-            total_vram_gb = total_vram_bytes / (1024**3)
-
-            # Estimate memory needed per chunk (empirical: ~3-4x weight size for processing)
-            out_features = module.weight.shape[0]
-            chunk_size = out_features // num_chunks
-            weight_chunk_gb = (chunk_size * module.weight.shape[1] *
-                              module.weight.element_size() / (1024**3))
-            # Factor accounts for: grid search (20 alphas), activation data, intermediate tensors
-            estimated_chunk_gb = weight_chunk_gb * 4.0
-
-            print(f"\n[Memory Check]")
-            print(f"  Total VRAM: {total_vram_gb:.2f} GB")
-            print(f"  Actually free: {free_vram_gb:.2f} GB")
-            print(f"  Weight per chunk: {weight_chunk_gb:.2f} GB")
-            print(f"  Estimated per chunk: {estimated_chunk_gb:.2f} GB (with processing overhead)")
-
-            # If not enough memory, increase chunks
-            # Use 70% of free memory as safety margin (more conservative)
-            usable_vram_gb = free_vram_gb * 0.7
-
-            if estimated_chunk_gb > usable_vram_gb:
-                # Calculate needed chunks to fit in usable VRAM
-                needed_chunks = int(np.ceil(estimated_chunk_gb / usable_vram_gb))
-                if needed_chunks > num_chunks:
-                    old_chunks = num_chunks
-                    num_chunks = needed_chunks
-                    print(f"  ⚠️  Not enough VRAM for {old_chunks} chunk(s) (need {estimated_chunk_gb:.2f} GB, have {usable_vram_gb:.2f} GB usable)")
-                    print(f"  ✓ Auto-adjusted to {num_chunks} chunks to fit in available VRAM")
-                    # Recalculate with new chunks
-                    chunk_size = out_features // num_chunks
-                    weight_chunk_gb = (chunk_size * module.weight.shape[1] *
-                                      module.weight.element_size() / (1024**3))
-                    estimated_chunk_gb = weight_chunk_gb * 4.0
-                    print(f"  ✓ New estimate: {estimated_chunk_gb:.2f} GB per chunk")
-                else:
-                    print(f"  ✓ Sufficient VRAM for {num_chunks} chunk(s)")
-            else:
-                print(f"  ✓ Sufficient VRAM for {num_chunks} chunk(s)")
-
-        print(f"\n[Processing] lm_head with {num_chunks} chunk(s)...")
-        if num_chunks == 1:
-            print(f"  Processing full lm_head without chunking (may take several minutes)...\n")
-        else:
-            print(f"  Processing lm_head in {num_chunks} chunks...\n")
-
-        # Call parent's lm_head processing with adjusted chunks
+        # Just call parent - NO modifications
         super().quantize_lmhead_half_by_half(name, module, debug=debug, num_chunks=num_chunks)
-
-        print(f"\n{'=' * 80}")
-        print(f"[COMPLETED] lm_head quantization")
-        print(f"{'=' * 80}\n")
 
     def quantize_layer(self, name, module):
         """Override to store James-Stein means AND heuristic integer weights for GQA layers."""
