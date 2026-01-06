@@ -32,6 +32,7 @@ import argparse
 import random
 import numpy as np
 import gc
+import sys
 
 try:
     import psutil
@@ -490,102 +491,131 @@ class GroupWiseAWQAsymmetricL2Quantizer:
         """
         BATCHED SEQUENTIAL QUANTIZATION with special handling for lm_head.
         """
-        print("\n" + "=" * 80)
-        print("BATCHED SEQUENTIAL QUANTIZATION (XL Version)")
-        print("=" * 80)
+        try:
+            print("\n" + "=" * 80)
+            print("BATCHED SEQUENTIAL QUANTIZATION (XL Version)")
+            print("=" * 80)
 
-        if HAS_PSUTIL:
-            initial_ram = psutil.virtual_memory().percent
-            print(f"Initial System RAM: {initial_ram:.1f}%")
+            if HAS_PSUTIL:
+                initial_ram = psutil.virtual_memory().percent
+                print(f"Initial System RAM: {initial_ram:.1f}%")
 
-        layer_names = [(name, module) for name, module in self.model.named_modules()
-                       if isinstance(module, nn.Linear)]
+            layer_names = [(name, module) for name, module in self.model.named_modules()
+                           if isinstance(module, nn.Linear)]
 
-        print(f"\nFound {len(layer_names)} linear layers to quantize")
-        print(f"Batch size: {layer_batch_size} layers per batch")
-        num_batches = (len(layer_names) + layer_batch_size - 1) // layer_batch_size
-        print(f"Total batches: {num_batches}")
+            print(f"\nFound {len(layer_names)} linear layers to quantize")
+            print(f"Batch size: {layer_batch_size} layers per batch")
+            num_batches = (len(layer_names) + layer_batch_size - 1) // layer_batch_size
+            print(f"Total batches: {num_batches}")
 
-        quantized_count = 0
-        skipped_count = 0
+            quantized_count = 0
+            skipped_count = 0
 
-        # Process layers in batches
-        for batch_idx in range(num_batches):
-            batch_start = batch_idx * layer_batch_size
-            batch_end = min(batch_start + layer_batch_size, len(layer_names))
-            batch_layers = layer_names[batch_start:batch_end]
+            # Process layers in batches
+            for batch_idx in range(num_batches):
+                batch_start = batch_idx * layer_batch_size
+                batch_end = min(batch_start + layer_batch_size, len(layer_names))
+                batch_layers = layer_names[batch_start:batch_end]
 
-            print(f"\n{'='*60}")
-            print(f"Batch {batch_idx + 1}/{num_batches}: Layers {batch_start}-{batch_end-1}")
-            print(f"{'='*60}")
+                print(f"\n{'='*60}")
+                print(f"Batch {batch_idx + 1}/{num_batches}: Layers {batch_start}-{batch_end-1}")
+                print(f"{'='*60}")
 
-            # STEP 1: Calibrate this BATCH
-            self.calibrate_layer_batch(batch_layers, calibration_data, n_samples)
+                # STEP 1: Calibrate this BATCH
+                self.calibrate_layer_batch(batch_layers, calibration_data, n_samples)
 
-            # STEP 2: Quantize each layer in the batch
-            for idx_in_batch, (name, module) in enumerate(tqdm(batch_layers, desc=f"Quantizing Batch {batch_idx+1}")):
-                try:
-                    # Check if this is lm_head (special handling)
-                    is_lmhead = 'lm_head' in name.lower() or name.endswith('lm_head')
+                # STEP 2: Quantize each layer in the batch
+                for idx_in_batch, (name, module) in enumerate(tqdm(batch_layers, desc=f"Quantizing Batch {batch_idx+1}")):
+                    try:
+                        # Check if this is lm_head (special handling)
+                        is_lmhead = 'lm_head' in name.lower() or name.endswith('lm_head')
 
-                    if is_lmhead:
-                        # Use chunked processing for lm_head
-                        debug = (quantized_count < 2)
-                        self.quantize_lmhead_half_by_half(name, module, debug=debug, num_chunks=self.lmhead_chunks)
-                    else:
-                        # Standard processing for other layers
-                        # Debug output for first few layers
-                        if quantized_count < 2:
-                            print(f"\nDEBUG Layer {quantized_count}: {name}")
-                            best_scales, best_alpha, best_error = self.search_best_scale(name, module, debug=True)
-                            print(f"  → α={best_alpha:.4f}, error={best_error:.8f}")
+                        if is_lmhead:
+                            # Use chunked processing for lm_head
+                            debug = (quantized_count < 2)
+                            self.quantize_lmhead_half_by_half(name, module, debug=debug, num_chunks=self.lmhead_chunks)
                         else:
-                            best_scales, best_alpha, best_error = self.search_best_scale(name, module)
+                            # Standard processing for other layers
+                            # Debug output for first few layers
+                            if quantized_count < 2:
+                                print(f"\nDEBUG Layer {quantized_count}: {name}")
+                                best_scales, best_alpha, best_error = self.search_best_scale(name, module, debug=True)
+                                print(f"  → α={best_alpha:.4f}, error={best_error:.8f}")
+                            else:
+                                best_scales, best_alpha, best_error = self.search_best_scale(name, module)
 
-                        W = module.weight.data
-                        original_dtype = W.dtype
-                        W_scaled = W * best_scales.unsqueeze(0)
-                        W_quant = self.quantize_weight_groupwise_asymmetric(W_scaled)
-                        W_final = (W_quant / best_scales.unsqueeze(0)).to(original_dtype)
-                        module.weight.data = W_final
+                            W = module.weight.data
+                            original_dtype = W.dtype
+                            W_scaled = W * best_scales.unsqueeze(0)
+                            W_quant = self.quantize_weight_groupwise_asymmetric(W_scaled)
+                            W_final = (W_quant / best_scales.unsqueeze(0)).to(original_dtype)
+                            module.weight.data = W_final
 
-                        self.layer_scales[name] = {
-                            'scales': best_scales.cpu(),
-                            'alpha': best_alpha,
-                            'error': best_error
-                        }
+                            self.layer_scales[name] = {
+                                'scales': best_scales.cpu(),
+                                'alpha': best_alpha,
+                                'error': best_error
+                            }
 
-                    quantized_count += 1
+                        quantized_count += 1
 
-                except Exception as e:
-                    print(f"\n⚠️  Error quantizing {name}: {e}")
-                    skipped_count += 1
-                    continue
+                    except Exception as e:
+                        print(f"\n⚠️  Error quantizing {name}: {e}")
+                        skipped_count += 1
+                        continue
 
-            # STEP 3: Clear activations
+                # STEP 3: Clear activations
+                self.activation_data = {}
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                gc.collect()
+
+                if HAS_PSUTIL:
+                    ram_pct = psutil.virtual_memory().percent
+                    print(f"Batch {batch_idx+1} complete. RAM: {ram_pct:.1f}%")
+
+            print(f"\n✅ Sequential Quantization Complete!")
+            print(f"   Total layers quantized: {quantized_count}/{len(layer_names)}")
+
+            if self.layer_scales:
+                alphas = [info['alpha'] for info in self.layer_scales.values()]
+                print(f"\nOptimal α statistics:")
+                print(f"  Mean: {np.mean(alphas):.3f}")
+                print(f"  Median: {np.median(alphas):.3f}")
+
+            # Final cleanup
             self.activation_data = {}
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             gc.collect()
 
-            if HAS_PSUTIL:
-                ram_pct = psutil.virtual_memory().percent
-                print(f"Batch {batch_idx+1} complete. RAM: {ram_pct:.1f}%")
-
-        print(f"\n✅ Sequential Quantization Complete!")
-        print(f"   Total layers quantized: {quantized_count}/{len(layer_names)}")
-
-        if self.layer_scales:
-            alphas = [info['alpha'] for info in self.layer_scales.values()]
-            print(f"\nOptimal α statistics:")
-            print(f"  Mean: {np.mean(alphas):.3f}")
-            print(f"  Median: {np.median(alphas):.3f}")
-
-        # Final cleanup
-        self.activation_data = {}
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        gc.collect()
+        except torch.cuda.OutOfMemoryError:
+            print("\n" + "=" * 80)
+            print("❌ CUDA OUT OF MEMORY ERROR")
+            print("=" * 80)
+            print("The GPU ran out of memory during quantization.")
+            print("Suggestions:")
+            print("  1. Reduce --layer-batch-size (current: {})".format(layer_batch_size))
+            print("  2. Reduce --n-calib (fewer calibration samples)")
+            print("  3. Reduce --max-tokens-per-sample")
+            print("  4. Use a smaller model or GPU with more VRAM")
+            print("=" * 80)
+            sys.exit(1)
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                print("\n" + "=" * 80)
+                print("❌ CUDA OUT OF MEMORY ERROR")
+                print("=" * 80)
+                print(f"Error: {e}")
+                print("Suggestions:")
+                print("  1. Reduce --layer-batch-size (current: {})".format(layer_batch_size))
+                print("  2. Reduce --n-calib (fewer calibration samples)")
+                print("  3. Reduce --max-tokens-per-sample")
+                print("  4. Use a smaller model or GPU with more VRAM")
+                print("=" * 80)
+                sys.exit(1)
+            else:
+                raise
 
 def load_wikitext2_simple(n_samples=128):
     from datasets import load_dataset

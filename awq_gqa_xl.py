@@ -28,6 +28,7 @@ import numpy as np
 import random
 from tqdm import tqdm
 import gc
+import sys
 
 # Import AWQ quantizer from awq_js_xl
 from awq_js_xl import JamesSteinHeuristicAWQQuantizerXL, compute_james_stein_mean
@@ -251,37 +252,68 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
 
     def quantize_model_sequential(self, calibration_data, n_samples=500):
         """Override to add GQA ReFlip refinement after AWQ quantization."""
-        if not self.apply_gqa_reflip:
+        try:
+            if not self.apply_gqa_reflip:
+                super().quantize_model_sequential(calibration_data, n_samples)
+                return
+
+            print("\n" + "=" * 80)
+            print("AWQ-GQA: Combined Quantization Pipeline")
+            print("=" * 80)
+            print(f"  Step 1: Save original model state")
+            print(f"  Step 2: AWQ quantization for all layers")
+            print(f"  Step 3: GQA ReFlip refinement")
+            print("=" * 80)
+
+            # Step 1: Save original weights
+            print("\n[Step 1] Saving original GQA layer weights...")
+            self.original_state_dict = {}
+            for name, module in self.model.named_modules():
+                if isinstance(module, nn.Linear) and is_gqa_layer(name):
+                    self.original_state_dict[name + '.weight'] = module.weight.data.clone().cpu()
+            print(f"  ✓ Saved {len(self.original_state_dict)} GQA layer weights")
+
+            # Step 2: AWQ quantization
+            print("\n[Step 2] Running AWQ quantization...")
             super().quantize_model_sequential(calibration_data, n_samples)
-            return
 
-        print("\n" + "=" * 80)
-        print("AWQ-GQA: Combined Quantization Pipeline")
-        print("=" * 80)
-        print(f"  Step 1: Save original model state")
-        print(f"  Step 2: AWQ quantization for all layers")
-        print(f"  Step 3: GQA ReFlip refinement")
-        print("=" * 80)
+            # Step 3: GQA ReFlip refinement
+            print("\n[Step 3] Applying GQA ReFlip refinement...")
+            self.apply_gqa_reflip_refinement()
 
-        # Step 1: Save original weights
-        print("\n[Step 1] Saving original GQA layer weights...")
-        self.original_state_dict = {}
-        for name, module in self.model.named_modules():
-            if isinstance(module, nn.Linear) and is_gqa_layer(name):
-                self.original_state_dict[name + '.weight'] = module.weight.data.clone().cpu()
-        print(f"  ✓ Saved {len(self.original_state_dict)} GQA layer weights")
+            self.original_state_dict = None
+            torch.cuda.empty_cache()
+            gc.collect()
 
-        # Step 2: AWQ quantization
-        print("\n[Step 2] Running AWQ quantization...")
-        super().quantize_model_sequential(calibration_data, n_samples)
-
-        # Step 3: GQA ReFlip refinement
-        print("\n[Step 3] Applying GQA ReFlip refinement...")
-        self.apply_gqa_reflip_refinement()
-
-        self.original_state_dict = None
-        torch.cuda.empty_cache()
-        gc.collect()
+        except torch.cuda.OutOfMemoryError:
+            print("\n" + "=" * 80)
+            print("❌ CUDA OUT OF MEMORY ERROR")
+            print("=" * 80)
+            print("The GPU ran out of memory during quantization.")
+            print("Suggestions:")
+            print("  1. Reduce --layer-batch-size (current: {})".format(self.layer_batch_size))
+            print("  2. Reduce --n-calib (fewer calibration samples)")
+            print("  3. Reduce --max-tokens-per-sample")
+            print("  4. Disable GQA ReFlip (remove --apply-gqa-reflip)")
+            print("  5. Use a smaller model or GPU with more VRAM")
+            print("=" * 80)
+            sys.exit(1)
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                print("\n" + "=" * 80)
+                print("❌ CUDA OUT OF MEMORY ERROR")
+                print("=" * 80)
+                print(f"Error: {e}")
+                print("Suggestions:")
+                print("  1. Reduce --layer-batch-size (current: {})".format(self.layer_batch_size))
+                print("  2. Reduce --n-calib (fewer calibration samples)")
+                print("  3. Reduce --max-tokens-per-sample")
+                print("  4. Disable GQA ReFlip (remove --apply-gqa-reflip)")
+                print("  5. Use a smaller model or GPU with more VRAM")
+                print("=" * 80)
+                sys.exit(1)
+            else:
+                raise
 
     def apply_gqa_reflip_refinement(self):
         """Apply ReFlip refinement to GQA layers."""

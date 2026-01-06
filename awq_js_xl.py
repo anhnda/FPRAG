@@ -33,6 +33,7 @@ import argparse
 import random
 import numpy as np
 import gc
+import sys
 
 try:
     import psutil
@@ -848,142 +849,171 @@ class JamesSteinHeuristicAWQQuantizerXL:
 
     def quantize_model_sequential(self, calibration_data, n_samples=500):
         """Batched sequential quantization with special lm_head handling."""
-        print("\n" + "=" * 80)
-        print("Batched Sequential Quantization (James-Stein XL Version)")
-        print("=" * 80)
-        print(f"  Strategy: Process {self.layer_batch_size} layers per batch")
-
-        if HAS_PSUTIL:
-            initial_ram = psutil.virtual_memory().percent
-            print(f"  Initial System RAM: {initial_ram:.1f}%")
-
-        layer_names = [(name, module) for name, module in self.model.named_modules()
-                       if isinstance(module, nn.Linear)]
-
-        num_layers = len(layer_names)
-        num_batches = (num_layers + self.layer_batch_size - 1) // self.layer_batch_size
-
-        print(f"  Total layers: {num_layers}")
-        print(f"  Total batches: {num_batches}")
-        print("=" * 80)
-
-        quantized_count = 0
-
-        # Process in batches
-        for batch_idx in range(num_batches):
-            batch_start = batch_idx * self.layer_batch_size
-            batch_end = min(batch_start + self.layer_batch_size, num_layers)
-            batch_layers = layer_names[batch_start:batch_end]
-
-            print(f"\n[Batch {batch_idx + 1}/{num_batches}] Layers {batch_start}-{batch_end-1}")
-
-            # Calibrate this batch
-            self.calibrate_layer_batch(batch_layers, calibration_data, n_samples)
-
-            # Quantize all layers in this batch
-            print(f"  Quantizing {len(batch_layers)} layers...")
-            for name, module in tqdm(batch_layers, desc="  Quantization", leave=False):
-                try:
-                    # Check if this is lm_head (special handling)
-                    is_lmhead = 'lm_head' in name.lower() or name.endswith('lm_head')
-
-                    if is_lmhead:
-                        # Use chunked processing for lm_head
-                        debug = (quantized_count < 2)
-                        self.quantize_lmhead_half_by_half(name, module, debug=debug, num_chunks=self.lmhead_chunks)
-                    else:
-                        # Standard processing
-                        self.quantize_layer(name, module)
-
-                    quantized_count += 1
-
-                except Exception as e:
-                    print(f"\n⚠️  Error quantizing {name}: {e}")
-                    continue
-
-            # Clear activations for this batch
-            self.activation_data = {}
-            torch.cuda.empty_cache()
-            gc.collect()
+        try:
+            print("\n" + "=" * 80)
+            print("Batched Sequential Quantization (James-Stein XL Version)")
+            print("=" * 80)
+            print(f"  Strategy: Process {self.layer_batch_size} layers per batch")
 
             if HAS_PSUTIL:
-                ram_pct = psutil.virtual_memory().percent
-                print(f"  Batch {batch_idx+1} complete. RAM: {ram_pct:.1f}%")
+                initial_ram = psutil.virtual_memory().percent
+                print(f"  Initial System RAM: {initial_ram:.1f}%")
 
-        print("\n" + "=" * 80)
-        print("✓ Batched Sequential Quantization Complete")
-        print(f"  Total layers quantized: {quantized_count}/{num_layers}")
-        print("=" * 80)
+            layer_names = [(name, module) for name, module in self.model.named_modules()
+                           if isinstance(module, nn.Linear)]
 
-        if self.layer_scales:
-            alphas = [info['alpha'] for info in self.layer_scales.values()]
-            outlier_pcts = [info.get('outlier_percent', 0.0) for info in self.layer_scales.values()]
+            num_layers = len(layer_names)
+            num_batches = (num_layers + self.layer_batch_size - 1) // self.layer_batch_size
 
-            print(f"\nOptimal α statistics:")
-            print(f"  Mean: {np.mean(alphas):.3f}")
-            print(f"  Median: {np.median(alphas):.3f}")
+            print(f"  Total layers: {num_layers}")
+            print(f"  Total batches: {num_batches}")
+            print("=" * 80)
 
-            if self.use_heuristic and outlier_pcts:
-                mean_outlier = np.mean(outlier_pcts) * 100
-                median_outlier = np.median(outlier_pcts) * 100
-                default_pct = 5.0
-                diff_from_default = mean_outlier - default_pct
+            quantized_count = 0
 
-                print(f"\nDynamic Outlier Detection statistics:")
-                print(f"  Mean outlier %: {mean_outlier:.2f}%")
-                print(f"  Median outlier %: {median_outlier:.2f}%")
-                print(f"  vs Default 5.00%: {diff_from_default:+.2f}%")
-                print(f"  Min: {np.min(outlier_pcts)*100:.2f}% | Max: {np.max(outlier_pcts)*100:.2f}%")
+            # Process in batches
+            for batch_idx in range(num_batches):
+                batch_start = batch_idx * self.layer_batch_size
+                batch_end = min(batch_start + self.layer_batch_size, num_layers)
+                batch_layers = layer_names[batch_start:batch_end]
 
-                if mean_outlier < default_pct:
-                    print(f"  → Dynamic method keeps FEWER outliers (more aggressive quantization)")
-                elif mean_outlier > default_pct:
-                    print(f"  → Dynamic method keeps MORE outliers (more conservative)")
-                else:
-                    print(f"  → Similar to default 5%")
+                print(f"\n[Batch {batch_idx + 1}/{num_batches}] Layers {batch_start}-{batch_end-1}")
 
-            if self.use_heuristic:
-                # Collect flip statistics
-                flip_totals = [info.get('flip_stats', {}).get('total', 0) for info in self.layer_scales.values()]
-                per_ch_means = [info.get('flip_stats', {}).get('per_channel_mean', 0) for info in self.layer_scales.values()]
-                per_ch_medians = [info.get('flip_stats', {}).get('per_channel_median', 0) for info in self.layer_scales.values()]
-                per_ch_stds = [info.get('flip_stats', {}).get('per_channel_std', 0) for info in self.layer_scales.values()]
-                per_ch_p25s = [info.get('flip_stats', {}).get('per_channel_p25', 0) for info in self.layer_scales.values()]
-                per_ch_p75s = [info.get('flip_stats', {}).get('per_channel_p75', 0) for info in self.layer_scales.values()]
-                per_ch_p90s = [info.get('flip_stats', {}).get('per_channel_p90', 0) for info in self.layer_scales.values()]
-                per_ch_p95s = [info.get('flip_stats', {}).get('per_channel_p95', 0) for info in self.layer_scales.values()]
-                per_ch_p99s = [info.get('flip_stats', {}).get('per_channel_p99', 0) for info in self.layer_scales.values()]
-                per_ch_zero_pcts = [info.get('flip_stats', {}).get('per_channel_zero_pct', 0) for info in self.layer_scales.values()]
+                # Calibrate this batch
+                self.calibrate_layer_batch(batch_layers, calibration_data, n_samples)
 
-                total_flips = np.sum(flip_totals)
-                mean_flips_per_layer = np.mean(flip_totals)
-                median_flips_per_layer = np.median(flip_totals)
-                min_flips = np.min(flip_totals)
-                max_flips = np.max(flip_totals)
+                # Quantize all layers in this batch
+                print(f"  Quantizing {len(batch_layers)} layers...")
+                for name, module in tqdm(batch_layers, desc="  Quantization", leave=False):
+                    try:
+                        # Check if this is lm_head (special handling)
+                        is_lmhead = 'lm_head' in name.lower() or name.endswith('lm_head')
 
-                avg_per_ch_mean = np.mean(per_ch_means)
-                avg_per_ch_median = np.mean(per_ch_medians)
-                avg_per_ch_std = np.mean(per_ch_stds)
-                avg_per_ch_p25 = np.mean(per_ch_p25s)
-                avg_per_ch_p75 = np.mean(per_ch_p75s)
-                avg_per_ch_p90 = np.mean(per_ch_p90s)
-                avg_per_ch_p95 = np.mean(per_ch_p95s)
-                avg_per_ch_p99 = np.mean(per_ch_p99s)
-                avg_per_ch_zero_pct = np.mean(per_ch_zero_pcts)
+                        if is_lmhead:
+                            # Use chunked processing for lm_head
+                            debug = (quantized_count < 2)
+                            self.quantize_lmhead_half_by_half(name, module, debug=debug, num_chunks=self.lmhead_chunks)
+                        else:
+                            # Standard processing
+                            self.quantize_layer(name, module)
 
-                print(f"\nWeight Flipping Statistics:")
-                print(f"  Total flips across all layers: {int(total_flips):,}")
-                print(f"  Mean flips per layer: {mean_flips_per_layer:,.1f}")
-                print(f"  Median flips per layer: {median_flips_per_layer:,.1f}")
-                print(f"  Min: {int(min_flips):,} | Max: {int(max_flips):,}")
-                print(f"\n  Per-Channel Statistics (averaged across layers):")
-                print(f"    Mean flips per channel: {avg_per_ch_mean:.2f}")
-                print(f"    Median flips per channel: {avg_per_ch_median:.2f}")
-                print(f"    Std dev: {avg_per_ch_std:.2f}")
-                print(f"\n    Percentiles:")
-                print(f"      25th: {avg_per_ch_p25:.2f} | 50th: {avg_per_ch_median:.2f} | 75th: {avg_per_ch_p75:.2f}")
-                print(f"      90th: {avg_per_ch_p90:.2f} | 95th: {avg_per_ch_p95:.2f} | 99th: {avg_per_ch_p99:.2f}")
-                print(f"\n    Channels with 0 flips: {avg_per_ch_zero_pct:.1f}%")
+                        quantized_count += 1
+
+                    except Exception as e:
+                        print(f"\n⚠️  Error quantizing {name}: {e}")
+                        continue
+
+                # Clear activations for this batch
+                self.activation_data = {}
+                torch.cuda.empty_cache()
+                gc.collect()
+
+                if HAS_PSUTIL:
+                    ram_pct = psutil.virtual_memory().percent
+                    print(f"  Batch {batch_idx+1} complete. RAM: {ram_pct:.1f}%")
+
+            print("\n" + "=" * 80)
+            print("✓ Batched Sequential Quantization Complete")
+            print(f"  Total layers quantized: {quantized_count}/{num_layers}")
+            print("=" * 80)
+
+            if self.layer_scales:
+                alphas = [info['alpha'] for info in self.layer_scales.values()]
+                outlier_pcts = [info.get('outlier_percent', 0.0) for info in self.layer_scales.values()]
+
+                print(f"\nOptimal α statistics:")
+                print(f"  Mean: {np.mean(alphas):.3f}")
+                print(f"  Median: {np.median(alphas):.3f}")
+
+                if self.use_heuristic and outlier_pcts:
+                    mean_outlier = np.mean(outlier_pcts) * 100
+                    median_outlier = np.median(outlier_pcts) * 100
+                    default_pct = 5.0
+                    diff_from_default = mean_outlier - default_pct
+
+                    print(f"\nDynamic Outlier Detection statistics:")
+                    print(f"  Mean outlier %: {mean_outlier:.2f}%")
+                    print(f"  Median outlier %: {median_outlier:.2f}%")
+                    print(f"  vs Default 5.00%: {diff_from_default:+.2f}%")
+                    print(f"  Min: {np.min(outlier_pcts)*100:.2f}% | Max: {np.max(outlier_pcts)*100:.2f}%")
+
+                    if mean_outlier < default_pct:
+                        print(f"  → Dynamic method keeps FEWER outliers (more aggressive quantization)")
+                    elif mean_outlier > default_pct:
+                        print(f"  → Dynamic method keeps MORE outliers (more conservative)")
+                    else:
+                        print(f"  → Similar to default 5%")
+
+                if self.use_heuristic:
+                    # Collect flip statistics
+                    flip_totals = [info.get('flip_stats', {}).get('total', 0) for info in self.layer_scales.values()]
+                    per_ch_means = [info.get('flip_stats', {}).get('per_channel_mean', 0) for info in self.layer_scales.values()]
+                    per_ch_medians = [info.get('flip_stats', {}).get('per_channel_median', 0) for info in self.layer_scales.values()]
+                    per_ch_stds = [info.get('flip_stats', {}).get('per_channel_std', 0) for info in self.layer_scales.values()]
+                    per_ch_p25s = [info.get('flip_stats', {}).get('per_channel_p25', 0) for info in self.layer_scales.values()]
+                    per_ch_p75s = [info.get('flip_stats', {}).get('per_channel_p75', 0) for info in self.layer_scales.values()]
+                    per_ch_p90s = [info.get('flip_stats', {}).get('per_channel_p90', 0) for info in self.layer_scales.values()]
+                    per_ch_p95s = [info.get('flip_stats', {}).get('per_channel_p95', 0) for info in self.layer_scales.values()]
+                    per_ch_p99s = [info.get('flip_stats', {}).get('per_channel_p99', 0) for info in self.layer_scales.values()]
+                    per_ch_zero_pcts = [info.get('flip_stats', {}).get('per_channel_zero_pct', 0) for info in self.layer_scales.values()]
+
+                    total_flips = np.sum(flip_totals)
+                    mean_flips_per_layer = np.mean(flip_totals)
+                    median_flips_per_layer = np.median(flip_totals)
+                    min_flips = np.min(flip_totals)
+                    max_flips = np.max(flip_totals)
+
+                    avg_per_ch_mean = np.mean(per_ch_means)
+                    avg_per_ch_median = np.mean(per_ch_medians)
+                    avg_per_ch_std = np.mean(per_ch_stds)
+                    avg_per_ch_p25 = np.mean(per_ch_p25s)
+                    avg_per_ch_p75 = np.mean(per_ch_p75s)
+                    avg_per_ch_p90 = np.mean(per_ch_p90s)
+                    avg_per_ch_p95 = np.mean(per_ch_p95s)
+                    avg_per_ch_p99 = np.mean(per_ch_p99s)
+                    avg_per_ch_zero_pct = np.mean(per_ch_zero_pcts)
+
+                    print(f"\nWeight Flipping Statistics:")
+                    print(f"  Total flips across all layers: {int(total_flips):,}")
+                    print(f"  Mean flips per layer: {mean_flips_per_layer:,.1f}")
+                    print(f"  Median flips per layer: {median_flips_per_layer:,.1f}")
+                    print(f"  Min: {int(min_flips):,} | Max: {int(max_flips):,}")
+                    print(f"\n  Per-Channel Statistics (averaged across layers):")
+                    print(f"    Mean flips per channel: {avg_per_ch_mean:.2f}")
+                    print(f"    Median flips per channel: {avg_per_ch_median:.2f}")
+                    print(f"    Std dev: {avg_per_ch_std:.2f}")
+                    print(f"\n    Percentiles:")
+                    print(f"      25th: {avg_per_ch_p25:.2f} | 50th: {avg_per_ch_median:.2f} | 75th: {avg_per_ch_p75:.2f}")
+                    print(f"      90th: {avg_per_ch_p90:.2f} | 95th: {avg_per_ch_p95:.2f} | 99th: {avg_per_ch_p99:.2f}")
+                    print(f"\n    Channels with 0 flips: {avg_per_ch_zero_pct:.1f}%")
+
+        except torch.cuda.OutOfMemoryError:
+            print("\n" + "=" * 80)
+            print("❌ CUDA OUT OF MEMORY ERROR")
+            print("=" * 80)
+            print("The GPU ran out of memory during quantization.")
+            print("Suggestions:")
+            print("  1. Reduce --layer-batch-size (current: {})".format(self.layer_batch_size))
+            print("  2. Reduce --n-calib (fewer calibration samples)")
+            print("  3. Reduce --max-tokens-per-sample")
+            print("  4. Use a smaller model or GPU with more VRAM")
+            print("=" * 80)
+            sys.exit(1)
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                print("\n" + "=" * 80)
+                print("❌ CUDA OUT OF MEMORY ERROR")
+                print("=" * 80)
+                print(f"Error: {e}")
+                print("Suggestions:")
+                print("  1. Reduce --layer-batch-size (current: {})".format(self.layer_batch_size))
+                print("  2. Reduce --n-calib (fewer calibration samples)")
+                print("  3. Reduce --max-tokens-per-sample")
+                print("  4. Use a smaller model or GPU with more VRAM")
+                print("=" * 80)
+                sys.exit(1)
+            else:
+                raise
 
 
 def main():
