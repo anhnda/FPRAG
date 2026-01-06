@@ -699,7 +699,8 @@ class JamesSteinHeuristicAWQQuantizerXL:
             )
             W_final_chunk = (W_quant / best_scales.unsqueeze(0)).to(original_dtype)
 
-            W_final_chunks.append(W_final_chunk)
+            # CRITICAL: Move chunk to CPU/RAM immediately to free VRAM
+            W_final_chunks.append(W_final_chunk.cpu())
             chunk_stats.append({
                 'alpha': best_alpha,
                 'error': best_error,
@@ -708,13 +709,20 @@ class JamesSteinHeuristicAWQQuantizerXL:
                 'flip_stats': flip_stats
             })
 
-            # Cleanup
+            # Cleanup VRAM
             del W_chunk, W_scaled, W_quant, W_final_chunk, scaled_act_mean
             torch.cuda.empty_cache()
 
-        # Combine all chunks
-        W_final = torch.cat(W_final_chunks, dim=0)
+        # Combine all chunks on CPU first
+        print(f"     Combining {num_chunks} chunks from RAM...")
+        W_final_cpu = torch.cat(W_final_chunks, dim=0)
+
+        # Move back to device and assign
+        W_final = W_final_cpu.to(module.weight.device)
         module.weight.data = W_final
+
+        # Keep in CPU for saving (will be moved back to device by model.save_pretrained)
+        del W_final_cpu
 
         # Store average statistics
         avg_alpha = np.mean([s['alpha'] for s in chunk_stats])

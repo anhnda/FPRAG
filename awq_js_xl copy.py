@@ -1,21 +1,26 @@
 """
-Dynamic Heuristic AWQ - XL Version with Dynamic Outlier Detection
+James-Stein Heuristic AWQ - XL Version with James-Stein Mean Estimation
 
-This version extends awq_sh_xl.py with dynamic outlier detection using the Kneedle algorithm.
+This version extends awq_dh_xl.py with James-Stein estimator for activation means.
 
 Key Features:
-- Same base as awq_sh_xl.py (Heuristic-Guided Global Greedy Rounding)
+- Same base as awq_dh_xl.py (Heuristic-Guided Global Greedy Rounding)
 - SPECIAL: Splits lm_head into chunks to avoid OOM
 - L2 salience metric
-- **DYNAMIC OUTLIER DETECTION**: Uses Kneedle algorithm on sorted E[X] instead of fixed percent
+- Dynamic outlier detection using Kneedle algorithm
+- **JAMES-STEIN ESTIMATOR**: Uses shrinkage estimation for E[X] instead of direct mean
 - Batched sequential quantization
 
-Dynamic Outlier Detection:
-- Instead of fixed outlier_percent (e.g., 5%), we use Kneedle algorithm
-- Apply Kneedle to the first half of sorted E[X] values
-- Add tolerance/offset to the knee point as anchor
-- Channels above anchor are considered outliers
-- More adaptive to the actual activation distribution per layer
+James-Stein Estimator:
+- Instead of using direct sample mean E[X] for each channel, we use James-Stein shrinkage
+- Formula: μ̂_JS[j] = μ̄ + (1 - c) × (X̄[j] - μ̄)
+  where:
+  - μ̄ = grand mean across all channels
+  - X̄[j] = sample mean for channel j
+  - c = shrinkage factor = (p - 2) × σ² / Σ(X̄[j] - μ̄)²
+- Provably dominates MLE (simple mean) when p ≥ 3 in terms of MSE
+- Shrinks extreme channel means toward the grand mean
+- More robust to sampling noise in activation statistics
 """
 
 import torch
@@ -109,10 +114,72 @@ def find_knee_point(values, tolerance_offset=0.0):
     return knee_idx
 
 
-class DynamicHeuristicAWQQuantizerXL:
+def compute_james_stein_mean(raw_means, variance_estimate=None):
+    """
+    Apply James-Stein shrinkage estimator to channel-wise means.
+
+    The James-Stein estimator shrinks individual means toward the grand mean,
+    provably dominating the MLE (simple mean) in terms of MSE when p ≥ 3.
+
+    Args:
+        raw_means: Tensor of shape [in_features] containing sample means for each channel
+        variance_estimate: Optional variance estimate. If None, uses empirical variance.
+
+    Returns:
+        Tensor of James-Stein estimated means
+
+    Formula:
+        μ̂_JS[j] = μ̄ + (1 - c) × (X̄[j] - μ̄)
+        where c = (p - 2) × σ² / Σ(X̄[j] - μ̄)²
+    """
+    p = len(raw_means)
+
+    # Need at least 3 dimensions for James-Stein to be beneficial
+    if p < 3:
+        return raw_means
+
+    # Compute grand mean
+    grand_mean = raw_means.mean()
+
+    # Compute deviations from grand mean
+    deviations = raw_means - grand_mean
+
+    # Compute sum of squared deviations
+    sum_sq_dev = (deviations ** 2).sum()
+
+    # Prevent division by zero
+    if sum_sq_dev < 1e-10:
+        # All means are the same, no shrinkage needed
+        return raw_means
+
+    # Estimate variance
+    if variance_estimate is None:
+        # Use a conservative estimate: mean absolute deviation squared
+        # This is more robust to outliers than variance
+        variance_estimate = ((raw_means - grand_mean).abs().mean()) ** 2
+        # Add small constant for numerical stability
+        variance_estimate = variance_estimate.clamp(min=1e-8)
+
+    # Compute shrinkage factor c
+    # c = (p - 2) × σ² / Σ(X̄[j] - μ̄)²
+    shrinkage_factor = ((p - 2) * variance_estimate) / sum_sq_dev
+
+    # Clamp shrinkage factor to [0, 1] for stability
+    # c > 1 means we overshoot, c < 0 means we expand (both bad)
+    shrinkage_factor = shrinkage_factor.clamp(0, 1)
+
+    # Apply James-Stein shrinkage
+    # μ̂_JS[j] = μ̄ + (1 - c) × (X̄[j] - μ̄)
+    js_means = grand_mean + (1 - shrinkage_factor) * deviations
+
+    return js_means
+
+
+class JamesSteinHeuristicAWQQuantizerXL:
     def __init__(self, model, tokenizer, device="cuda", bits=4, n_grid=20,
                  group_size=128, use_heuristic=True, knee_tolerance=0.1, max_tokens_per_sample=512,
-                 layer_batch_size=16, lmhead_chunks=4, max_flip_percent=0.05):
+                 layer_batch_size=16, lmhead_chunks=4, max_flip_percent=0.05,
+                 use_james_stein=True):
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
@@ -125,18 +192,20 @@ class DynamicHeuristicAWQQuantizerXL:
         self.layer_batch_size = layer_batch_size
         self.lmhead_chunks = lmhead_chunks
         self.max_flip_percent = max_flip_percent  # Max percentage of channel size that can be flipped
+        self.use_james_stein = use_james_stein  # Enable/disable James-Stein estimation
 
         # Storage for activations
         self.activation_data = {}
         self.hooks = []
         self.layer_scales = {}
 
-        print(f"\n[Dynamic Heuristic AWQ Quantizer XL Initialized]")
+        print(f"\n[James-Stein Heuristic AWQ Quantizer XL Initialized]")
         print(f"  Target bits: {bits}")
         print(f"  Group size: {group_size}")
         print(f"  Token subsampling: {max_tokens_per_sample} tokens/sample")
         print(f"  Layer batch size: {layer_batch_size}")
         print(f"  Use heuristic: {use_heuristic}")
+        print(f"  Use James-Stein mean estimation: {use_james_stein}")
         if use_heuristic:
             print(f"  Outlier detection: DYNAMIC (Kneedle algorithm on sorted E[X])")
             print(f"  Knee tolerance offset: {knee_tolerance:.8f}")
@@ -170,7 +239,12 @@ class DynamicHeuristicAWQQuantizerXL:
 
     @torch.no_grad()
     def get_activation_stats(self, name):
-        """Compute L2 salience (E[X²]) and raw mean (E[X]) using FLOAT32 precision."""
+        """
+        Compute L2 salience (E[X²]) and James-Stein estimated mean using FLOAT32 precision.
+
+        Returns:
+            tuple: (salience, js_mean) where js_mean uses James-Stein shrinkage
+        """
         if name not in self.activation_data or len(self.activation_data[name]) == 0:
             return None, None
 
@@ -190,7 +264,13 @@ class DynamicHeuristicAWQQuantizerXL:
         salience = (l2_sum / total_samples)
         raw_mean = (mean_sum / total_samples)
 
-        return salience, raw_mean
+        # Apply James-Stein estimator to the mean
+        if self.use_james_stein:
+            js_mean = compute_james_stein_mean(raw_mean)
+        else:
+            js_mean = raw_mean
+
+        return salience, js_mean
 
     @torch.no_grad()
     def compute_dynamic_outlier_threshold(self, activation_means, debug=False):
@@ -256,7 +336,7 @@ class DynamicHeuristicAWQQuantizerXL:
         Vectorized implementation of 'quantize_groupwise_global_greedy' with DYNAMIC outlier detection.
 
         Returns:
-            tuple: (W_dequant, outlier_percent) if apply_heuristic=True, else (W_dequant, None)
+            tuple: (W_dequant, outlier_percent, flip_stats) if apply_heuristic=True, else (W_dequant, None, flip_stats)
         """
         out_features, in_features = W.shape
         device = W.device
@@ -414,13 +494,13 @@ class DynamicHeuristicAWQQuantizerXL:
             in_features = module.weight.shape[1]
             return torch.ones(in_features).to(self.device), 0.0, 0.0
 
-        activation_salience, raw_mean = self.get_activation_stats(name)
+        activation_salience, js_mean = self.get_activation_stats(name)
         if activation_salience is None:
             in_features = module.weight.shape[1]
             return torch.ones(in_features).to(self.device), 0.0, 0.0
 
         activation_salience = activation_salience.to(self.device).to(module.weight.dtype)
-        raw_mean = raw_mean.to(self.device).to(module.weight.dtype)
+        js_mean = js_mean.to(self.device).to(module.weight.dtype)
 
         # Subsample for speed
         X_list = self.activation_data[name]
@@ -453,7 +533,7 @@ class DynamicHeuristicAWQQuantizerXL:
             scales = activation_salience.pow(alpha)
 
             W_scaled = W * scales.unsqueeze(0)
-            scaled_act_mean = raw_mean / scales
+            scaled_act_mean = js_mean / scales
 
             W_quant, _, _ = self.quantize_weight_heuristic_groupwise(
                 W_scaled,
@@ -490,7 +570,7 @@ class DynamicHeuristicAWQQuantizerXL:
             in_features = module.weight.shape[1]
             return torch.ones(in_features).to(self.device), 0.0, 0.0
 
-        activation_salience, raw_mean = self.get_activation_stats(name)
+        activation_salience, js_mean = self.get_activation_stats(name)
         if activation_salience is None:
             if debug:
                 print(f"  DEBUG: No activation salience for {name}, using default scales")
@@ -503,7 +583,7 @@ class DynamicHeuristicAWQQuantizerXL:
                   f"mean={activation_salience.mean():.6f}, max={activation_salience.max():.6f}")
 
         activation_salience = activation_salience.to(self.device).to(module.weight.dtype)
-        raw_mean = raw_mean.to(self.device).to(module.weight.dtype)
+        js_mean = js_mean.to(self.device).to(module.weight.dtype)
 
         # Prepare calibration data - use fewer samples for lm_head
         X_list = self.activation_data[name]
@@ -540,7 +620,7 @@ class DynamicHeuristicAWQQuantizerXL:
             scales = activation_salience.pow(alpha)
 
             W_scaled = W * scales.unsqueeze(0)
-            scaled_act_mean = raw_mean / scales
+            scaled_act_mean = js_mean / scales
 
             W_quant, _, _ = self.quantize_weight_heuristic_groupwise(
                 W_scaled,
@@ -583,11 +663,11 @@ class DynamicHeuristicAWQQuantizerXL:
         print(f"     Shape: {W.shape} ({W.numel() / 1e6:.1f}M parameters)")
 
         # Get activation stats once for all chunks
-        _, raw_mean = self.get_activation_stats(name)
-        if raw_mean is None:
-            raw_mean = torch.zeros(in_features, device=self.device, dtype=W.dtype)
+        _, js_mean = self.get_activation_stats(name)
+        if js_mean is None:
+            js_mean = torch.zeros(in_features, device=self.device, dtype=W.dtype)
         else:
-            raw_mean = raw_mean.to(self.device).to(W.dtype)
+            js_mean = js_mean.to(self.device).to(W.dtype)
 
         # Calculate chunk boundaries
         chunk_size = out_features // num_chunks
@@ -610,7 +690,7 @@ class DynamicHeuristicAWQQuantizerXL:
             # Scale and quantize this chunk
             W_chunk = W[start_idx:end_idx, :]
             W_scaled = W_chunk * best_scales.unsqueeze(0)
-            scaled_act_mean = raw_mean / best_scales
+            scaled_act_mean = js_mean / best_scales
 
             W_quant, outlier_pct, flip_stats = self.quantize_weight_heuristic_groupwise(
                 W_scaled,
@@ -619,8 +699,7 @@ class DynamicHeuristicAWQQuantizerXL:
             )
             W_final_chunk = (W_quant / best_scales.unsqueeze(0)).to(original_dtype)
 
-            # CRITICAL: Move chunk to CPU/RAM immediately to free VRAM
-            W_final_chunks.append(W_final_chunk.cpu())
+            W_final_chunks.append(W_final_chunk)
             chunk_stats.append({
                 'alpha': best_alpha,
                 'error': best_error,
@@ -629,20 +708,13 @@ class DynamicHeuristicAWQQuantizerXL:
                 'flip_stats': flip_stats
             })
 
-            # Cleanup VRAM
+            # Cleanup
             del W_chunk, W_scaled, W_quant, W_final_chunk, scaled_act_mean
             torch.cuda.empty_cache()
 
-        # Combine all chunks on CPU first
-        print(f"     Combining {num_chunks} chunks from RAM...")
-        W_final_cpu = torch.cat(W_final_chunks, dim=0)
-
-        # Move back to device and assign
-        W_final = W_final_cpu.to(module.weight.device)
+        # Combine all chunks
+        W_final = torch.cat(W_final_chunks, dim=0)
         module.weight.data = W_final
-
-        # Keep in CPU for saving (will be moved back to device by model.save_pretrained)
-        del W_final_cpu
 
         # Store average statistics
         avg_alpha = np.mean([s['alpha'] for s in chunk_stats])
@@ -698,21 +770,21 @@ class DynamicHeuristicAWQQuantizerXL:
         print(f"             {outlier_str}")
         print(f"             {flips_str}")
 
-        del W_final_chunks, chunk_stats, W_final, raw_mean
+        del W_final_chunks, chunk_stats, W_final, js_mean
         torch.cuda.empty_cache()
 
     @torch.no_grad()
     def quantize_layer(self, name, module):
-        """Apply Dynamic Heuristic AWQ Quantization."""
+        """Apply James-Stein Heuristic AWQ Quantization."""
         best_scales, best_alpha, best_error = self.search_best_scale(name, module)
 
         W = module.weight.data
         original_dtype = W.dtype
         W_scaled = W * best_scales.unsqueeze(0)
 
-        _, raw_mean = self.get_activation_stats(name)
-        if raw_mean is not None:
-            scaled_act_mean = (raw_mean.to(self.device).to(W.dtype) / best_scales)
+        _, js_mean = self.get_activation_stats(name)
+        if js_mean is not None:
+            scaled_act_mean = (js_mean.to(self.device).to(W.dtype) / best_scales)
         else:
             scaled_act_mean = torch.zeros(W.shape[1], device=W.device, dtype=W.dtype)
 
@@ -779,7 +851,7 @@ class DynamicHeuristicAWQQuantizerXL:
         """Batched sequential quantization with special lm_head handling."""
         try:
             print("\n" + "=" * 80)
-            print("Batched Sequential Quantization (Dynamic Heuristic XL Version)")
+            print("Batched Sequential Quantization (James-Stein XL Version)")
             print("=" * 80)
             print(f"  Strategy: Process {self.layer_batch_size} layers per batch")
 
@@ -956,21 +1028,26 @@ def main():
     parser.add_argument("--n-calib", type=int, default=128, help="Number of calibration samples")
     parser.add_argument("--n-grid", type=int, default=20)
     parser.add_argument("--group-size", type=int, default=128)
+    parser.add_argument("--bits", type=int, default=4, choices=[3, 4], help="Quantization bit width (default: 4)")
     parser.add_argument("--use-heuristic", action="store_true", default=True,
                        help="Enable heuristic rounding (default: True)")
     parser.add_argument("--no-heuristic", dest="use_heuristic", action="store_false",
                        help="Disable heuristic rounding")
+    parser.add_argument("--use-james-stein", action="store_true", default=True,
+                       help="Enable James-Stein mean estimation (default: True)")
+    parser.add_argument("--no-james-stein", dest="use_james_stein", action="store_false",
+                       help="Disable James-Stein mean estimation")
     parser.add_argument("--knee-tolerance", type=float, default=0.000,
-                       help="Tolerance offset for knee point (default: 0.1, higher = more conservative)")
-    parser.add_argument("--max-flip-percent", type=float, default=0.01,
+                       help="Tolerance offset for knee point (default: 0.000, higher = more conservative)")
+    parser.add_argument("--max-flip-percent", type=float, default=0.05,
                        help="Max percentage of channel size that can be flipped (default: 0.05 = 5%%)")
     parser.add_argument("--max-tokens-per-sample", type=int, default=2048,
                        help="Max tokens to store per sample (default: 2048)")
     parser.add_argument("--layer-batch-size", type=int, default=16,
                        help="Number of layers to process per batch (default: 16)")
-    parser.add_argument("--lmhead-chunks", type=int, default=4,
+    parser.add_argument("--lmhead-chunks", type=int, default=8,
                        help="Number of chunks to split lm_head into (default: 4, higher = less memory)")
-    parser.add_argument("--output-dir", type=str, default="./quantized_models/model_awq_dh_xl")
+    parser.add_argument("--output-dir", type=str, default="./quantized_models/model_awq_js_xl")
     parser.add_argument("--model-path", type=str, default="./models/Mistral-7B-v0.3",
                        help="Model name or local path")
     parser.add_argument("--seed", type=int, default=42)
@@ -990,13 +1067,14 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     print("=" * 80)
-    print("Dynamic Heuristic AWQ (XL Version)")
+    print("James-Stein Heuristic AWQ (XL Version)")
     print(f"Target Model: {model_name}")
     print("=" * 80)
     print(f"Device: {device}")
     print(f"Group size: {args.group_size}")
     print(f"Layer Batch Size: {args.layer_batch_size}")
     print(f"Use heuristic: {args.use_heuristic}")
+    print(f"Use James-Stein estimator: {args.use_james_stein}")
     print(f"Dynamic outlier detection: Kneedle algorithm")
     print(f"Knee tolerance offset: {args.knee_tolerance}")
     print(f"Max flip percent per channel: {args.max_flip_percent*100:.1f}%")
@@ -1027,11 +1105,11 @@ def main():
     else:
         calib_texts = get_wikitext2_calibration_data(tokenizer, n_samples=args.n_calib, seqlen=2048, seed=args.seed, cache_dir=args.cache_dir)
 
-    quantizer = DynamicHeuristicAWQQuantizerXL(
+    quantizer = JamesSteinHeuristicAWQQuantizerXL(
         model=model,
         tokenizer=tokenizer,
         device=device,
-        bits=4,
+        bits=args.bits,
         n_grid=args.n_grid,
         group_size=args.group_size,
         use_heuristic=args.use_heuristic,
@@ -1039,7 +1117,8 @@ def main():
         max_tokens_per_sample=args.max_tokens_per_sample,
         layer_batch_size=args.layer_batch_size,
         lmhead_chunks=args.lmhead_chunks,
-        max_flip_percent=args.max_flip_percent
+        max_flip_percent=args.max_flip_percent,
+        use_james_stein=args.use_james_stein
     )
 
     # Use batched sequential quantization (optimal memory/speed balance)
