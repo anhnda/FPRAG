@@ -585,11 +585,20 @@ class JamesSteinHeuristicAWQQuantizerXL:
         activation_salience = activation_salience.to(self.device).to(module.weight.dtype)
         js_mean = js_mean.to(self.device).to(module.weight.dtype)
 
-        # Prepare calibration data - use fewer samples for lm_head
+        # Prepare calibration data - use MUCH fewer samples for lm_head to save memory
         X_list = self.activation_data[name]
         X_cpu = torch.cat([x.reshape(-1, x.shape[-1]) for x in X_list], dim=0)
 
-        max_samples = min(1024, X_cpu.shape[0])  # Reduced for lm_head
+        # CRITICAL: Reduce samples significantly for lm_head chunks to avoid OOM
+        # For large lm_heads (128k vocab), even 256 samples use ~1GB during grid search
+        chunk_size = out_end - out_start
+        if chunk_size > 16000:  # Large chunk (>16k output dims)
+            max_samples = min(128, X_cpu.shape[0])  # Very aggressive reduction
+        elif chunk_size > 8000:  # Medium chunk (>8k output dims)
+            max_samples = min(256, X_cpu.shape[0])
+        else:  # Small chunk
+            max_samples = min(512, X_cpu.shape[0])
+
         if X_cpu.shape[0] > max_samples:
             indices = torch.randperm(X_cpu.shape[0])[:max_samples]
             X_search = X_cpu[indices].to(self.device)
