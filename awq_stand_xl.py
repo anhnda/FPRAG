@@ -172,8 +172,18 @@ class GroupWiseAWQAsymmetricL2Quantizer:
         X_list = self.activation_data[name]
         X_cpu = torch.cat([x.reshape(-1, x.shape[-1]) for x in X_list], dim=0)
 
-        # Limit samples for the grid search to avoid OOM
-        max_samples = min(2048, X_cpu.shape[0])
+        # CRITICAL: Adaptive sampling based on layer size to avoid OOM
+        W = module.weight.data
+        out_features = W.shape[0]
+
+        # For very large layers (like lm_head), reduce samples significantly
+        if out_features > 100000:  # Very large (>100k output dims)
+            max_samples = min(512, X_cpu.shape[0])
+        elif out_features > 50000:  # Large (>50k output dims)
+            max_samples = min(1024, X_cpu.shape[0])
+        else:  # Normal layers
+            max_samples = min(2048, X_cpu.shape[0])
+
         if X_cpu.shape[0] > max_samples:
             indices = torch.randperm(X_cpu.shape[0])[:max_samples]
             X_search = X_cpu[indices].to(self.device)
@@ -181,8 +191,6 @@ class GroupWiseAWQAsymmetricL2Quantizer:
             X_search = X_cpu.to(self.device)
 
         del X_cpu
-
-        W = module.weight.data
         b = module.bias.data if module.bias is not None else None
 
         # Convert X_search to match weight dtype (bfloat16) for matmul compatibility
