@@ -94,52 +94,59 @@ class AWQGQAQuantizer(JamesSteinHeuristicAWQQuantizerXL):
 
     def quantize_layer(self, name, module):
         """Override to store James-Stein means AND heuristic integer weights for GQA layers."""
-        if self.apply_gqa_reflip and is_gqa_layer(name):
-            # Store JS means
-            _, js_mean = self.get_activation_stats(name)
-            if js_mean is not None:
-                self.gqa_js_means[name] = js_mean.cpu().float()
+        try:
+            if self.apply_gqa_reflip and is_gqa_layer(name):
+                # Store JS means
+                _, js_mean = self.get_activation_stats(name)
+                if js_mean is not None:
+                    self.gqa_js_means[name] = js_mean.cpu().float()
 
-            # CRITICAL: Quantize and store integer weights BEFORE parent class modifies them
-            best_scales, best_alpha, best_error = self.search_best_scale(name, module)
-            W = module.weight.data
-            W_scaled = W * best_scales.unsqueeze(0)
+                # CRITICAL: Quantize and store integer weights BEFORE parent class modifies them
+                best_scales, best_alpha, best_error = self.search_best_scale(name, module)
+                W = module.weight.data
+                W_scaled = W * best_scales.unsqueeze(0)
 
-            if js_mean is not None:
-                scaled_act_mean = (js_mean.to(self.device).to(W.dtype) / best_scales)
+                if js_mean is not None:
+                    scaled_act_mean = (js_mean.to(self.device).to(W.dtype) / best_scales)
+                else:
+                    scaled_act_mean = torch.zeros(W.shape[1], device=W.device, dtype=W.dtype)
+
+                # Call the quantization function directly to get integer weights
+                W_quant, scales, zp, W_int = self.quantize_weight_heuristic_with_int_output(
+                    W_scaled, scaled_act_mean, apply_heuristic=self.use_heuristic
+                )
+
+                # Store the heuristic integer weights, scales, and zero points
+                self.gqa_heuristic_int_weights[name + '.weight'] = W_int.cpu()
+                self.gqa_heuristic_scales[name + '.weight'] = scales.cpu()
+                self.gqa_heuristic_zp[name + '.weight'] = zp.cpu()
+                self.gqa_awq_scales[name + '.weight'] = best_scales.cpu()  # CRITICAL: Store AWQ scales!
+
+                # Apply the quantized weights to the module (same as parent class)
+                W_final = (W_quant / best_scales.unsqueeze(0)).to(W.dtype)
+                module.weight.data = W_final
+
+                # Store layer scales (same as parent class)
+                self.layer_scales[name] = {
+                    'scales': best_scales.cpu(),
+                    'alpha': best_alpha,
+                    'error': best_error,
+                }
+
+                # Cleanup
+                del best_scales, scaled_act_mean, W_scaled, W_quant, W_final, W_int, scales, zp
+                if name in self.activation_data:
+                    del self.activation_data[name]
+                torch.cuda.empty_cache()
             else:
-                scaled_act_mean = torch.zeros(W.shape[1], device=W.device, dtype=W.dtype)
-
-            # Call the quantization function directly to get integer weights
-            W_quant, scales, zp, W_int = self.quantize_weight_heuristic_with_int_output(
-                W_scaled, scaled_act_mean, apply_heuristic=self.use_heuristic
-            )
-
-            # Store the heuristic integer weights, scales, and zero points
-            self.gqa_heuristic_int_weights[name + '.weight'] = W_int.cpu()
-            self.gqa_heuristic_scales[name + '.weight'] = scales.cpu()
-            self.gqa_heuristic_zp[name + '.weight'] = zp.cpu()
-            self.gqa_awq_scales[name + '.weight'] = best_scales.cpu()  # CRITICAL: Store AWQ scales!
-
-            # Apply the quantized weights to the module (same as parent class)
-            W_final = (W_quant / best_scales.unsqueeze(0)).to(W.dtype)
-            module.weight.data = W_final
-
-            # Store layer scales (same as parent class)
-            self.layer_scales[name] = {
-                'scales': best_scales.cpu(),
-                'alpha': best_alpha,
-                'error': best_error,
-            }
-
-            # Cleanup
-            del best_scales, scaled_act_mean, W_scaled, W_quant, W_final, W_int, scales, zp
-            if name in self.activation_data:
-                del self.activation_data[name]
-            torch.cuda.empty_cache()
-        else:
-            # For non-GQA layers, use parent class method
-            super().quantize_layer(name, module)
+                # For non-GQA layers, use parent class method
+                super().quantize_layer(name, module)
+        except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+            # Re-raise OOM errors immediately
+            if isinstance(e, torch.cuda.OutOfMemoryError) or "out of memory" in str(e).lower():
+                raise
+            # Re-raise other errors as well
+            raise
 
     def quantize_weight_heuristic_with_int_output(self, W, group_activation_means, apply_heuristic=True):
         """

@@ -559,6 +559,14 @@ class GroupWiseAWQAsymmetricL2Quantizer:
 
                         quantized_count += 1
 
+                    except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+                        # Re-raise OOM errors to stop the script
+                        if isinstance(e, torch.cuda.OutOfMemoryError) or "out of memory" in str(e).lower():
+                            raise
+                        # For other errors, log and continue
+                        print(f"\n⚠️  Error quantizing {name}: {e}")
+                        skipped_count += 1
+                        continue
                     except Exception as e:
                         print(f"\n⚠️  Error quantizing {name}: {e}")
                         skipped_count += 1
