@@ -630,10 +630,18 @@ class DynamicHeuristicAWQQuantizerXL:
             W_scaled = W_chunk * best_scales.unsqueeze(0)
             scaled_act_mean = raw_mean / best_scales
 
+            # CRITICAL: For very large chunks, disable heuristic to avoid OOM
+            # Heuristic creates intermediate tensors of size (out_chunk × in_features)
+            chunk_out_dim = end_idx - start_idx
+            use_heuristic_for_chunk = self.use_heuristic and (chunk_out_dim <= 16384)
+
+            if not use_heuristic_for_chunk and self.use_heuristic:
+                print(f"       ⚠️  Chunk too large ({chunk_out_dim} rows), disabling heuristic to save memory")
+
             W_quant, outlier_pct, flip_stats = self.quantize_weight_heuristic_groupwise(
                 W_scaled,
                 scaled_act_mean,
-                apply_heuristic=self.use_heuristic
+                apply_heuristic=use_heuristic_for_chunk
             )
             W_final_chunk = (W_quant / best_scales.unsqueeze(0)).to(original_dtype)
 
