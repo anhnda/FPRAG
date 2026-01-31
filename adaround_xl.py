@@ -146,9 +146,10 @@ class AdaRoundQuantizerXL:
         print(f"\n[AdaRound Quantizer XL Initialized]")
         print(f"  Target bits: {bits}")
         print(f"  Group size: {group_size}")
-        print(f"  AdaRound iterations: {adaround_iters}")
+        print(f"  AdaRound iterations: {adaround_iters} (max, early stopping enabled)")
         print(f"  Learning rate: {adaround_lr}")
         print(f"  Regularization weight: {reg_weight}")
+        print(f"  Calibration: 256 samples max, mini-batch size 64")
         print(f"  Token subsampling: {max_tokens_per_sample} tokens/sample")
         print(f"  Layer batch size: {layer_batch_size}")
         print(f"  Quantization: GROUP-WISE ASYMMETRIC [0, {2**bits - 1}]")
@@ -285,9 +286,11 @@ class AdaRoundQuantizerXL:
         mini_batch_size = 64
         num_mini_batches = (max_samples + mini_batch_size - 1) // mini_batch_size
 
-        # Optimization loop
+        # Optimization loop with early stopping
         best_loss = float('inf')
         best_v = None
+        patience_counter = 0
+        patience_limit = 500  # Stop if no improvement for 500 iterations
 
         for i in range(num_iterations):
             optimizer.zero_grad()
@@ -323,10 +326,20 @@ class AdaRoundQuantizerXL:
             total_loss.backward()
             optimizer.step()
 
-            # Track best
-            if total_loss.item() < best_loss:
-                best_loss = total_loss.item()
+            # Track best and early stopping
+            current_loss = total_loss.item()
+            if current_loss < best_loss - 1e-6:  # Significant improvement
+                best_loss = current_loss
                 best_v = wrapper.v.data.clone()
+                patience_counter = 0
+            else:
+                patience_counter += 1
+
+            # Early stopping
+            if patience_counter >= patience_limit:
+                if debug:
+                    print(f"      Early stopping at iter {i}/{num_iterations} (no improvement for {patience_limit} iters)")
+                break
 
             if debug and i % 1000 == 0:
                 print(f"      Iter {i}/{num_iterations}: Total={total_loss.item():.6f}, "
@@ -580,12 +593,12 @@ def main():
     parser.add_argument("--n-calib", type=int, default=128, help="Number of calibration samples")
     parser.add_argument("--group-size", type=int, default=128)
     parser.add_argument("--bits", type=int, default=4, choices=[3, 4], help="Quantization bit width (default: 4)")
-    parser.add_argument("--adaround-iters", type=int, default=10000,
-                       help="Number of AdaRound optimization iterations per layer (default: 10000)")
+    parser.add_argument("--adaround-iters", type=int, default=2000,
+                       help="Number of AdaRound optimization iterations per layer (default: 2000, early stopping at 500)")
     parser.add_argument("--adaround-lr", type=float, default=1e-3,
                        help="Learning rate for AdaRound optimization (default: 1e-3)")
-    parser.add_argument("--reg-weight", type=float, default=0.01,
-                       help="Weight for regularization term (default: 0.01)")
+    parser.add_argument("--reg-weight", type=float, default=0.001,
+                       help="Weight for regularization term (default: 0.001)")
     parser.add_argument("--max-tokens-per-sample", type=int, default=2048,
                        help="Max tokens to store per sample (default: 2048)")
     parser.add_argument("--layer-batch-size", type=int, default=16,
