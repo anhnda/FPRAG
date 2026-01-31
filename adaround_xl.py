@@ -247,7 +247,7 @@ class AdaRoundQuantizerXL:
 
     def optimize_layer_adaround(self, name, module, calibration_data_cpu, num_iterations=10000, debug=False):
         """
-        Optimize rounding for a single layer using AdaRound.
+        Optimize rounding for a single layer using AdaRound with mini-batch processing.
 
         Args:
             name: Layer name
@@ -273,17 +273,17 @@ class AdaRoundQuantizerXL:
         wrapper = AdaRoundOptimizer(module, scale, w_floor, iterations=num_iterations).to(self.device)
         optimizer = torch.optim.Adam([wrapper.v], lr=self.adaround_lr)
 
-        # Subsample calibration data for speed (use fewer samples for AdaRound)
-        max_samples = min(1024, calibration_data_cpu.shape[0])
+        # Subsample calibration data for speed (REDUCED from 1024 to 256 for memory)
+        max_samples = min(256, calibration_data_cpu.shape[0])
         if calibration_data_cpu.shape[0] > max_samples:
             indices = torch.randperm(calibration_data_cpu.shape[0])[:max_samples]
-            calib_data = calibration_data_cpu[indices].to(self.device).to(original_dtype)
+            calib_data_cpu_subset = calibration_data_cpu[indices]
         else:
-            calib_data = calibration_data_cpu.to(self.device).to(original_dtype)
+            calib_data_cpu_subset = calibration_data_cpu
 
-        # Get ground truth (FP32 output)
-        with torch.no_grad():
-            target_out = F.linear(calib_data, W, module.bias)
+        # Mini-batch size for processing (MEMORY OPTIMIZATION: process in smaller chunks)
+        mini_batch_size = 64
+        num_mini_batches = (max_samples + mini_batch_size - 1) // mini_batch_size
 
         # Optimization loop
         best_loss = float('inf')
@@ -292,14 +292,34 @@ class AdaRoundQuantizerXL:
         for i in range(num_iterations):
             optimizer.zero_grad()
 
-            # Quantized forward pass
-            current_out = wrapper(calib_data)
+            total_rec_loss = 0.0
 
-            # MSE Loss + Regularization
-            rec_loss = F.mse_loss(current_out, target_out)
+            # Process calibration data in mini-batches to save memory
+            for mb_idx in range(num_mini_batches):
+                mb_start = mb_idx * mini_batch_size
+                mb_end = min(mb_start + mini_batch_size, max_samples)
+
+                # Load only current mini-batch to GPU
+                calib_mb = calib_data_cpu_subset[mb_start:mb_end].to(self.device).to(original_dtype)
+
+                # Ground truth for this mini-batch
+                with torch.no_grad():
+                    target_mb = F.linear(calib_mb, W, module.bias)
+
+                # Quantized forward pass
+                current_mb = wrapper(calib_mb)
+
+                # Accumulate reconstruction loss
+                rec_loss_mb = F.mse_loss(current_mb, target_mb)
+                total_rec_loss += rec_loss_mb * (mb_end - mb_start) / max_samples
+
+                # Free mini-batch memory immediately
+                del calib_mb, target_mb, current_mb
+
+            # Regularization (computed once, not per mini-batch)
             reg_loss = self.reg_weight * compute_adaround_reg(wrapper.v, i, num_iterations)
 
-            total_loss = rec_loss + reg_loss
+            total_loss = total_rec_loss + reg_loss
             total_loss.backward()
             optimizer.step()
 
@@ -310,7 +330,11 @@ class AdaRoundQuantizerXL:
 
             if debug and i % 1000 == 0:
                 print(f"      Iter {i}/{num_iterations}: Total={total_loss.item():.6f}, "
-                      f"Rec={rec_loss.item():.6f}, Reg={reg_loss.item():.6f}")
+                      f"Rec={total_rec_loss.item():.6f}, Reg={reg_loss.item():.6f}")
+
+            # Periodic cache clearing
+            if i % 100 == 0:
+                torch.cuda.empty_cache()
 
         # Final hard rounding using best V
         with torch.no_grad():
@@ -321,7 +345,7 @@ class AdaRoundQuantizerXL:
             optimized_weights = (w_floor + hard_rounding) * scale
 
         # Cleanup
-        del wrapper, optimizer, calib_data, target_out, current_out, scale, zp, w_floor
+        del wrapper, optimizer, scale, zp, w_floor, calib_data_cpu_subset
         torch.cuda.empty_cache()
 
         return optimized_weights.to(original_dtype), best_loss
@@ -351,7 +375,8 @@ class AdaRoundQuantizerXL:
             'shape': list(W_optimized.shape)
         }
 
-        # Cleanup
+        # Aggressive cleanup
+        del W_optimized, calib_data_cpu
         if name in self.activation_data:
             del self.activation_data[name]
         torch.cuda.empty_cache()
