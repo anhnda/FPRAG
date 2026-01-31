@@ -116,7 +116,7 @@ def compute_adaround_reg(v_parameter, iter_count, max_iter, zeta=1.1, gamma=-0.1
 
     # Penalty: 1 - |2*h_v - 1|^beta
     # This is 0 when h_v is 0 or 1, and max when h_v is 0.5
-    reg = (1 - (2 * h_v - 1).abs().pow(beta)).sum()
+    reg = (1 - (2 * h_v - 1).abs().pow(beta)).mean()  # Use mean instead of sum
     return reg
 
 
