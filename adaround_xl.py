@@ -66,16 +66,18 @@ class AdaRoundOptimizer(nn.Module):
         out_features, in_features = layer.weight.shape
 
         # Register COMPACT scale, floor, and zero-point as buffers
-        self.register_buffer('scale_g', scale_g.float())  # [out, n_groups] fp32
-        self.register_buffer('w_floor_int', w_floor_int)  # [out, in] int8
+        # CRITICAL: scale_g as fp16 for 2× memory savings (safe for multiplicative factor)
+        self.register_buffer('scale_g', scale_g.half())  # [out, n_groups] fp16
+        self.register_buffer('w_floor_int', w_floor_int)  # [out, in] int16
         self.register_buffer('zp_g', zp_g)  # [out, n_groups] uint8
 
         # V is the learnable rounding parameter (same shape as weights)
         # CRITICAL: Initialize to fractional part WITH zero-point for asymmetric quantization
+        # Directly fill v_init chunk-by-chunk to avoid allocating extra W_frac tensor
         W = layer.weight.data.float()
+        v_init = torch.empty_like(W, dtype=torch.float32)
 
-        # Compute fractional part group-by-group using compact params
-        W_frac = torch.zeros_like(W)
+        # Compute v_init group-by-group using compact params
         for g in range(n_groups):
             j0 = g * group_size
             j1 = min((g + 1) * group_size, in_features)
@@ -85,19 +87,19 @@ class AdaRoundOptimizer(nn.Module):
             W_chunk = W[:, j0:j1]
             W_div = W_chunk / scale_g_cur
             W_shift = W_div + zp_g_cur  # Add zero-point (asymmetric!)
-            W_frac[:, j0:j1] = W_shift - torch.floor(W_shift)  # Fractional part [0, 1)
+            W_frac_chunk = W_shift - torch.floor(W_shift)  # Fractional part [0, 1)
 
-        # Clip away from exact 0/1 to avoid saturation (keep in [0.01, 0.99])
-        h_init = torch.clamp(W_frac, 0.01, 0.99)
+            # Clip away from exact 0/1 to avoid saturation (keep in [0.01, 0.99])
+            h_init_chunk = torch.clamp(W_frac_chunk, 0.01, 0.99)
 
-        # Invert rectified sigmoid to get V
-        # h = clamp(sigmoid(V) * (zeta - gamma) + gamma, 0, 1)
-        # Solve for V: sigmoid(V) = (h - gamma) / (zeta - gamma)
-        sigmoid_target = (h_init - gamma) / (zeta - gamma)
-        sigmoid_target = torch.clamp(sigmoid_target, 0.01, 0.99)  # Avoid log(0)
+            # Invert rectified sigmoid to get V
+            # h = clamp(sigmoid(V) * (zeta - gamma) + gamma, 0, 1)
+            # Solve for V: sigmoid(V) = (h - gamma) / (zeta - gamma)
+            sigmoid_target = (h_init_chunk - gamma) / (zeta - gamma)
+            sigmoid_target = torch.clamp(sigmoid_target, 0.01, 0.99)  # Avoid log(0)
 
-        # Inverse sigmoid: V = log(s / (1-s))
-        v_init = torch.log(sigmoid_target / (1.0 - sigmoid_target))
+            # Inverse sigmoid: V = log(s / (1-s))
+            v_init[:, j0:j1] = torch.log(sigmoid_target / (1.0 - sigmoid_target))
 
         # CRITICAL: Keep V in fp32 for stable gradients (even if model is bf16)
         self.v = nn.Parameter(v_init.float(), requires_grad=True)
@@ -114,11 +116,8 @@ class AdaRoundOptimizer(nn.Module):
     def forward(self, x):
         """
         Apply the learned rounding to the weights.
-        Uses block-wise reconstruction to avoid materializing full w_q.
+        Uses block-wise reconstruction to avoid materializing full w_q AND full h_v.
         """
-        # h(V) in fp32
-        h_v = self.get_soft_rounding().float()  # [out, in]
-
         # Accumulate output group-by-group (block-wise matmul)
         batch_dims = x.shape[:-1]  # Support arbitrary batch dims
         in_features = x.shape[-1]
@@ -127,15 +126,21 @@ class AdaRoundOptimizer(nn.Module):
         # Initialize output
         out = torch.zeros(*batch_dims, out_features, device=x.device, dtype=torch.float32)
 
-        # Process each group
+        # Process each group (compute h_v chunk-wise, never materialize full h_v)
         for g in range(self.n_groups):
             j0 = g * self.group_size
             j1 = min((g + 1) * self.group_size, in_features)
 
+            # CRITICAL: Compute h_v for this chunk only (not full [out, in])
+            v_chunk = self.v[:, j0:j1]  # [out, chunk_size]
+            h_v_chunk = torch.clamp(
+                torch.sigmoid(v_chunk) * (self.zeta - self.gamma) + self.gamma,
+                0, 1
+            ).float()  # [out, chunk_size]
+
             # Reconstruct weights for this group only
             scale_g_cur = self.scale_g[:, g:g+1].float()  # [out, 1]
             w_floor_chunk = self.w_floor_int[:, j0:j1].float()  # [out, chunk_size]
-            h_v_chunk = h_v[:, j0:j1]  # [out, chunk_size]
 
             # W_q_chunk = (w_floor + h_v) * scale
             w_q_chunk = (w_floor_chunk + h_v_chunk) * scale_g_cur  # [out, chunk_size]
@@ -316,8 +321,10 @@ class AdaRoundQuantizerXL:
             W_floor = W_floor[:, :in_features]
 
         # Convert to integers for memory efficiency
+        # CRITICAL: Use int16 for w_floor (not int8) to avoid overflow
+        # Range can be [-zp, max_int - zp] which is [-15, 15] for 4-bit
         zp_g_int = zp_g.to(torch.uint8)  # [out, n_groups] uint8
-        w_floor_int = W_floor.to(torch.int8)  # [out, in] int8 (assuming range fits)
+        w_floor_int = W_floor.to(torch.int16)  # [out, in] int16 (safe for all cases)
 
         return scale_g, zp_g_int, w_floor_int, n_groups, self.group_size
 
@@ -452,6 +459,7 @@ class AdaRoundQuantizerXL:
                 torch.cuda.empty_cache()
 
         # Final hard rounding using best V (reconstruct group-by-group)
+        # CRITICAL: Compute h_v chunk-wise to avoid materializing full [out, in] tensor
         with torch.no_grad():
             # Safety check: if best_v is None (should never happen now), use current V
             if best_v is None:
@@ -459,20 +467,28 @@ class AdaRoundQuantizerXL:
                 best_v = wrapper.v.data.clone()
 
             wrapper.v.data = best_v
-            h_v_final = wrapper.get_soft_rounding().float()
-            # Round to 0 or 1 based on optimized soft values
-            hard_rounding = (h_v_final > 0.5).float()
 
             # Reconstruct weights group-by-group using compact params
-            out_features, in_features = W.shape
+            _, in_features = W.shape
             optimized_weights = torch.zeros_like(W, dtype=torch.float32)
 
             for g in range(n_groups):
                 j0 = g * group_size
                 j1 = min((g + 1) * group_size, in_features)
+
+                # Compute h_v for this chunk only (not full tensor!)
+                v_chunk = wrapper.v[:, j0:j1]
+                h_v_chunk = torch.clamp(
+                    torch.sigmoid(v_chunk) * (wrapper.zeta - wrapper.gamma) + wrapper.gamma,
+                    0, 1
+                ).float()
+
+                # Round to 0 or 1 based on optimized soft values
+                hard_rounding_chunk = (h_v_chunk > 0.5).float()
+
+                # Reconstruct this chunk
                 scale_g_cur = scale_g[:, g:g+1].float()  # [out, 1]
                 w_floor_chunk = w_floor_int[:, j0:j1].float()  # [out, chunk_size]
-                hard_rounding_chunk = hard_rounding[:, j0:j1]  # [out, chunk_size]
 
                 # W_q = (w_floor + hard_rounding) * scale
                 optimized_weights[:, j0:j1] = (w_floor_chunk + hard_rounding_chunk) * scale_g_cur
@@ -481,7 +497,7 @@ class AdaRoundQuantizerXL:
 
         # Cleanup ALL temporary tensors (keep final_weights for return)
         del wrapper, optimizer, scale_g, zp_g, w_floor_int, calib_data_cpu_subset
-        del best_v, h_v_final, hard_rounding, optimized_weights
+        del best_v, optimized_weights
         torch.cuda.empty_cache()
         gc.collect()
 
