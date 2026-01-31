@@ -61,12 +61,20 @@ class AdaRoundOptimizer(nn.Module):
     def __init__(self, layer, weight_delta, weight_floor, iterations=10000, zeta=1.1, gamma=-0.1):
         super().__init__()
         self.layer = layer
-        self.delta = weight_delta        # Scale factor (fixed from asymmetric quantization)
-        self.w_floor = weight_floor      # floor(W / delta)
+
+        # Register scale and floor as buffers (not parameters, but need proper device handling)
+        self.register_buffer('delta', weight_delta)
+        self.register_buffer('w_floor', weight_floor)
 
         # V is the learnable rounding parameter (same shape as weights)
         # Initialized such that sigmoid(V) ≈ 0.5
-        self.v = nn.Parameter(torch.zeros_like(layer.weight))
+        # Create new tensor explicitly to avoid copying metadata from layer.weight
+        v_init = torch.zeros(
+            layer.weight.shape,
+            dtype=layer.weight.dtype,
+            device=layer.weight.device
+        )
+        self.v = nn.Parameter(v_init, requires_grad=True)
 
         # Hyperparameters (Qualcomm AIMET defaults)
         self.iterations = iterations
