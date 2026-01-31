@@ -742,7 +742,7 @@ def main():
     parser.add_argument("--use-flipping", action="store_true", default=True)
     parser.add_argument("--no-flipping", dest="use_flipping", action="store_false")
     parser.add_argument("--max-flip-percent", type=float, default=0.05)
-    parser.add_argument("--knee-tolerance", type=float, default=0.1)
+    parser.add_argument("--knee-tolerance", type=float, default=0.00)
     parser.add_argument("--output-dir", type=str, default="./quantized_models/model_adaround_flip_xl")
     parser.add_argument("--model-path", type=str, default="./models/Mistral-7B-v0.3")
     parser.add_argument("--seed", type=int, default=42)
