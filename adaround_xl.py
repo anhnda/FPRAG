@@ -362,14 +362,21 @@ class AdaRoundQuantizerXL:
 
             # Track best and early stopping
             current_loss = total_loss.item()
-            # Use relative tolerance for better robustness with fp16/bf16
-            improvement_threshold = max(1e-5, best_loss * 1e-4)  # 0.01% relative improvement
-            if current_loss < best_loss - improvement_threshold:
+
+            # Special handling for first iteration
+            if best_v is None:
                 best_loss = current_loss
                 best_v = wrapper.v.data.clone()
                 patience_counter = 0
             else:
-                patience_counter += 1
+                # Use relative tolerance for better robustness with fp16/bf16
+                improvement_threshold = max(1e-5, best_loss * 1e-4)  # 0.01% relative improvement
+                if current_loss < best_loss - improvement_threshold:
+                    best_loss = current_loss
+                    best_v = wrapper.v.data.clone()
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
 
             # Early stopping
             if patience_counter >= patience_limit:
@@ -391,6 +398,11 @@ class AdaRoundQuantizerXL:
 
         # Final hard rounding using best V
         with torch.no_grad():
+            # Safety check: if best_v is None (should never happen now), use current V
+            if best_v is None:
+                print(f"      ⚠️  WARNING: best_v is None! Using current V")
+                best_v = wrapper.v.data.clone()
+
             wrapper.v.data = best_v
             h_v_final = wrapper.get_soft_rounding()
             # Round to 0 or 1 based on optimized soft values
