@@ -324,7 +324,7 @@ class AdaRoundQuantizerXL:
         best_loss = float('inf')
         best_v = None
         patience_counter = 0
-        patience_limit = 500  # Stop if no improvement for 500 iterations
+        patience_limit = 200  # Stop if no improvement for 200 iterations (reduced from 500)
 
         for i in range(num_iterations):
             optimizer.zero_grad()
@@ -362,7 +362,9 @@ class AdaRoundQuantizerXL:
 
             # Track best and early stopping
             current_loss = total_loss.item()
-            if current_loss < best_loss - 1e-6:  # Significant improvement
+            # Use relative tolerance for better robustness with fp16/bf16
+            improvement_threshold = max(1e-5, best_loss * 1e-4)  # 0.01% relative improvement
+            if current_loss < best_loss - improvement_threshold:
                 best_loss = current_loss
                 best_v = wrapper.v.data.clone()
                 patience_counter = 0
@@ -371,13 +373,14 @@ class AdaRoundQuantizerXL:
 
             # Early stopping
             if patience_counter >= patience_limit:
-                if debug:
-                    print(f"      Early stopping at iter {i}/{num_iterations} (no improvement for {patience_limit} iters)")
+                print(f"      ⏹️  Early stopping at iter {i}/{num_iterations} (no improvement for {patience_limit} iters)")
                 break
 
-            if debug and i % 1000 == 0:
+            # Progress updates (more frequent for visibility)
+            if debug and i % 200 == 0:
                 print(f"      Iter {i}/{num_iterations}: Total={total_loss.item():.6f}, "
-                      f"Rec={total_rec_loss.item():.6f}, Reg={reg_loss.item():.6f}")
+                      f"Rec={total_rec_loss.item():.6f}, Reg={reg_loss.item():.6f}, "
+                      f"Patience={patience_counter}/{patience_limit}")
 
             # Free gradients and intermediate tensors
             del total_rec_loss, reg_loss, total_loss
@@ -659,7 +662,7 @@ def main():
     parser.add_argument("--group-size", type=int, default=128)
     parser.add_argument("--bits", type=int, default=4, choices=[3, 4], help="Quantization bit width (default: 4)")
     parser.add_argument("--adaround-iters", type=int, default=2000,
-                       help="Number of AdaRound optimization iterations per layer (default: 2000, early stopping at 500)")
+                       help="Number of AdaRound optimization iterations per layer (default: 2000, early stopping at 200)")
     parser.add_argument("--adaround-lr", type=float, default=1e-3,
                        help="Learning rate for AdaRound optimization (default: 1e-3)")
     parser.add_argument("--reg-weight", type=float, default=0.001,
