@@ -326,7 +326,6 @@ class AdaRoundQuantizerXL:
 
         return optimized_weights.to(original_dtype), best_loss
 
-    @torch.no_grad()
     def quantize_layer(self, name, module, debug=False):
         """Apply AdaRound quantization to a single layer."""
         # Get calibration data
@@ -358,7 +357,6 @@ class AdaRoundQuantizerXL:
         torch.cuda.empty_cache()
         gc.collect()
 
-    @torch.no_grad()
     def quantize_lmhead_chunked(self, name, module, num_chunks=4, debug=False):
         """
         Quantize lm_head by splitting it into chunks along output dimension.
