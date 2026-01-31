@@ -345,6 +345,9 @@ class AdaRoundQuantizerXL:
                 print(f"      Iter {i}/{num_iterations}: Total={total_loss.item():.6f}, "
                       f"Rec={total_rec_loss.item():.6f}, Reg={reg_loss.item():.6f}")
 
+            # Free gradients and intermediate tensors
+            del total_rec_loss, reg_loss, total_loss
+
             # Periodic cache clearing
             if i % 100 == 0:
                 torch.cuda.empty_cache()
@@ -356,12 +359,15 @@ class AdaRoundQuantizerXL:
             # Round to 0 or 1 based on optimized soft values
             hard_rounding = (h_v_final > 0.5).float()
             optimized_weights = (w_floor + hard_rounding) * scale
+            final_weights = optimized_weights.to(original_dtype)
 
-        # Cleanup
+        # Cleanup ALL temporary tensors (keep final_weights for return)
         del wrapper, optimizer, scale, zp, w_floor, calib_data_cpu_subset
+        del best_v, h_v_final, hard_rounding, optimized_weights
         torch.cuda.empty_cache()
+        gc.collect()
 
-        return optimized_weights.to(original_dtype), best_loss
+        return final_weights, best_loss
 
     def quantize_layer(self, name, module, debug=False):
         """Apply AdaRound quantization to a single layer."""
@@ -470,9 +476,10 @@ class AdaRoundQuantizerXL:
         loss_str = ', '.join([f'loss_{i+1}={s["loss"]:.6f}' for i, s in enumerate(chunk_stats)])
         print(f"     ✓ Done: {loss_str}")
 
-        # Cleanup
+        # Cleanup (W_final is now owned by module.weight.data, safe to delete reference)
         del W_final_chunks, chunk_stats, calib_data_cpu
         torch.cuda.empty_cache()
+        gc.collect()
 
     def calibrate_layer_batch(self, layer_names_batch, calibration_data, n_samples=500):
         """Calibrate a batch of layers simultaneously."""
