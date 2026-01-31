@@ -57,6 +57,15 @@ except ImportError:
     def get_wikitext2_calibration_data(*args, **kwargs): raise NotImplementedError("Please provide calibration_utils.py")
 
 
+def clear_gpu_cache():
+    """Device-agnostic GPU cache clearing."""
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    elif torch.backends.mps.is_available():
+        torch.mps.empty_cache()
+    gc.collect()
+
+
 class AdaRoundOptimizer(nn.Module):
     """
     AdaRound wrapper for a single linear layer.
@@ -366,7 +375,7 @@ class AdaRoundQuantizerXL:
 
         # Cleanup
         del wrapper, optimizer, calib_data, target_out, current_out, scale, w_floor, precomputed_floor_output
-        torch.cuda.empty_cache()
+        clear_gpu_cache()
 
         return optimized_weights.to(original_dtype), best_loss, actual_iters
 
@@ -400,8 +409,7 @@ class AdaRoundQuantizerXL:
         # Cleanup
         if name in self.activation_data:
             del self.activation_data[name]
-        torch.cuda.empty_cache()
-        gc.collect()
+        clear_gpu_cache()
 
     @torch.no_grad()
     def quantize_lmhead_chunked(self, name, module, num_chunks=4, debug=False):
@@ -461,7 +469,7 @@ class AdaRoundQuantizerXL:
 
             # Cleanup
             del chunk_module, W_chunk_optimized
-            torch.cuda.empty_cache()
+            clear_gpu_cache()
 
         # Combine all chunks
         W_final = torch.cat(W_final_chunks, dim=0).to(self.device)
@@ -485,7 +493,7 @@ class AdaRoundQuantizerXL:
 
         # Cleanup
         del W_final_chunks, chunk_stats, calib_data_cpu
-        torch.cuda.empty_cache()
+        clear_gpu_cache()
 
     def calibrate_layer_batch(self, layer_names_batch, calibration_data, n_samples=500):
         """Calibrate a batch of layers simultaneously."""
@@ -512,7 +520,7 @@ class AdaRoundQuantizerXL:
 
                     # Periodic cache clearing
                     if (successful + 1) % 32 == 0:
-                        torch.cuda.empty_cache()
+                        clear_gpu_cache()
                 except Exception:
                     continue
 
@@ -520,8 +528,7 @@ class AdaRoundQuantizerXL:
         for _, handle in handles:
             handle.remove()
 
-        torch.cuda.empty_cache()
-        gc.collect()
+        clear_gpu_cache()
 
     def quantize_model_sequential(self, calibration_data, n_samples=500):
         """Batched sequential quantization with AdaRound."""
@@ -581,8 +588,7 @@ class AdaRoundQuantizerXL:
 
             # Clear activations for this batch
             self.activation_data = {}
-            torch.cuda.empty_cache()
-            gc.collect()
+            clear_gpu_cache()
 
             if HAS_PSUTIL:
                 ram_pct = psutil.virtual_memory().percent
@@ -644,13 +650,26 @@ def main():
 
     # Use model path from args
     model_name = args.model_path
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # Device detection: CUDA > MPS > CPU
+    if torch.cuda.is_available():
+        device = "cuda"
+        device_name = torch.cuda.get_device_name(0)
+    elif torch.backends.mps.is_available():
+        device = "mps"
+        device_name = "Apple Silicon GPU (MPS)"
+    else:
+        device = "cpu"
+        device_name = "CPU"
+        print("\n⚠️  WARNING: No GPU detected! AdaRound on CPU will be EXTREMELY slow.")
+        print("   For Apple Silicon Macs: Install PyTorch with MPS support")
+        print("   For NVIDIA GPUs: Install PyTorch with CUDA support\n")
 
     print("=" * 80)
     print("AdaRound Quantization (XL Version)")
     print(f"Target Model: {model_name}")
     print("=" * 80)
-    print(f"Device: {device}")
+    print(f"Device: {device} ({device_name})")
     print(f"Group size: {args.group_size}")
     print(f"Layer Batch Size: {args.layer_batch_size}")
     print(f"AdaRound iterations per layer: {args.adaround_iters}")
@@ -665,11 +684,20 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
         print("  -> Set pad_token = eos_token")
 
+    # Load model with appropriate dtype and device
+    # Note: MPS doesn't support bfloat16, use float16 instead
+    if device == "mps":
+        dtype = torch.float16
+        print("  -> Using float16 for MPS compatibility")
+    else:
+        dtype = torch.bfloat16
+
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        torch_dtype=torch.bfloat16,
-        device_map="auto",
-        trust_remote_code=True
+        torch_dtype=dtype,
+        device_map="auto" if device == "cuda" else device,
+        trust_remote_code=True,
+        low_cpu_mem_usage=True
     )
     model.eval()
 
