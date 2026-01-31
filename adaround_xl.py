@@ -7,7 +7,7 @@ Key Features:
 - Learned rounding using gradient descent instead of heuristic rules
 - Rectified sigmoid for soft rounding decisions
 - Regularization to encourage binary (0/1) rounding
-- Beta annealing from 20 → 2 over iterations
+- Beta annealing from 2 → 20 over iterations (gentle → hard)
 - Special lm_head chunking to avoid OOM
 - Batched sequential quantization for memory efficiency
 
@@ -21,7 +21,7 @@ AdaRound Algorithm:
 Formula:
 - W_quant = (W_floor + h(V)) × delta
 - h(V) = clamp(sigmoid(V) × (ζ - γ) + γ, 0, 1)
-- Regularization: Σ(1 - |2h(V) - 1|^β) where β decreases from 20 to 2
+- Regularization: Σ(1 - |2h(V) - 1|^β) where β increases from 2 to 20
 """
 
 import torch
@@ -58,23 +58,37 @@ class AdaRoundOptimizer(nn.Module):
 
     Learns optimal rounding decisions via gradient descent.
     """
-    def __init__(self, layer, weight_delta, weight_floor, iterations=10000, zeta=1.1, gamma=-0.1):
+    def __init__(self, layer, weight_delta, weight_floor, weight_zp, iterations=10000, zeta=1.1, gamma=-0.1):
         super().__init__()
         self.layer = layer
 
-        # Register scale and floor as buffers (not parameters, but need proper device handling)
+        # Register scale, floor, and zero-point as buffers
         self.register_buffer('delta', weight_delta)
         self.register_buffer('w_floor', weight_floor)
+        self.register_buffer('w_zp', weight_zp)
 
         # V is the learnable rounding parameter (same shape as weights)
-        # Initialized such that sigmoid(V) ≈ 0.5
-        # Create new tensor explicitly to avoid copying metadata from layer.weight
-        v_init = torch.zeros(
-            layer.weight.shape,
-            dtype=layer.weight.dtype,
-            device=layer.weight.device
-        )
-        self.v = nn.Parameter(v_init, requires_grad=True)
+        # CRITICAL: Initialize to fractional part WITH zero-point for asymmetric quantization
+        # Compute fractional part of (W / scale + zp)
+        W = layer.weight.data.float()
+        W_div = W / weight_delta.float()
+        W_shift = W_div + weight_zp.float()  # Add zero-point (asymmetric!)
+        W_frac = W_shift - torch.floor(W_shift)  # Fractional part [0, 1)
+
+        # Clip away from exact 0/1 to avoid saturation (keep in [0.01, 0.99])
+        h_init = torch.clamp(W_frac, 0.01, 0.99)
+
+        # Invert rectified sigmoid to get V
+        # h = clamp(sigmoid(V) * (zeta - gamma) + gamma, 0, 1)
+        # Solve for V: sigmoid(V) = (h - gamma) / (zeta - gamma)
+        sigmoid_target = (h_init - gamma) / (zeta - gamma)
+        sigmoid_target = torch.clamp(sigmoid_target, 0.01, 0.99)  # Avoid log(0)
+
+        # Inverse sigmoid: V = log(s / (1-s))
+        v_init = torch.log(sigmoid_target / (1.0 - sigmoid_target))
+
+        # CRITICAL: Keep V in fp32 for stable gradients (even if model is bf16)
+        self.v = nn.Parameter(v_init.float(), requires_grad=True)
 
         # Hyperparameters (Qualcomm AIMET defaults)
         self.iterations = iterations
@@ -88,13 +102,14 @@ class AdaRoundOptimizer(nn.Module):
     def forward(self, x):
         """Apply the learned rounding to the weights"""
         # W_q = (W_floor + h(V)) × delta
-        h_v = self.get_soft_rounding()
-        w_q = (self.w_floor + h_v) * self.delta
+        # CRITICAL: Compute in fp32 for numerical stability
+        h_v = self.get_soft_rounding().float()
+        w_q = ((self.w_floor.float() + h_v) * self.delta.float()).to(x.dtype)
 
         return F.linear(x, w_q, self.layer.bias)
 
 
-def compute_adaround_reg(v_parameter, iter_count, max_iter, zeta=1.1, gamma=-0.1, beta_start=20, beta_end=2):
+def compute_adaround_reg(v_parameter, iter_count, max_iter, zeta=1.1, gamma=-0.1, beta_start=2, beta_end=20):
     """
     Regularization term to force rounding to 0 or 1.
 
@@ -103,13 +118,13 @@ def compute_adaround_reg(v_parameter, iter_count, max_iter, zeta=1.1, gamma=-0.1
         iter_count: Current iteration
         max_iter: Maximum iterations
         zeta, gamma: Rectified sigmoid parameters
-        beta_start, beta_end: Annealing range for beta
+        beta_start, beta_end: Annealing range for beta (2 → 20 for gentle → hard)
 
     Returns:
         Regularization loss (scalar)
     """
-    # Anneal beta from beta_start down to beta_end over iterations
-    beta = beta_end + (beta_start - beta_end) * (1 - iter_count / max_iter)
+    # Anneal beta from beta_start UP to beta_end over iterations (2 → 20)
+    beta = beta_start + (beta_end - beta_start) * (iter_count / max_iter)
 
     # h_v is the soft decision
     h_v = torch.clamp(torch.sigmoid(v_parameter) * (zeta - gamma) + gamma, 0, 1)
@@ -150,9 +165,10 @@ class AdaRoundQuantizerXL:
         print(f"  Learning rate: {adaround_lr}")
         print(f"  Regularization weight: {reg_weight}")
         print(f"  Calibration: 256 samples max, mini-batch size 64")
-        print(f"  Token subsampling: {max_tokens_per_sample} tokens/sample")
+        print(f"  Token subsampling: {max_tokens_per_sample} tokens/sample (stored as fp16)")
         print(f"  Layer batch size: {layer_batch_size}")
         print(f"  Quantization: GROUP-WISE ASYMMETRIC [0, {2**bits - 1}]")
+        print(f"  Optimization: V in fp32, weights computed in fp32")
         print(f"  Special: lm_head split into {lmhead_chunks} chunks to avoid OOM")
 
     def get_hook(self, name):
@@ -172,8 +188,9 @@ class AdaRoundQuantizerXL:
                 indices = indices.sort()[0]  # Keep temporal order
                 inp = inp[:, indices, :]
 
-            # Store on CPU to save GPU memory, use float32 for numerical stability
-            self.activation_data[name].append(inp.detach().cpu().float())
+            # CRITICAL: Store as fp16 (not fp32) to reduce memory by 50%
+            # For 128 samples × 512 tokens × 4096 dim: fp16 = 512MB vs fp32 = 1GB
+            self.activation_data[name].append(inp.detach().cpu().half())
         return hook
 
     @torch.no_grad()
@@ -182,14 +199,14 @@ class AdaRoundQuantizerXL:
         Get concatenated calibration activations for a layer.
 
         Returns:
-            Tensor of shape [total_tokens, in_features]
+            Tensor of shape [total_tokens, in_features] in fp32
         """
         if name not in self.activation_data or len(self.activation_data[name]) == 0:
             return None
 
         X_list = self.activation_data[name]
-        # Concatenate all activation batches
-        X_all = torch.cat([x.reshape(-1, x.shape[-1]) for x in X_list], dim=0)
+        # Concatenate all activation batches (stored as fp16, convert to fp32 for stability)
+        X_all = torch.cat([x.reshape(-1, x.shape[-1]).float() for x in X_list], dim=0)
         return X_all
 
     @torch.no_grad()
@@ -205,13 +222,17 @@ class AdaRoundQuantizerXL:
         """
         out_features, in_features = W.shape
         device = W.device
+        original_dtype = W.dtype
+
+        # CRITICAL: Compute quantization params in fp32 for numerical stability
+        W = W.float()
 
         # Padding to multiple of group_size
         n_groups = (in_features + self.group_size - 1) // self.group_size
         padded_in_features = n_groups * self.group_size
 
         if padded_in_features > in_features:
-            W_padded = torch.zeros(out_features, padded_in_features, device=device, dtype=W.dtype)
+            W_padded = torch.zeros(out_features, padded_in_features, device=device, dtype=torch.float32)
             W_padded[:, :in_features] = W
         else:
             W_padded = W
@@ -224,7 +245,7 @@ class AdaRoundQuantizerXL:
         w_max = W_g.max(dim=2, keepdim=True)[0]
         max_int = 2**self.bits - 1
 
-        # Scale and zero-point
+        # Scale and zero-point (computed in fp32)
         scale = (w_max - w_min) / max_int
         scale = scale.clamp(min=1e-8)
         zp = torch.round(-w_min / scale).clamp(0, max_int)
@@ -263,15 +284,28 @@ class AdaRoundQuantizerXL:
         W = module.weight.data
         original_dtype = W.dtype
 
+        # CRITICAL: Use the layer's actual device (for multi-GPU support with device_map="auto")
+        layer_device = W.device
+
         # Compute quantization parameters
         scale, zp, w_floor = self.compute_quantization_params_groupwise(W)
 
-        # Move to device
-        w_floor = w_floor.to(self.device)
-        scale = scale.to(self.device)
+        # CRITICAL: Check for invalid scale values
+        if (scale == 0).any() or torch.isnan(scale).any() or torch.isinf(scale).any():
+            print(f"    🚨 ERROR: Invalid scale values in {name}!")
+            print(f"       Zero scales: {(scale == 0).sum().item()}")
+            print(f"       NaN scales: {torch.isnan(scale).sum().item()}")
+            print(f"       Inf scales: {torch.isinf(scale).sum().item()}")
+            # Return original weights without quantization
+            return W.clone(), float('inf')
 
-        # Create AdaRound wrapper
-        wrapper = AdaRoundOptimizer(module, scale, w_floor, iterations=num_iterations).to(self.device)
+        # Move to layer's device (not self.device!)
+        w_floor = w_floor.to(layer_device)
+        scale = scale.to(layer_device)
+        zp = zp.to(layer_device)
+
+        # Create AdaRound wrapper on the same device as the layer (pass zp for correct init)
+        wrapper = AdaRoundOptimizer(module, scale, w_floor, zp, iterations=num_iterations).to(layer_device)
         optimizer = torch.optim.Adam([wrapper.v], lr=self.adaround_lr)
 
         # Subsample calibration data for speed (REDUCED from 1024 to 256 for memory)
@@ -302,8 +336,8 @@ class AdaRoundQuantizerXL:
                 mb_start = mb_idx * mini_batch_size
                 mb_end = min(mb_start + mini_batch_size, max_samples)
 
-                # Load only current mini-batch to GPU
-                calib_mb = calib_data_cpu_subset[mb_start:mb_end].to(self.device).to(original_dtype)
+                # Load only current mini-batch to layer's device
+                calib_mb = calib_data_cpu_subset[mb_start:mb_end].to(layer_device).to(original_dtype)
 
                 # Ground truth for this mini-batch
                 with torch.no_grad():
@@ -385,13 +419,30 @@ class AdaRoundQuantizerXL:
             debug=debug
         )
 
+        # CRITICAL: Check for NaN/Inf before updating weights
+        if torch.isnan(W_optimized).any() or torch.isinf(W_optimized).any():
+            print(f"    🚨 ERROR: {name} has NaN/Inf values! Skipping quantization.")
+            print(f"       NaN count: {torch.isnan(W_optimized).sum().item()}")
+            print(f"       Inf count: {torch.isinf(W_optimized).sum().item()}")
+            del W_optimized, calib_data_cpu
+            return
+
         # Update weights
         module.weight.data = W_optimized
+
+        # Diagnostic: Print weight statistics for first few layers
+        if debug:
+            print(f"       Weight stats: min={W_optimized.min().item():.6f}, "
+                  f"max={W_optimized.max().item():.6f}, "
+                  f"mean={W_optimized.mean().item():.6f}, "
+                  f"std={W_optimized.std().item():.6f}")
 
         # Store statistics
         self.layer_stats[name] = {
             'final_loss': final_loss,
-            'shape': list(W_optimized.shape)
+            'shape': list(W_optimized.shape),
+            'weight_min': W_optimized.min().item(),
+            'weight_max': W_optimized.max().item()
         }
 
         # Aggressive cleanup
@@ -413,6 +464,7 @@ class AdaRoundQuantizerXL:
 
         W = module.weight.data
         original_dtype = W.dtype
+        layer_device = W.device  # CRITICAL: Use layer's actual device
         out_features, in_features = W.shape
 
         print(f"     Shape: {W.shape} ({W.numel() / 1e6:.1f}M parameters)")
@@ -437,12 +489,13 @@ class AdaRoundQuantizerXL:
         for chunk_idx, (start_idx, end_idx) in enumerate(chunk_boundaries):
             print(f"     Processing chunk {chunk_idx + 1}/{num_chunks}: rows {start_idx}-{end_idx}")
 
-            # Create a temporary module for this chunk
+            # Create a temporary module for this chunk (CRITICAL: match original dtype)
             chunk_module = nn.Linear(in_features, end_idx - start_idx, bias=module.bias is not None)
             chunk_module.weight.data = W[start_idx:end_idx, :].clone()
             if module.bias is not None:
                 chunk_module.bias.data = module.bias.data[start_idx:end_idx].clone()
-            chunk_module = chunk_module.to(self.device)
+            # Move to layer's device and convert to original dtype
+            chunk_module = chunk_module.to(layer_device, dtype=original_dtype)
 
             # Optimize this chunk
             W_chunk_optimized, chunk_loss = self.optimize_layer_adaround(
@@ -453,15 +506,20 @@ class AdaRoundQuantizerXL:
                 debug=(debug and chunk_idx == 0)
             )
 
-            W_final_chunks.append(W_chunk_optimized.cpu())
+            # Check for NaN/Inf in chunk
+            if torch.isnan(W_chunk_optimized).any() or torch.isinf(W_chunk_optimized).any():
+                print(f"    🚨 ERROR: Chunk {chunk_idx} has NaN/Inf! Using original weights.")
+                W_final_chunks.append(W[start_idx:end_idx, :].clone().cpu())
+            else:
+                W_final_chunks.append(W_chunk_optimized.cpu())
             chunk_stats.append({'loss': chunk_loss})
 
             # Cleanup
             del chunk_module, W_chunk_optimized
             torch.cuda.empty_cache()
 
-        # Combine all chunks
-        W_final = torch.cat(W_final_chunks, dim=0).to(self.device)
+        # Combine all chunks and move to layer's device
+        W_final = torch.cat(W_final_chunks, dim=0).to(layer_device)
         module.weight.data = W_final
 
         # Store statistics
@@ -606,8 +664,8 @@ def main():
                        help="Learning rate for AdaRound optimization (default: 1e-3)")
     parser.add_argument("--reg-weight", type=float, default=0.001,
                        help="Weight for regularization term (default: 0.001)")
-    parser.add_argument("--max-tokens-per-sample", type=int, default=2048,
-                       help="Max tokens to store per sample (default: 2048)")
+    parser.add_argument("--max-tokens-per-sample", type=int, default=256,
+                       help="Max tokens to store per sample (default: 256, CRITICAL for memory)")
     parser.add_argument("--layer-batch-size", type=int, default=16,
                        help="Number of layers to process per batch (default: 16)")
     parser.add_argument("--lmhead-chunks", type=int, default=4,
