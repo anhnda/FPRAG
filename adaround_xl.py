@@ -224,6 +224,7 @@ class AdaRoundQuantizerXL:
         scale_flat = scale.repeat(1, 1, self.group_size).reshape(out_features, padded_in_features)
         zp_flat = zp.repeat(1, 1, self.group_size).reshape(out_features, padded_in_features)
 
+
         # Compute floor(W / scale)
         W_div = W_padded / scale_flat
         W_floor = torch.floor(W_div + zp_flat).clamp(0, max_int) - zp_flat
