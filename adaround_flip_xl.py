@@ -291,12 +291,187 @@ class AdaRoundFlipQuantizerXL:
 
         return scale_g, zp_g_int, w_floor_int, n_groups, self.group_size
 
+    def _apply_heuristic_flipping_chunked(self, W, scale_g, zp_g, w_floor_int, n_groups, group_size,
+                                          group_activation_means, chunk_size_out):
+        """
+        Chunked version of heuristic flipping for large layers.
+        Processes output channels in chunks to avoid OOM.
+        """
+        out_features, in_features = W.shape
+        device = W.device
+
+        print(f"      Using chunked flipping: {out_features} outputs → chunks of {chunk_size_out}")
+
+        num_chunks = (out_features + chunk_size_out - 1) // chunk_size_out
+        W_refined = torch.zeros_like(W, dtype=torch.float32)
+
+        total_flips = 0
+        all_flips_per_channel = []
+
+        for chunk_idx in range(num_chunks):
+            start_out = chunk_idx * chunk_size_out
+            end_out = min(start_out + chunk_size_out, out_features)
+
+            # Extract chunk
+            W_chunk = W[start_out:end_out, :]
+            scale_g_chunk = scale_g[start_out:end_out, :]
+            zp_g_chunk = zp_g[start_out:end_out, :]
+            w_floor_int_chunk = w_floor_int[start_out:end_out, :]
+
+            # Apply flipping to this chunk (will use non-chunked version since it's smaller)
+            W_refined_chunk, flip_stats_chunk = self._apply_heuristic_flipping_single(
+                W_chunk, scale_g_chunk, zp_g_chunk, w_floor_int_chunk,
+                n_groups, group_size, group_activation_means
+            )
+
+            W_refined[start_out:end_out, :] = W_refined_chunk
+            total_flips += flip_stats_chunk['total']
+            all_flips_per_channel.append(flip_stats_chunk.get('_per_channel_raw', torch.zeros(in_features, device=device)))
+
+            # Cleanup
+            del W_chunk, scale_g_chunk, zp_g_chunk, w_floor_int_chunk, W_refined_chunk
+            torch.cuda.empty_cache()
+
+        # Aggregate flip statistics
+        flips_per_channel = torch.stack(all_flips_per_channel, dim=0).sum(dim=0)  # Sum across output chunks
+
+        flip_stats = {
+            'total': total_flips,
+            'per_channel_mean': flips_per_channel.mean().item(),
+            'per_channel_median': flips_per_channel.median().item(),
+            'per_channel_min': flips_per_channel.min().item(),
+            'per_channel_max': flips_per_channel.max().item(),
+            'per_channel_std': flips_per_channel.std().item(),
+            'per_channel_p95': torch.quantile(flips_per_channel, 0.95).item(),
+            'per_channel_zero_pct': (flips_per_channel == 0).float().mean().item() * 100,
+            'outlier_percent': 0.0  # Not tracked in chunked mode
+        }
+
+        return W_refined.to(W.dtype), flip_stats
+
+    def _apply_heuristic_flipping_single(self, W, scale_g, zp_g, w_floor_int, n_groups, group_size,
+                                         group_activation_means):
+        """Single-chunk flipping (original algorithm)."""
+        out_features, in_features = W.shape
+        device = W.device
+
+        # Expand quantization params to full size for flipping
+        padded_in_features = n_groups * group_size
+
+        if padded_in_features > in_features:
+            W_padded = torch.zeros(out_features, padded_in_features, device=device, dtype=W.dtype)
+            W_padded[:, :in_features] = W
+            act_padded = torch.zeros(padded_in_features, device=device, dtype=W.dtype)
+            act_padded[:in_features] = group_activation_means
+        else:
+            W_padded = W
+            act_padded = group_activation_means
+
+        # Expand scale and zp to full size
+        scale_flat = scale_g.unsqueeze(2).repeat(1, 1, group_size).reshape(out_features, padded_in_features).float()
+        zp_flat = zp_g.unsqueeze(2).repeat(1, 1, group_size).reshape(out_features, padded_in_features).float()
+
+        # Pad w_floor_int if needed
+        if padded_in_features > in_features:
+            w_int = torch.zeros(out_features, padded_in_features, device=device, dtype=torch.float32)
+            w_int[:, :in_features] = w_floor_int.float() + zp_flat[:, :in_features]
+        else:
+            w_int = w_floor_int.float() + zp_flat
+
+        max_int = 2**self.bits - 1
+
+        # Current quantized weights
+        W_quant = (w_int - zp_flat) * scale_flat
+
+        # --- Global Greedy Heuristic Flipping ---
+        W_diff = W_padded - W_quant
+        current_error = (W_diff * act_padded.unsqueeze(0)).sum(dim=1)
+
+        W_div = W_padded / scale_flat
+        flip_dir = torch.sign(W_div + zp_flat - w_int)
+        flip_dir[flip_dir == 0] = 1.0
+        flip_impacts = act_padded.unsqueeze(0) * flip_dir * scale_flat
+
+        target_sign = torch.sign(current_error).unsqueeze(1)
+        valid_mask = (torch.sign(flip_impacts) == target_sign)
+
+        w_int_proposed = w_int + flip_dir
+        in_range = (w_int_proposed >= 0) & (w_int_proposed <= max_int)
+        valid_mask = valid_mask & in_range
+
+        # DYNAMIC Outlier Masking
+        outlier_threshold, outlier_percent = compute_dynamic_outlier_threshold_kneedle(
+            act_padded, knee_tolerance=self.knee_tolerance
+        )
+        is_outlier = act_padded.abs() > outlier_threshold
+        valid_mask = valid_mask & (~is_outlier).unsqueeze(0)
+
+        rounding_costs = (W_div + zp_flat - w_int).abs()
+        rounding_costs_masked = rounding_costs.clone()
+        rounding_costs_masked[~valid_mask] = -1.0
+
+        sorted_indices = torch.argsort(rounding_costs_masked, dim=1, descending=True)
+        sorted_impacts = torch.gather(flip_impacts, 1, sorted_indices)
+        sorted_validity = torch.gather(valid_mask.long(), 1, sorted_indices)
+        sorted_impacts = sorted_impacts * sorted_validity
+
+        cumsum_impacts = torch.cumsum(sorted_impacts, dim=1)
+        residuals = torch.abs(current_error.unsqueeze(1) - cumsum_impacts)
+        error_unsqueezed = torch.abs(current_error).unsqueeze(1)
+        all_residuals = torch.cat([error_unsqueezed, residuals], dim=1)
+        best_k = torch.argmin(all_residuals, dim=1)
+
+        idx_range = torch.arange(padded_in_features, device=device).unsqueeze(0)
+        flip_mask_sorted = idx_range < best_k.unsqueeze(1)
+        final_flips_sorted = flip_mask_sorted & (sorted_validity.bool())
+
+        sorted_flip_dir = torch.gather(flip_dir, 1, sorted_indices)
+        sorted_flip_dir[~final_flips_sorted] = 0.0
+
+        # Limit flips per output channel
+        max_flips_per_output = int(self.max_flip_percent * in_features)
+        cumsum_flips = final_flips_sorted.long().cumsum(dim=1)
+        within_limit = cumsum_flips <= max_flips_per_output
+        sorted_flip_dir[~within_limit] = 0.0
+
+        w_int.scatter_add_(1, sorted_indices, sorted_flip_dir)
+        w_int.clamp_(0, max_int)
+
+        # Compute flip statistics
+        num_flips_total = final_flips_sorted.sum().item()
+        flips_per_channel = final_flips_sorted.sum(dim=0).float()
+
+        if padded_in_features > in_features:
+            flips_per_channel = flips_per_channel[:in_features]
+
+        flip_stats = {
+            'total': num_flips_total,
+            'per_channel_mean': flips_per_channel.mean().item(),
+            'per_channel_median': flips_per_channel.median().item(),
+            'per_channel_min': flips_per_channel.min().item(),
+            'per_channel_max': flips_per_channel.max().item(),
+            'per_channel_std': flips_per_channel.std().item(),
+            'per_channel_p95': torch.quantile(flips_per_channel, 0.95).item(),
+            'per_channel_zero_pct': (flips_per_channel == 0).float().mean().item() * 100,
+            'outlier_percent': outlier_percent,
+            '_per_channel_raw': flips_per_channel  # For chunked aggregation
+        }
+
+        # Dequantize
+        W_refined = (w_int - zp_flat) * scale_flat
+
+        if padded_in_features > in_features:
+            W_refined = W_refined[:, :in_features]
+
+        return W_refined.to(W.dtype), flip_stats
+
     def apply_heuristic_flipping(self, W, scale_g, zp_g, w_floor_int, n_groups, group_size,
-                                 group_activation_means, debug=False):
+                                 group_activation_means):
         """
         Apply heuristic flipping to refine quantized weights.
 
         Takes AdaRound output and applies global greedy bit-flipping.
+        For large layers, chunks along output dimension to avoid OOM.
 
         Args:
             W: Original FP weights [out, in]
@@ -312,6 +487,20 @@ class AdaRoundFlipQuantizerXL:
         """
         out_features, in_features = W.shape
         device = W.device
+
+        # CRITICAL: For large layers, chunk along output dimension to avoid OOM
+        # Heuristic: if estimated memory > 1GB, use chunking
+        estimated_memory_gb = (out_features * in_features * 4) / 1e9  # 4 bytes (fp32)
+        chunk_size_out = 2048  # Process 2048 output channels at a time
+
+        if estimated_memory_gb > 1.0 and out_features > chunk_size_out:
+            # Use chunked flipping
+            return self._apply_heuristic_flipping_chunked(
+                W, scale_g, zp_g, w_floor_int, n_groups, group_size,
+                group_activation_means, chunk_size_out
+            )
+
+        # Original non-chunked version for small layers
 
         # Expand quantization params to full size for flipping
         padded_in_features = n_groups * group_size
@@ -575,7 +764,7 @@ class AdaRoundFlipQuantizerXL:
 
             final_weights, flip_stats = self.apply_heuristic_flipping(
                 W, scale_g, zp_g, w_floor_from_adaround, n_groups, group_size,
-                group_activation_means, debug=debug
+                group_activation_means
             )
         else:
             final_weights = adaround_weights
