@@ -685,7 +685,8 @@ class AdaRoundFlipQuantizerXL:
                 rec_loss_mb = F.mse_loss(current_mb, target_mb)
                 total_rec_loss += rec_loss_mb * (mb_end - mb_start) / max_samples
 
-                del calib_mb, target_mb, current_mb
+                # CRITICAL: Delete all intermediate tensors immediately
+                del calib_mb, target_mb, current_mb, rec_loss_mb
 
             reg_loss = self.reg_weight * compute_adaround_reg(wrapper.v, i, num_iterations)
             total_loss = total_rec_loss + reg_loss
@@ -717,8 +718,11 @@ class AdaRoundFlipQuantizerXL:
 
             del total_rec_loss, reg_loss, total_loss
 
-            if i % 100 == 0:
+            # More aggressive memory cleanup to prevent accumulation
+            if i % 50 == 0:
                 torch.cuda.empty_cache()
+                if i % 200 == 0:
+                    gc.collect()
 
         # Get AdaRound optimized weights
         with torch.no_grad():
@@ -766,13 +770,17 @@ class AdaRoundFlipQuantizerXL:
                 W, scale_g, zp_g, w_floor_from_adaround, n_groups, group_size,
                 group_activation_means
             )
+            del w_floor_from_adaround  # Free immediately after use
         else:
-            final_weights = adaround_weights
+            final_weights = adaround_weights.clone()  # Clone to free original
             flip_stats = {'total': 0}
 
-        # Cleanup
-        del wrapper, optimizer, scale_g, zp_g, w_floor_int, calib_data_cpu_subset
-        del best_v, adaround_weights
+        # Cleanup (CRITICAL: Free all optimizer states and intermediate tensors)
+        optimizer.zero_grad(set_to_none=True)  # Free gradient buffers
+        del optimizer  # Free optimizer state (momentum, etc.)
+        del wrapper  # Free AdaRound wrapper and V parameter
+        del scale_g, zp_g, w_floor_int, calib_data_cpu_subset
+        del best_v, adaround_weights, group_activation_means
         torch.cuda.empty_cache()
         gc.collect()
 
@@ -805,13 +813,15 @@ class AdaRoundFlipQuantizerXL:
             if flip_stats:
                 print(f"       Flips: {flip_stats['total']:,}")
 
+        # Store stats WITHOUT raw tensors to prevent memory leak
+        flip_stats_clean = {k: v for k, v in flip_stats.items() if not k.startswith('_')}
         self.layer_stats[name] = {
             'final_loss': final_loss,
             'shape': list(W_optimized.shape),
-            'flip_stats': flip_stats
+            'flip_stats': flip_stats_clean  # No raw tensors
         }
 
-        del W_optimized, calib_data_cpu
+        del W_optimized, calib_data_cpu, flip_stats
         if name in self.activation_data:
             del self.activation_data[name]
         torch.cuda.empty_cache()
@@ -882,11 +892,18 @@ class AdaRoundFlipQuantizerXL:
             self.calibrate_layer_batch(batch_layers, calibration_data, n_samples)
 
             print(f"  Quantizing {len(batch_layers)} layers with AdaRound + Flipping...")
-            for name, module in tqdm(batch_layers, desc="  Quantization", leave=False):
+            for idx, (name, module) in enumerate(tqdm(batch_layers, desc="  Quantization", leave=False)):
                 try:
                     debug = (quantized_count < 2)
                     self.quantize_layer(name, module, debug=debug)
                     quantized_count += 1
+
+                    # Monitor GPU memory every 5 layers
+                    if torch.cuda.is_available() and (idx + 1) % 5 == 0:
+                        allocated = torch.cuda.memory_allocated() / 1024**3
+                        reserved = torch.cuda.memory_reserved() / 1024**3
+                        print(f"\n    GPU Memory after layer {idx+1}/{len(batch_layers)}: "
+                              f"Allocated={allocated:.2f}GB, Reserved={reserved:.2f}GB")
                 except Exception as e:
                     print(f"\n⚠️  Error quantizing {name}: {e}")
                     continue
