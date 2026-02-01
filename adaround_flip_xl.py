@@ -649,19 +649,37 @@ class AdaRoundFlipQuantizerXL:
         group_activation_means = group_activation_means.to(layer_device)
 
         # === STEP 1: AdaRound Optimization ===
+
+        # ADAPTIVE: For very large layers (e.g., lm_head), reduce samples to save memory
+        out_features, in_features = W.shape
+        layer_size_mb = (out_features * in_features * 4) / (1024**2)  # V parameter size in MB
+
+        if layer_size_mb > 1500:  # >1.5 GB (e.g., lm_head 128256×4096)
+            max_samples = min(128, calibration_data_cpu.shape[0])  # Half samples
+            mini_batch_size = 32  # Smaller batches
+            print(f"    ⚠️  Very large layer ({layer_size_mb:.0f} MB), using adaptive memory mode:")
+            print(f"        Calibration samples: {max_samples}, Mini-batch: {mini_batch_size}")
+        elif layer_size_mb > 500:  # >500 MB
+            max_samples = min(192, calibration_data_cpu.shape[0])
+            mini_batch_size = 48
+        else:
+            max_samples = min(256, calibration_data_cpu.shape[0])
+            mini_batch_size = 64
+
+        # Free memory before creating wrapper (which allocates V parameter)
+        torch.cuda.empty_cache()
+
         wrapper = AdaRoundOptimizer(module, scale_g, w_floor_int, zp_g, n_groups, group_size,
                                    iterations=num_iterations).to(layer_device)
         optimizer = torch.optim.Adam([wrapper.v], lr=self.adaround_lr)
 
         # Subsample calibration data
-        max_samples = min(256, calibration_data_cpu.shape[0])
         if calibration_data_cpu.shape[0] > max_samples:
             indices = torch.randperm(calibration_data_cpu.shape[0])[:max_samples]
             calib_data_cpu_subset = calibration_data_cpu[indices]
         else:
             calib_data_cpu_subset = calibration_data_cpu
 
-        mini_batch_size = 64
         num_mini_batches = (max_samples + mini_batch_size - 1) // mini_batch_size
 
         best_loss = float('inf')
@@ -751,6 +769,15 @@ class AdaRoundFlipQuantizerXL:
 
                 adaround_weights[:, j0:j1] = (w_floor_chunk + hard_rounding_chunk) * scale_g_cur
 
+        # === CRITICAL: Free AdaRound resources BEFORE flipping ===
+        # Flipping doesn't need gradients, so free ~500 MB per large layer
+        optimizer.zero_grad(set_to_none=True)  # Free gradient buffers
+        del optimizer  # Free optimizer state (momentum, etc.)
+        del wrapper  # Free AdaRound wrapper and V parameter (~235 MB for large layers)
+        del best_v  # Free best V
+        torch.cuda.empty_cache()
+        gc.collect()
+
         # === STEP 2: Heuristic Flipping (if enabled) ===
         flip_stats = {}
         if self.use_flipping:
@@ -775,12 +802,9 @@ class AdaRoundFlipQuantizerXL:
             final_weights = adaround_weights.clone()  # Clone to free original
             flip_stats = {'total': 0}
 
-        # Cleanup (CRITICAL: Free all optimizer states and intermediate tensors)
-        optimizer.zero_grad(set_to_none=True)  # Free gradient buffers
-        del optimizer  # Free optimizer state (momentum, etc.)
-        del wrapper  # Free AdaRound wrapper and V parameter
+        # Final cleanup (optimizer/wrapper already freed before flipping)
         del scale_g, zp_g, w_floor_int, calib_data_cpu_subset
-        del best_v, adaround_weights, group_activation_means
+        del adaround_weights, group_activation_means
         torch.cuda.empty_cache()
         gc.collect()
 
@@ -822,9 +846,14 @@ class AdaRoundFlipQuantizerXL:
         }
 
         del W_optimized, calib_data_cpu, flip_stats
+
+        # CRITICAL: Free activation data immediately after layer is quantized
         if name in self.activation_data:
             del self.activation_data[name]
+
+        # Aggressive cleanup to free maximum memory before next layer
         torch.cuda.empty_cache()
+        torch.cuda.synchronize()  # Wait for all CUDA ops to complete
         gc.collect()
 
     @torch.no_grad()
@@ -846,10 +875,13 @@ class AdaRoundFlipQuantizerXL:
                     inputs = self.tokenizer(text, return_tensors="pt",
                                            truncation=True, max_length=512)
                     inputs = {k: v.to(self.device) for k, v in inputs.items()}
-                    self.model(**inputs, use_cache=False, return_dict=True)
+                    outputs = self.model(**inputs, use_cache=False, return_dict=True)
                     successful += 1
 
-                    if (successful + 1) % 32 == 0:
+                    # CRITICAL: Free outputs immediately to prevent accumulation
+                    del outputs, inputs
+
+                    if (successful + 1) % 16 == 0:  # More frequent (was 32)
                         torch.cuda.empty_cache()
                 except Exception:
                     continue
