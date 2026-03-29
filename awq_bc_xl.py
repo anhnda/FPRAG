@@ -45,7 +45,7 @@ except ImportError:
     def get_wikitext2_calibration_data(*args, **kwargs): raise NotImplementedError("Please provide calibration_utils.py")
 
 
-class BiascorrectionAWQQuantizerXL:
+class BiasCorrectionAWQQuantizerXL:
     def __init__(self, model, tokenizer, device="cuda", bits=4, n_grid=20,
                  group_size=128, max_tokens_per_sample=512,
                  layer_batch_size=16, lmhead_chunks=4):
