@@ -1,6 +1,6 @@
-# AWQ Quantization: Standard vs Dynamic Heuristic
+# Smart Flip Correction for Post Training Quantization
 
-Comparison of two AWQ quantization approaches for 4-bit weight quantization of Large Language Models.
+Comparison of applying Smart Flip Correction (SFC) for 4-bit weight quantization of Large Language Models.
 
 ## Methods
 
@@ -11,7 +11,7 @@ Comparison of two AWQ quantization approaches for 4-bit weight quantization of L
 - **Batched sequential processing**: Memory-efficient layer-by-layer quantization
 - **Special lm_head handling**: Splits large layers into chunks to avoid OOM
 
-### 2. Dynamic Heuristic AWQ (`awq_dh_xl.py`)
+### 2. SFC AWQ (`awq_dh_xl.py`)
 - **All features from Standard AWQ**, PLUS:
 - **Heuristic-guided rounding**: Global greedy correction to minimize quantization error
 - **Dynamic outlier detection**: Kneedle algorithm adaptively identifies outliers per layer
@@ -29,7 +29,7 @@ python awq_stand_xl.py \
     --layer-batch-size 16
 ```
 
-### Quantize with Dynamic Heuristic AWQ
+### Quantize with SFC AWQ
 ```bash
 python awq_dh_xl.py \
     --model-path ./models/Mistral-7B-v0.3 \
@@ -65,24 +65,24 @@ python compare_awq_slicing.py \
 ### Mistral-7B-v0.3
 Perplexity (↓ lower is better):
 
-| Dataset    | Origin | Standard AWQ | Dynamic AWQ |
+| Dataset    | Origin | Standard AWQ | SFC AWQ |
 |------------|--------|--------------|-------------|
 | WikiText-2 | 4.8454 | 4.9778       | **4.9689**  |
 | C4         | 7.6040 | 7.7892       | **7.7830**  |
 
-**Improvement**: Dynamic AWQ achieves 0.89% better WikiText-2 and 0.62% better C4 perplexity vs Standard AWQ.
+**Improvement**: SFC AWQ achieves 0.89% better WikiText-2 and 0.62% better C4 perplexity vs Standard AWQ.
 
 ---
 
 ### Llama-3-8B
 Perplexity (↓ lower is better):
 
-| Dataset    | Origin | Standard AWQ | Dynamic AWQ |
+| Dataset    | Origin | Standard AWQ | SFC AWQ |
 |------------|--------|--------------|-------------|
 | WikiText-2 | 5.4425 | 6.7386       | **6.6863**  |
 | C4         | 8.6383 | 10.4595      | **10.3014** |
 
-**Improvement**: Dynamic AWQ achieves 5.23% better C4 perplexity vs Standard AWQ.
+**Improvement**: SFC AWQ achieves 5.23% better C4 perplexity vs Standard AWQ.
 **Note**: Dynamic outlier detection found 0.65% outliers on average (vs fixed 5%).
 
 ---
@@ -90,7 +90,7 @@ Perplexity (↓ lower is better):
 ### Llama-2-7B
 Perplexity (↓ lower is better):
 
-| Dataset    | Origin | Standard AWQ | Dynamic AWQ |
+| Dataset    | Origin | Standard AWQ | SFC AWQ |
 |------------|--------|--------------|-------------|
 | WikiText-2 | 4.9712 | 5.1280       | **5.1270**  |
 | C4         | 6.5748 | 6.7986       | **6.7983**  |
@@ -102,25 +102,25 @@ Perplexity (↓ lower is better):
 ### Qwen2.5-7B
 Perplexity (↓ lower is better):
 
-| Dataset    | Origin  | Standard AWQ | Dynamic AWQ |
+| Dataset    | Origin  | Standard AWQ | SFC AWQ |
 |------------|---------|--------------|-------------|
 | WikiText-2 | 23.1382 | 24.0180      | **23.3029** |
 | C4         | 36.1769 | 37.5713      | **36.4447** |
 
-**Improvement**: Dynamic AWQ achieves 7.15% better WikiText-2 and 11.27% better C4 perplexity vs Standard AWQ.
+**Improvement**: SFC AWQ achieves 7.15% better WikiText-2 and 11.27% better C4 perplexity vs Standard AWQ.
 **Significant gains** on this model family.
 
 ---
 
 ## Summary
 
-**Dynamic Heuristic AWQ** consistently outperforms **Standard AWQ** across all tested models:
+**SFC AWQ** consistently outperforms **Standard AWQ** across all tested models:
 - **Mistral-7B-v0.3**: +0.6-0.9% improvement
 - **Llama-3-8B**: +5.2% improvement (C4)
 - **Llama-2-7B**: Marginal improvement
 - **Qwen2.5-7B**: +7-11% improvement
 
-### Key Advantages of Dynamic AWQ:
+### Key Advantages of SFC AWQ:
 1. **Adaptive outlier detection**: Kneedle algorithm adjusts per layer (vs fixed 5%)
 2. **Flip constraint**: Prevents over-correction (limits to 1% per channel)
 3. **Better optimization**: Global greedy rounding reduces quantization error
@@ -151,7 +151,9 @@ python awq_dh_xl.py \
 
 If you use this code, please cite:
 ```
-Dynamic Heuristic AWQ: Adaptive Quantization with Kneedle-based Outlier Detection
+Smart Flip Correction for Post Training Quantization
+
+Son Tung Nguyen, Tran Quang Hung, Toan Do, Linh Ngo Van, Dinh Viet Sang, Trung Le, Duc Anh Nguyen
 ```
 
 ## License
