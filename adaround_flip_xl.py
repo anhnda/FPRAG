@@ -178,7 +178,7 @@ class AdaRoundFlipQuantizerXL:
     def __init__(self, model, tokenizer, device="cuda", bits=4, group_size=128,
                  adaround_iters=2000, adaround_lr=1e-3, reg_weight=0.001,
                  max_tokens_per_sample=256, layer_batch_size=16, lmhead_chunks=4,
-                 use_flipping=True, max_flip_percent=0.05, knee_tolerance=0.1):
+                 use_flipping=True, max_flip_percent=0.05, knee_tolerance=0.1,skip_lmhead=False):
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
@@ -193,6 +193,7 @@ class AdaRoundFlipQuantizerXL:
         self.use_flipping = use_flipping
         self.max_flip_percent = max_flip_percent
         self.knee_tolerance = knee_tolerance
+        self.skip_lmhead = skip_lmhead
 
         self.activation_data = {}
         self.hooks = []
@@ -926,6 +927,15 @@ class AdaRoundFlipQuantizerXL:
             print(f"  Quantizing {len(batch_layers)} layers with AdaRound + Flipping...")
             for idx, (name, module) in enumerate(tqdm(batch_layers, desc="  Quantization", leave=False)):
                 try:
+                    is_lmhead = 'lm_head' in name.lower() or name.endswith('lm_head')
+
+                    if is_lmhead and self.skip_lmhead:
+                        print(f"\n  ⏭️  Skipping {name} (--skip-lmhead set, keeping original weights)")
+                        if name in self.activation_data:
+                            del self.activation_data[name]
+                        quantized_count += 1
+                        continue
+
                     debug = (quantized_count < 2)
                     self.quantize_layer(name, module, debug=debug)
                     quantized_count += 1
@@ -987,6 +997,8 @@ def main():
     parser.add_argument("--calib-dataset", type=str, default="c4",
                        choices=["c4", "wikitext2", "wikitext2-simple"])
     parser.add_argument("--cache-dir", type=str, default="./calibration_cache")
+    parser.add_argument("--skip-lmhead", action="store_true",
+                   help="Skip quantization of lm_head entirely, keep original weights")
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -1041,7 +1053,8 @@ def main():
         lmhead_chunks=args.lmhead_chunks,
         use_flipping=args.use_flipping,
         max_flip_percent=args.max_flip_percent,
-        knee_tolerance=args.knee_tolerance
+        knee_tolerance=args.knee_tolerance,
+        skip_lmhead=args.skip_lmhead,
     )
 
     quantizer.quantize_model_sequential(calib_texts, n_samples=args.n_calib)

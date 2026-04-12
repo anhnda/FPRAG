@@ -140,7 +140,7 @@ class AdaRoundQuantizerXL:
 
     def __init__(self, model, tokenizer, device="cuda", bits=4, group_size=128,
                  adaround_iters=10000, adaround_lr=1e-3, reg_weight=0.01,
-                 max_tokens_per_sample=512, layer_batch_size=16, lmhead_chunks=4):
+                 max_tokens_per_sample=512, layer_batch_size=16, lmhead_chunks=4, skip_lmhead=False):
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
@@ -152,6 +152,7 @@ class AdaRoundQuantizerXL:
         self.max_tokens_per_sample = max_tokens_per_sample
         self.layer_batch_size = layer_batch_size
         self.lmhead_chunks = lmhead_chunks
+        self.skip_lmhead = skip_lmhead  
 
         # Storage for activations
         self.activation_data = {}
@@ -628,20 +629,20 @@ class AdaRoundQuantizerXL:
             print(f"  Quantizing {len(batch_layers)} layers with AdaRound...")
             for name, module in tqdm(batch_layers, desc="  Quantization", leave=False):
                 try:
-                    # Check if this is lm_head (special handling)
                     is_lmhead = 'lm_head' in name.lower() or name.endswith('lm_head')
-
-                    if is_lmhead:
-                        # Use chunked processing for lm_head
+                    if is_lmhead and self.skip_lmhead:
+                        print(f"\n  ⏭️  Skipping {name} (--skip-lmhead set, keeping original weights)")
+                        # Still need to clear activation data for this layer to free memory
+                        if name in self.activation_data:
+                            del self.activation_data[name]
+                        quantized_count += 1  # or skip counting it — your choice
+                        continue
+                    elif is_lmhead:
                         debug = (quantized_count < 2)
                         self.quantize_lmhead_chunked(name, module, num_chunks=self.lmhead_chunks, debug=debug)
                     else:
-                        # Standard AdaRound processing
                         debug = (quantized_count < 2)
                         self.quantize_layer(name, module, debug=debug)
-
-                    quantized_count += 1
-
                 except Exception as e:
                     print(f"\n⚠️  Error quantizing {name}: {e}")
                     continue
@@ -694,6 +695,8 @@ def main():
                        help="Calibration dataset (default: c4)")
     parser.add_argument("--cache-dir", type=str, default="./calibration_cache",
                        help="Directory to cache calibration data (default: ./calibration_cache)")
+    parser.add_argument("--skip-lmhead", action="store_true",
+                   help="Skip quantization of lm_head entirely, keep original weights")
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -752,7 +755,8 @@ def main():
         reg_weight=args.reg_weight,
         max_tokens_per_sample=args.max_tokens_per_sample,
         layer_batch_size=args.layer_batch_size,
-        lmhead_chunks=args.lmhead_chunks
+        lmhead_chunks=args.lmhead_chunks,
+        skip_lmhead=args.skip_lmhead
     )
 
     # Use batched sequential quantization (optimal memory/speed balance)
