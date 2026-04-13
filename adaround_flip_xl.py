@@ -1000,6 +1000,7 @@ def main():
     parser.add_argument("--skip-lmhead", action="store_true",
                    help="Skip quantization of lm_head entirely, keep original weights")
     args = parser.parse_args()
+    args.skip_lmhead = True #To avoid OOM
 
     random.seed(args.seed)
     np.random.seed(args.seed)
