@@ -1,3 +1,34 @@
+                                                                                
+Llama-3-8B
+Dataset         Standard AdaRound  AdaRound SFA    Delta        Winner             
+--------------------------------------------------------------------------------
+WikiText-2      5.9802          5.9384               +0.704%  Tie               
+C4              9.6267          9.5433               +0.875%  Standard          
+
+
+  python adaround_xl.py \
+    --model-path /home/DATA/prometheus/anh/.cache/huggingface/hub/models--mistralai--Mistral-7B-v0.3/snapshots/caa1feb0e54d415e2df31207e5f4e273e33509b1 \
+    --output-dir ./quantized_models/Mistral-7B_ar \
+    --n-calib 128 \
+    --adaround-iters 10000 \
+    --adaround-lr 1e-3 \
+    --layer-batch-size 16 --skip-lmhead
+
+
+  python adaround_flip_xl.py \
+    --model-path /home/DATA/prometheus/anh/.cache/huggingface/hub/models--mistralai--Mistral-7B-v0.3/snapshots/caa1feb0e54d415e2df31207e5f4e273e33509b1 \
+    --output-dir ./quantized_models/Mistral-7B_arf \
+    --n-calib 128 \
+    --adaround-iters 10000 \
+    --adaround-lr 1e-3 \
+    --layer-batch-size 16 --skip-lmhead
+        models--mistralai--Mistral-7B-v0.3/snapshots/caa1feb0e54d415e2df31207e5f4e273e33509b1
+
+
+              python compare_slicing.py \
+    --heuristic-path ./quantized_models/Mistral-7B_ar \
+    --standard-path ./quantized_models/Mistral-7B_arf 
+
   python adaround_xl.py \
     --model-path /home/DATA/prometheus/anh/.cache/huggingface/hub/models--meta-llama--Meta-Llama-3-8B/snapshots/8cde5ca8380496c9a6cc7ef3a8b46a0372a1d920 \
     --output-dir ./quantized_models/Llama-3-8B_ar \
