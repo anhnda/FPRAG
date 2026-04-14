@@ -364,37 +364,38 @@ class QuantumCorrectionEngine:
             print(f"    lam actual: {lam_dev[:3].tolist()}")
         # ── Phase 1: Mean-Field Annealing ─────────────────────────────────────
         # Init: start from S_nearest, pre-flip spins opposing their local field
-        S_init     = S_nearest.clone()
-        wrong_init = (H_all * S_init) > 0
-        S_init[wrong_init] *= -1
-        if debug:
-            print(f"    Init pre-flips: {wrong_init.sum().item()}")
-        M = S_init.float()
-        del S_init, wrong_init
+        # S_init     = S_nearest.clone()
+        # wrong_init = (H_all * S_init) > 0
+        # S_init[wrong_init] *= -1
+        # if debug:
+        #     print(f"    Init pre-flips: {wrong_init.sum().item()}")
+        # M = S_init.float()
+        # del S_init, wrong_init
 
-        betas = torch.logspace(
-            np.log10(self.mf_beta_init),
-            np.log10(self.mf_beta_final),
-            self.mf_n_temps)
+        # betas = torch.logspace(
+        #     np.log10(self.mf_beta_init),
+        #     np.log10(self.mf_beta_final),
+        #     self.mf_n_temps)
 
-        for beta in betas:
-            beta_val = beta.item()
-            for iteration in range(self.mf_max_iter):
-                M_hd   = M * half_delta
-                Vt_Mhd = M_hd @ V_dev
-                JM     = 2.0 * (Vt_Mhd * lam_dev) @ V_dev.t() * half_delta
-                M_next = -torch.tanh(beta_val * (H_all + JM))
-                if iteration % 5 == 4:
-                    if (M_next - M).abs().max().item() < 1e-5:
-                        M = M_next
-                        break
-                M = M_next
+        # for beta in betas:
+        #     beta_val = beta.item()
+        #     for iteration in range(self.mf_max_iter):
+        #         M_hd   = M * half_delta
+        #         Vt_Mhd = M_hd @ V_dev
+        #         JM     = 2.0 * (Vt_Mhd * lam_dev) @ V_dev.t() * half_delta
+        #         M_next = -torch.tanh(beta_val * (H_all + JM))
+        #         if iteration % 5 == 4:
+        #             if (M_next - M).abs().max().item() < 1e-5:
+        #                 M = M_next
+        #                 break
+        #         M = M_next
 
-        S_mf = torch.sign(M)
-        S_mf[S_mf == 0] = 1.0
-        total_mf_flips = (S_mf != S_nearest).sum().item()
-        del M
-
+        # S_mf = torch.sign(M)
+        # S_mf[S_mf == 0] = 1.0
+        # total_mf_flips = (S_mf != S_nearest).sum().item()
+        # del M
+        S_mf = S_nearest.clone()
+        total_mf_flips = 0
         # ── Phase 2: Spin-Wave Stability ──────────────────────────────────────
         S_hd      = S_mf * half_delta
         Vt_Shd    = S_hd @ V_dev
