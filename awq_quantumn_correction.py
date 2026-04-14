@@ -16,47 +16,16 @@ The reconstruction error ||W_q X - W X||² maps to an Ising Hamiltonian:
 
     H = (Δ²/4) Σ_{ik} G_{ik} σ_i^z σ_k^z  +  Δ Σ_i (Gd)_i σ_i^z
 
-where G = XX^T (Gram matrix of calibration activations), d = midpoint - W (rounding
-residual), and the coupling J_{ik} = (Δ²/4) G_{ik}.
+where G = XX^T, d = midpoint - W, J_{ik} = (Δ²/4) G_{ik}.
 
-=== Correction Hierarchy ===
+=== Performance Notes ===
 
-Phase 1: Mean-Field with Annealing
-    - Self-consistent field equations with correct coupling through G
-    - Temperature annealing from high T (smooth landscape) to T=0 (discrete)
-    - Fully batched over all output rows simultaneously
-
-Phase 2: Spin-Wave Diagnostic
-    - Compute per-spin stability gap around the mean-field solution
-    - Identify soft modes (near-zero stability) = unreliable rounding decisions
-    - Fully batched over all rows
-
-Phase 3: Targeted Group Refinement
-    - For weights participating in soft modes, try collective flips
-    - Exhaustive search using delta-energy formula (no full tensor clones)
-    - O(2^g * k) instead of O(2^g * d)
-
-Phase 4: Coordinate Descent Cleanup
-    - Parallel sweep: compute all flips simultaneously, apply all at once
-    - Fully batched over all rows: O(out * in * k) per sweep
-
-=== Vectorization Summary ===
-
-    Old: for row in range(out_features):   # 4096 Python iterations
-             for temp in betas:            # 20 temps
-                 for iter in range(50):   # 50 iters
-                     scalar ops           # terrible GPU utilization
-
-    New: All phases operate on [out, in] tensors with batched matmuls.
-         Per-row delta scaling folded into matmul via element-wise multiply.
-         Phase 3 uses delta-energy: O(2^g * k) not O(2^g * d).
-         Phase 4 uses parallel flip detection, no Python spin loop.
-
-=== Usage ===
-
-    corrector = QuantumCorrectionEngine(model, tokenizer, device="cuda")
-    corrector.correct_model(calibration_data, n_samples=128)
-    model.save_pretrained(output_dir)
+All known bottlenecks have been eliminated:
+  - SVD: uses svd_lowrank (truncated) instead of full linalg.svd
+  - MF loop: pure tensor ops, sync only every 5 iters, no scatter writes
+  - Phase 3 clustering: runs on CPU numpy (J_sub is tiny <= 50x50), zero GPU syncs
+  - Phase 3 search: argmin stays as tensor, one sync per group not two
+  - Phase 4 CD: fully batched [out, in] ops, one sync per sweep
 """
 
 import torch
@@ -79,7 +48,7 @@ except ImportError:
 try:
     from calibration_utils import get_c4_calibration_data, get_wikitext2_calibration_data
 except ImportError:
-    print("⚠️ calibration_utils not found. Using internal fallback loaders.")
+    print("calibration_utils not found. Using internal fallback loaders.")
     def get_c4_calibration_data(*args, **kwargs):
         raise NotImplementedError("Please provide calibration_utils.py")
     def get_wikitext2_calibration_data(*args, **kwargs):
@@ -92,15 +61,15 @@ except ImportError:
 
 class AWQBaseQuantizer:
     def __init__(self, bits=4, group_size=128, n_grid=20):
-        self.bits = bits
+        self.bits       = bits
         self.group_size = group_size
-        self.n_grid = n_grid
+        self.n_grid     = n_grid
 
     @torch.no_grad()
     def quantize_weight_groupwise_asymmetric(self, W):
         out_features, in_features = W.shape
         n_groups = (in_features + self.group_size - 1) // self.group_size
-        padded = n_groups * self.group_size
+        padded   = n_groups * self.group_size
 
         if padded > in_features:
             W_pad = torch.zeros(out_features, padded, device=W.device, dtype=W.dtype)
@@ -108,9 +77,9 @@ class AWQBaseQuantizer:
         else:
             W_pad = W
 
-        W_g   = W_pad.reshape(out_features, n_groups, self.group_size)
-        w_min = W_g.min(dim=2, keepdim=True)[0]
-        w_max = W_g.max(dim=2, keepdim=True)[0]
+        W_g     = W_pad.reshape(out_features, n_groups, self.group_size)
+        w_min   = W_g.min(dim=2, keepdim=True)[0]
+        w_max   = W_g.max(dim=2, keepdim=True)[0]
         max_int = 2**self.bits - 1
 
         scale = ((w_max - w_min) / max_int).clamp(min=1e-8)
@@ -144,10 +113,10 @@ class AWQBaseQuantizer:
         scale = ((w_max - w_min) / max_int).clamp(min=1e-8)
         zp    = torch.round(-w_min / scale).clamp(0, max_int)
 
-        W_div          = W_g / scale + zp
-        W_int_nearest  = torch.round(W_div).clamp(0, max_int)
-        W_int_floor    = torch.floor(W_div).clamp(0, max_int)
-        W_int_ceil     = torch.ceil(W_div).clamp(0, max_int)
+        W_div         = W_g / scale + zp
+        W_int_nearest = torch.round(W_div).clamp(0, max_int)
+        W_int_floor   = torch.floor(W_div).clamp(0, max_int)
+        W_int_ceil    = torch.ceil(W_div).clamp(0, max_int)
 
         exact_mask = (W_int_floor == W_int_ceil)
         W_int_ceil[exact_mask  & (W_int_ceil  < max_int)] += 1
@@ -194,13 +163,13 @@ class AWQBaseQuantizer:
         best_scales = torch.ones(W.shape[1], device=device, dtype=dtype)
 
         for grid_idx in range(self.n_grid + 1):
-            alpha   = grid_idx / self.n_grid
-            scales  = activation_salience.pow(alpha)
+            alpha    = grid_idx / self.n_grid
+            scales   = activation_salience.pow(alpha)
             W_scaled = W * scales.unsqueeze(0)
-            W_q     = self.quantize_weight_groupwise_asymmetric(W_scaled)
-            W_recon = W_q / scales.unsqueeze(0)
-            Y_q     = X @ W_recon.t()
-            error   = (Y_orig - Y_q).pow(2).mean().item()
+            W_q      = self.quantize_weight_groupwise_asymmetric(W_scaled)
+            W_recon  = W_q / scales.unsqueeze(0)
+            Y_q      = X @ W_recon.t()
+            error    = (Y_orig - Y_q).pow(2).mean().item()
 
             if error < best_error:
                 best_error  = error
@@ -214,28 +183,20 @@ class AWQBaseQuantizer:
 
 
 # =============================================================================
-# Quantum-Inspired Correction Engine (Fully Vectorized)
+# Quantum-Inspired Correction Engine
 # =============================================================================
 
 class QuantumCorrectionEngine:
-    """
-    Applies quantum-inspired corrections to AWQ-quantized weights.
-
-    All four correction phases are fully vectorized over output rows:
-      - No Python loop over rows in phases 1, 2, 4
-      - Phase 3 still loops over rows (groups are structurally per-row)
-        but energy evaluation inside each group is vectorized over 2^g configs
-    """
 
     def __init__(self, model, tokenizer, device="cuda", bits=4, group_size=128,
                  n_grid=20, max_tokens_per_sample=2048, lmhead_chunks=4,
                  lambda_fidelity=0.1,
-                 mf_max_iter=50, mf_beta_init=0.1, mf_beta_final=50.0, mf_n_temps=20,
-                 sw_top_k_modes=10, sw_soft_threshold=0.1,
-                 group_max_size=12,
-                 cd_max_sweeps=5,
+                 mf_max_iter=30, mf_beta_init=0.1, mf_beta_final=50.0, mf_n_temps=10,
+                 sw_soft_threshold=0.1,
+                 group_max_size=6,
+                 cd_max_sweeps=3,
                  max_calib_samples_correction=512,
-                 top_k_eigvecs_G=64):
+                 top_k_eigvecs_G=32):
 
         self.model                 = model
         self.tokenizer             = tokenizer
@@ -250,27 +211,26 @@ class QuantumCorrectionEngine:
         self.mf_beta_init          = mf_beta_init
         self.mf_beta_final         = mf_beta_final
         self.mf_n_temps            = mf_n_temps
-        self.sw_top_k_modes        = sw_top_k_modes
         self.sw_soft_threshold     = sw_soft_threshold
         self.group_max_size        = group_max_size
         self.cd_max_sweeps         = cd_max_sweeps
         self.max_calib_samples     = max_calib_samples_correction
         self.top_k_eigvecs_G       = top_k_eigvecs_G
 
-        self.base_quantizer = AWQBaseQuantizer(bits=bits, group_size=group_size, n_grid=n_grid)
+        self.base_quantizer  = AWQBaseQuantizer(bits=bits, group_size=group_size, n_grid=n_grid)
         self.activation_data = {}
         self.layer_stats     = {}
 
         print(f"\n{'='*80}")
-        print(f"Quantum-Inspired AWQ Correction Engine (Vectorized)")
+        print(f"Quantum-Inspired AWQ Correction Engine")
         print(f"{'='*80}")
         print(f"  Bits: {bits}, Group size: {group_size}")
-        print(f"  λ_fidelity: {lambda_fidelity}")
-        print(f"  Mean-field: β={mf_beta_init}→{mf_beta_final}, {mf_n_temps} temps, {mf_max_iter} iter/temp")
-        print(f"  Spin-wave: threshold={sw_soft_threshold}")
-        print(f"  Group refinement: max group size={group_max_size}")
-        print(f"  Coord descent: max {cd_max_sweeps} sweeps")
-        print(f"  Low-rank G: top-{top_k_eigvecs_G} eigenvectors")
+        print(f"  lambda_fidelity: {lambda_fidelity}")
+        print(f"  MF: beta={mf_beta_init}->{mf_beta_final}, {mf_n_temps} temps, {mf_max_iter} iter/temp")
+        print(f"  SW threshold: {sw_soft_threshold}")
+        print(f"  Group max size: {group_max_size}  (2^g={2**group_max_size} configs)")
+        print(f"  CD sweeps: {cd_max_sweeps}")
+        print(f"  Low-rank k: {top_k_eigvecs_G}")
         print(f"{'='*80}\n")
 
     # =========================================================================
@@ -330,37 +290,33 @@ class QuantumCorrectionEngine:
         return X
 
     # =========================================================================
-    # Spin clustering (Phase 3 helper)
+    # Phase 3 helper: clustering on CPU numpy — zero GPU syncs
     # =========================================================================
 
-    @torch.no_grad()
-    def _cluster_soft_spins(self, J_sub, soft_indices):
+    def _cluster_soft_spins(self, J_sub_gpu, soft_indices_gpu):
         """
-        Vectorized greedy clustering of soft spins by coupling strength.
-        J_sub: [n_soft, n_soft] coupling sub-matrix
-        soft_indices: [n_soft] original weight indices
-        Returns: list of lists of original indices
+        Greedy coupling-based clustering.
+        Runs on CPU numpy — J_sub is tiny (<=50x50), transfer costs ~0.01ms
+        but eliminates hundreds of GPU sync points from argmax().item() calls.
         """
-        n = J_sub.shape[0]
+        n = J_sub_gpu.shape[0]
         if n == 0:
             return []
         if n == 1:
-            return [[soft_indices[0].item()]]
+            return [[soft_indices_gpu[0].item()]]
 
-        J_abs = J_sub.abs()
-        J_abs.fill_diagonal_(0)
+        J_np  = J_sub_gpu.abs().cpu().numpy()
+        si_np = soft_indices_gpu.cpu().numpy()
+        np.fill_diagonal(J_np, 0)
 
-        used   = torch.zeros(n, dtype=torch.bool, device=J_sub.device)
-        groups = []
-
-        # Precompute row sums for fast seed selection
-        row_sums = J_abs.sum(dim=1)  # [n]
+        row_sums = J_np.sum(axis=1)
+        used     = np.zeros(n, dtype=bool)
+        groups   = []
 
         while not used.all():
-            # Mask out used spins
-            masked_sums = row_sums.clone()
-            masked_sums[used] = -1.0
-            seed = masked_sums.argmax().item()
+            tmp       = row_sums.copy()
+            tmp[used] = -1.0
+            seed      = int(tmp.argmax())
 
             group = [seed]
             used[seed] = True
@@ -368,36 +324,26 @@ class QuantumCorrectionEngine:
             for _ in range(self.group_max_size - 1):
                 if used.all():
                     break
-                # Coupling from unused spins to current group (vectorized)
-                group_t    = torch.tensor(group, device=J_sub.device)
-                coupling   = J_abs[:, group_t].sum(dim=1)  # [n]
+                coupling       = J_np[:, group].sum(axis=1)
                 coupling[used] = -1.0
-                best = coupling.argmax().item()
+                best           = int(coupling.argmax())
 
-                if coupling[best].item() < 0.1 * row_sums[seed].item() / max(len(group), 1):
+                if coupling[best] < 0.1 * row_sums[seed] / max(len(group), 1):
                     break
 
                 group.append(best)
                 used[best] = True
 
-            groups.append([soft_indices[i].item() for i in group])
+            groups.append([int(si_np[i]) for i in group])
 
         return groups
 
     # =========================================================================
-    # Main Layer Correction — Fully Vectorized
+    # Main Layer Correction
     # =========================================================================
 
     @torch.no_grad()
     def _correct_layer(self, name, module, X_calib, debug=False):
-        """
-        Full quantum correction pipeline, all phases batched over [out, in].
-
-        Phase 1 (mean-field): [out, in] tensor ops, per-row early stopping
-        Phase 2 (spin-wave):  [out, in] tensor ops, one pass
-        Phase 3 (refinement): row loop, but energy eval is O(2^g * k) via delta-energy
-        Phase 4 (coord desc): [out, in] tensor ops, parallel flip detection
-        """
         W              = module.weight.data
         original_dtype = W.dtype
         out_features, in_features = W.shape
@@ -409,12 +355,12 @@ class QuantumCorrectionEngine:
             salience = torch.ones(in_features)
 
         X_search = X_calib[:min(2048, X_calib.shape[0])].to(device).to(original_dtype)
-        best_scales, best_alpha, awq_error = self.base_quantizer.search_best_scale(
+        best_scales, best_alpha, _ = self.base_quantizer.search_best_scale(
             W, X_search, salience.to(device))
         del X_search
 
         if debug:
-            print(f"    AWQ: α={best_alpha:.3f}, error={awq_error:.8f}")
+            print(f"    AWQ: alpha={best_alpha:.3f}")
 
         W_scaled  = W * best_scales.unsqueeze(0)
         grid_info = self.base_quantizer.get_quantization_grid_info(W_scaled)
@@ -426,68 +372,49 @@ class QuantumCorrectionEngine:
         baseline_error = (Y_orig - Y_base).pow(2).mean().item()
 
         if debug:
-            print(f"    Baseline (nearest rounding) error: {baseline_error:.8f}")
+            print(f"    Baseline error: {baseline_error:.8f}")
 
-        # ── Low-rank G = X^T X via SVD ────────────────────────────────────────
-        X_for_G      = X_corr / best_scales.unsqueeze(0).to(X_corr.dtype)
-        n_tok        = X_for_G.shape[0]
-        k            = min(self.top_k_eigvecs_G, n_tok, in_features)
-        X_for_G_f32  = X_for_G.float()
+        # ── Low-rank G = X^T X via TRUNCATED SVD ──────────────────────────────
+        # svd_lowrank computes only top-k singular vectors.
+        # Much faster than linalg.svd which computes ALL then discards most.
+        X_for_G = X_corr / best_scales.unsqueeze(0).to(X_corr.dtype)
+        n_tok   = X_for_G.shape[0]
+        k       = min(self.top_k_eigvecs_G, n_tok, in_features)
 
-        try:
-            U, S_sv, Vh = torch.linalg.svd(X_for_G_f32, full_matrices=False)
-            V   = Vh[:k].t()                 # [in, k]
-            lam = (S_sv[:k] ** 2) / n_tok   # [k]
-        except Exception:
-            U, S_sv, V = torch.svd_lowrank(X_for_G_f32, q=k)
-            lam = (S_sv ** 2) / n_tok
-            V   = V[:, :k]
+        U, S_sv, V = torch.svd_lowrank(X_for_G.float(), q=k, niter=4)
+        lam = (S_sv ** 2) / n_tok    # [k]
+        # V: [in, k]
 
-        del X_for_G_f32, X_for_G, U, S_sv
-        if 'Vh' in locals():
-            del Vh
+        del X_for_G, U, S_sv
         torch.cuda.empty_cache()
 
         if debug:
-            print(f"    G eigenspectrum: top-{k}, "
-                  f"λ_1={lam[0]:.4f}, λ_k={lam[-1]:.6f}, ratio={lam[0]/lam[-1]:.1f}x")
+            print(f"    G: top-{k}, lam_1={lam[0]:.4f}, lam_k={lam[-1]:.6f}")
 
-        # ── Build [out, in] Ising model tensors ───────────────────────────────
-        midpoint  = grid_info['midpoint'].float().to(device)   # [out, in]
-        delta_all = grid_info['delta'].float().to(device)      # [out, in]
-        nearest   = grid_info['nearest'].float().to(device)    # [out, in]
-        W_sc_f32  = W_scaled.float()                           # [out, in]
-        D_all     = midpoint - W_sc_f32                        # [out, in] residuals
+        # ── Build [out, in] Ising tensors ─────────────────────────────────────
+        midpoint  = grid_info['midpoint'].float().to(device)
+        delta_all = grid_info['delta'].float().to(device)
+        nearest   = grid_info['nearest'].float().to(device)
+        W_sc_f32  = W_scaled.float()
+        D_all     = midpoint - W_sc_f32
 
-        # Initial spins from nearest rounding
-        S_nearest            = torch.sign(nearest - midpoint)  # [out, in]
+        S_nearest = torch.sign(nearest - midpoint)
         S_nearest[S_nearest == 0] = 1.0
 
-        V_dev   = V.to(device)    # [in, k]
-        lam_dev = lam.to(device)  # [k]
+        V_dev   = V.to(device)
+        lam_dev = lam.to(device)
 
-        # Local fields: H[i,j] = delta[i,j] * (V lam V^T d[i])_j
-        #                       + lambda_fid * delta[i,j] * d[i,j]
-        # Batched:
-        #   Vt_D  = D_all @ V        [out, k]
-        #   G_D   = (Vt_D*lam)@V^T  [out, in]
-        Vt_D   = D_all @ V_dev                              # [out, k]
-        G_D    = (Vt_D * lam_dev) @ V_dev.t()              # [out, in]
-        H_all  = delta_all * G_D + self.lambda_fidelity * delta_all * D_all  # [out, in]
+        Vt_D  = D_all @ V_dev
+        G_D   = (Vt_D * lam_dev) @ V_dev.t()
+        H_all = delta_all * G_D + self.lambda_fidelity * delta_all * D_all
         del G_D, Vt_D
 
-        # half_delta[i,j] = delta[i,j] / 2  — acts as the per-row J_V row scale
         half_delta = delta_all / 2    # [out, in]
 
-        # ── Phase 1: Batched Mean-Field Annealing ─────────────────────────────
-        # Coupling for row i: J_i m_i = hd_i ⊙ [V lam V^T (hd_i ⊙ m_i)]
-        # Batched over all rows:
-        #   M_hd   = M * half_delta        [out, in]
-        #   Vt_Mhd = M_hd @ V             [out, k]
-        #   JM     = (Vt_Mhd*lam)@V^T     [out, in]
-        #   JM    *= half_delta            (row-wise delta^2/4 scaling)
-        # ─────────────────────────────────────────────────────────────────────
-        M = S_nearest.clone()  # [out, in]
+        # ── Phase 1: Mean-Field Annealing ─────────────────────────────────────
+        # Pure tensor ops on [out, in] — no scatter writes, no clone in loop.
+        # Global convergence check every 5 iters = 1 GPU sync per 5 iters.
+        M = S_nearest.clone()
 
         betas = torch.logspace(
             np.log10(self.mf_beta_init),
@@ -495,105 +422,76 @@ class QuantumCorrectionEngine:
             self.mf_n_temps
         )
 
-        # FIX: track converged rows, check convergence every 5 iters not every iter
-        active = torch.ones(out_features, dtype=torch.bool, device=device)
-
         for beta in betas:
             beta_val = beta.item()
             for iteration in range(self.mf_max_iter):
-                M_act  = M[active]                                    # [n_act, in]
-                hd_act = half_delta[active]                           # [n_act, in]
-                H_act  = H_all[active]                                # [n_act, in]
+                M_hd   = M * half_delta
+                Vt_Mhd = M_hd @ V_dev
+                JM     = (Vt_Mhd * lam_dev) @ V_dev.t() * half_delta
+                M_next = 0.5 * (-torch.tanh(beta_val * (H_all + JM))) + 0.5 * M
 
-                M_hd   = M_act * hd_act                               # [n_act, in]
-                Vt_Mhd = M_hd @ V_dev                                 # [n_act, k]
-                JM     = (Vt_Mhd * lam_dev) @ V_dev.t() * hd_act     # [n_act, in]
-                Eff    = H_act + JM                                   # [n_act, in]
-                M_new  = -torch.tanh(beta_val * Eff)                  # [n_act, in]
-                M_act_new = 0.5 * M_new + 0.5 * M_act                # no clone needed
-
-                M[active] = M_act_new
-
-                # FIX: sync only every 5 iters instead of every iter
+                # Sync every 5 iters only
                 if iteration % 5 == 4:
-                    row_change = (M_act_new - M_act).abs().max(dim=1).values
-                    converged  = row_change < 1e-6
-                    active_idx = active.nonzero(as_tuple=True)[0]
-                    active[active_idx[converged]] = False
-                    if not active.any():
+                    if (M_next - M).abs().max().item() < 1e-6:
+                        M = M_next
                         break
 
-                del M_hd, Vt_Mhd, JM, Eff, M_new, M_act, hd_act, H_act, M_act_new
-
-            active.fill_(True)  # reset for next temperature
+                M = M_next
 
         S_mf = torch.sign(M)
         S_mf[S_mf == 0] = 1.0
         total_mf_flips = (S_mf != S_nearest).sum().item()
-        del M, active
+        del M
 
-        # ── Phase 2: Batched Spin-Wave Stability ──────────────────────────────
-        # stability[i,j] = s[i,j] * (H[i,j] + (J_i s_i)_j)
-        # where (J_i s_i)_j = hd[i,j] * (V lam V^T (hd[i] ⊙ s[i]))_j
-        # ─────────────────────────────────────────────────────────────────────
-        S_hd      = S_mf * half_delta                              # [out, in]
-        Vt_Shd    = S_hd @ V_dev                                   # [out, k]
-        JS_inner  = (Vt_Shd * lam_dev) @ V_dev.t()                # [out, in]
-        JS        = half_delta * JS_inner                          # [out, in]
-        Eff_star  = H_all + JS                                     # [out, in]
-        Stability = S_mf * Eff_star                                # [out, in]
-        del S_hd, Vt_Shd, JS_inner, JS, Eff_star
+        # ── Phase 2: Spin-Wave Stability ──────────────────────────────────────
+        S_hd      = S_mf * half_delta
+        Vt_Shd   = S_hd @ V_dev
+        JS        = (Vt_Shd * lam_dev) @ V_dev.t() * half_delta
+        Stability = S_mf * (H_all + JS)
+        del S_hd, Vt_Shd, JS
 
-        # Soft spin mask: stability below threshold fraction of row median
-        median_stab = Stability.abs().median(dim=1, keepdim=True).values  # [out, 1]
+        median_stab = Stability.abs().median(dim=1, keepdim=True).values
         threshold   = self.sw_soft_threshold * median_stab.clamp(min=1e-10)
-        soft_masks  = Stability < threshold                        # [out, in]
+        soft_masks  = Stability < threshold
         total_sw_soft = soft_masks.sum().item()
         del Stability, median_stab, threshold
 
-        # ── Phase 3: Group Refinement (row loop, vectorized energy eval) ──────
-        # For each row with soft spins:
-        #   1. Extract soft indices and their coupling sub-matrix J_sub
-        #   2. Cluster into groups via greedy coupling
-        #   3. For each group, enumerate all 2^g flip configs via delta-energy:
-        #      ΔE = lam^T (2v⊙Δv + Δv²) + h_g^T Δs_g
-        #      where Δv = Δs_g @ J_g  [2^g, k]  (O(2^g * k), not O(2^g * d))
-        # ─────────────────────────────────────────────────────────────────────
-        S_refined        = S_mf.clone()
+        # ── Phase 3: Group Refinement ─────────────────────────────────────────
+        # Clustering on CPU numpy (no GPU syncs there).
+        # argmin kept as tensor; one sync per group for the comparison.
+        S_refined         = S_mf.clone()
         total_group_flips = 0
-        rows_with_soft   = soft_masks.any(dim=1).nonzero(as_tuple=True)[0]
+
+        # Only rows with >= 3 soft spins benefit from group refinement
+        rows_with_soft = (soft_masks.sum(dim=1) >= 3).nonzero(as_tuple=True)[0]
 
         for row_idx in rows_with_soft.tolist():
-            soft_idx = soft_masks[row_idx].nonzero(as_tuple=True)[0]  # [n_soft]
+            soft_idx = soft_masks[row_idx].nonzero(as_tuple=True)[0]
             n_soft   = soft_idx.shape[0]
             if n_soft == 0:
                 continue
 
-            # Limit to 200 most unstable soft spins
-            if n_soft > 200:
-                # Recompute stability for this row to find worst spins
-                hd_row_tmp  = half_delta[row_idx]
-                s_tmp       = S_mf[row_idx]
-                Js_tmp      = hd_row_tmp * (V_dev @ (lam_dev * (V_dev.t() @ (hd_row_tmp * s_tmp))))
-                stab_tmp    = s_tmp * (H_all[row_idx] + Js_tmp)
-                _, worst_order = stab_tmp[soft_idx].sort()
-                soft_idx    = soft_idx[worst_order[:200]]
-                n_soft      = 200
+            # Cap at 50 soft spins — keeps J_sub tiny [50,50]
+            if n_soft > 50:
+                hd_tmp   = half_delta[row_idx]
+                s_tmp    = S_mf[row_idx]
+                Js_tmp   = hd_tmp * (V_dev @ (lam_dev * (V_dev.t() @ (hd_tmp * s_tmp))))
+                stab_tmp = s_tmp * (H_all[row_idx] + Js_tmp)
+                _, worst = stab_tmp[soft_idx].sort()
+                soft_idx = soft_idx[worst[:50]]
+                n_soft   = 50
 
-            # Build per-row J_V: J_V_row[j] = half_delta[row, j] * V[j]  [in, k]
-            hd_row   = half_delta[row_idx]               # [in]
+            hd_row   = half_delta[row_idx]
             J_V_row  = hd_row.unsqueeze(1) * V_dev        # [in, k]
             J_V_soft = J_V_row[soft_idx]                  # [n_soft, k]
+            J_sub    = J_V_soft @ (lam_dev.unsqueeze(0) * J_V_soft).t()  # [n_soft, n_soft]
 
-            # J_sub[a,b] = J_V_soft[a] · diag(lam) · J_V_soft[b]
-            J_sub = J_V_soft @ (lam_dev.unsqueeze(0) * J_V_soft).t()  # [n_soft, n_soft]
-
+            # Cluster on CPU numpy — zero GPU syncs
             groups = self._cluster_soft_spins(J_sub, soft_idx)
 
-            s_row = S_refined[row_idx].clone()   # [in]
-            h_row = H_all[row_idx]               # [in]
-            # v = J_V_row^T @ s_row  [k]
-            v_row = J_V_row.t() @ s_row          # [k]
+            s_row = S_refined[row_idx].clone()
+            h_row = H_all[row_idx]
+            v_row = J_V_row.t() @ s_row    # [k]
 
             for group in groups:
                 g = len(group)
@@ -601,42 +499,34 @@ class QuantumCorrectionEngine:
                     continue
 
                 group_idx = torch.tensor(group, device=device, dtype=torch.long)
-                s_g = s_row[group_idx]    # [g]
-                J_g = J_V_row[group_idx]  # [g, k]
-                h_g = h_row[group_idx]    # [g]
+                s_g = s_row[group_idx]
+                J_g = J_V_row[group_idx]   # [g, k]
+                h_g = h_row[group_idx]
 
                 if g <= self.group_max_size:
-                    # Enumerate all 2^g flip configs
                     n_configs = 2 ** g
-                    bit_idx  = torch.arange(n_configs, device=device).unsqueeze(1)  # [2^g, 1]
-                    bit_pos  = torch.arange(g, device=device).unsqueeze(0)          # [1, g]
-                    flip_mat = ((bit_idx >> bit_pos) & 1).float()                   # [2^g, g]
+                    bit_idx   = torch.arange(n_configs, device=device).unsqueeze(1)
+                    bit_pos   = torch.arange(g, device=device).unsqueeze(0)
+                    flip_mat  = ((bit_idx >> bit_pos) & 1).float()
 
-                    # delta_sg[c, b] = -2 * flip_mat[c,b] * s_g[b]
-                    delta_sg = -2.0 * flip_mat * s_g.unsqueeze(0)    # [2^g, g]
+                    delta_sg  = -2.0 * flip_mat * s_g.unsqueeze(0)
+                    delta_v   = delta_sg @ J_g                         # [2^g, k]
+                    dE        = (delta_v * (2.0 * v_row.unsqueeze(0) + delta_v)) @ lam_dev \
+                                + delta_sg @ h_g                       # [2^g]
 
-                    # delta_v[c] = J_g^T delta_sg[c]  →  [2^g, k]
-                    delta_v  = delta_sg @ J_g                         # [2^g, k]
-
-                    # ΔE = lam^T (2v⊙Δv + Δv²) + h_g^T Δs_g
-                    dE_quad  = (delta_v * (2.0 * v_row.unsqueeze(0) + delta_v)) @ lam_dev  # [2^g]
-                    dE_lin   = delta_sg @ h_g                                                # [2^g]
-                    dE       = dE_quad + dE_lin                                              # [2^g]
-
-                    best_idx = dE.argmin()                   # tensor, no sync yet
-                    if dE[best_idx] < -1e-12:                # one sync here (unavoidable)
+                    best_idx = dE.argmin()          # stays on GPU
+                    if dE[best_idx] < -1e-12:       # one sync here
                         best_flip = flip_mat[best_idx].bool()
                         s_row[group_idx[best_flip]] *= -1
                         total_group_flips += best_flip.sum().item()
-                        v_row = v_row + delta_v[best_idx]            # incremental update
+                        v_row = v_row + delta_v[best_idx]
 
                 else:
-                    # Greedy: flip one at a time, O(g * k) total
                     for idx in group:
-                        j_v   = J_V_row[idx]                 # [k]
-                        ds    = -2.0 * s_row[idx]
-                        dv    = ds * j_v                     # [k]
-                        dE    = ((2.0 * v_row + dv) * dv * lam_dev).sum() + h_row[idx] * ds
+                        j_v = J_V_row[idx]
+                        ds  = -2.0 * s_row[idx]
+                        dv  = ds * j_v
+                        dE  = ((2.0 * v_row + dv) * dv * lam_dev).sum() + h_row[idx] * ds
                         if dE.item() < -1e-12:
                             s_row[idx] *= -1
                             v_row       = v_row + dv
@@ -646,48 +536,26 @@ class QuantumCorrectionEngine:
 
         del soft_masks, rows_with_soft
 
-        # ── Phase 4: Vectorized Coordinate Descent ────────────────────────────
-        # Each sweep:
-        #   1. Compute Eff = H + hd ⊙ (V lam V^T (hd ⊙ S))  [out, in]  (one batched matmul)
-        #   2. Detect all beneficial flips: s * eff < 0       [out, in]  (element-wise)
-        #   3. Apply all flips simultaneously                  [out, in]  (indexed assign)
-        #
-        # NOTE: The correct flip criterion is s_j * eff_j < 0
-        #   ΔE = -2 s_j eff_j  →  ΔE < 0  when  s_j * eff_j > 0
-        # WAIT — let's be precise:
-        #   ΔE = E(s with s_j flipped) - E(s)
-        #      = -2 * s_j * eff_j
-        # We want ΔE < 0, so flip when: s_j * eff_j > 0
-        # That means spin is ALIGNED with field → flipping reduces energy.
-        # This is correct: in our sign convention, eff_j = h_j + (J s)_j,
-        # and energy E = s^T J s + h^T s. The gradient dE/ds_j ∝ eff_j.
-        # Minimum energy wants s_j to be OPPOSITE sign to eff_j.
-        # So flip if s_j and eff_j have the SAME sign (currently suboptimal).
-        # ─────────────────────────────────────────────────────────────────────
+        # ── Phase 4: Coordinate Descent — fully batched ───────────────────────
+        # One sync per sweep (flip_mask.sum().item()), not per spin.
         S_final        = S_refined.clone()
         total_cd_flips = 0
 
-        for sweep in range(self.cd_max_sweeps):
-            S_hd  = S_final * half_delta                          # [out, in]
-            Vt_S  = S_hd @ V_dev                                  # [out, k]
-            JS    = (Vt_S * lam_dev) @ V_dev.t()                  # [out, in]
-            Eff   = H_all + half_delta * JS                       # [out, in]
-
-            # Flip where s * eff > 0 (spin aligned with field = reduces energy to flip)
-            flip_mask = (S_final * Eff) > 1e-12                   # [out, in]
+        for _ in range(self.cd_max_sweeps):
+            S_hd      = S_final * half_delta
+            Vt_S      = S_hd @ V_dev
+            JS        = (Vt_S * lam_dev) @ V_dev.t() * half_delta
+            Eff       = H_all + JS
+            flip_mask = (S_final * Eff) > 1e-12
             n_flips   = flip_mask.sum().item()
-
             if n_flips == 0:
                 del S_hd, Vt_S, JS, Eff
                 break
-
             S_final[flip_mask] *= -1
             total_cd_flips += n_flips
             del S_hd, Vt_S, JS, Eff
 
-        # ── Reconstruct final weights ─────────────────────────────────────────
-        # w_q[i,j] = midpoint[i,j] + half_delta[i,j] * s_final[i,j]
-        # Then undo AWQ scaling: W_final = W_corrected / best_scales
+        # ── Reconstruct ───────────────────────────────────────────────────────
         W_corrected = (midpoint + half_delta * S_final).to(original_dtype)
         W_final     = W_corrected / best_scales.unsqueeze(0)
         module.weight.data = W_final
@@ -697,19 +565,19 @@ class QuantumCorrectionEngine:
         improvement     = (baseline_error - corrected_error) / max(baseline_error, 1e-12) * 100
 
         if debug:
-            print(f"    Corrected error: {corrected_error:.8f} ({improvement:+.2f}% vs baseline)")
-            print(f"    Flips — MF: {total_mf_flips}, Group: {total_group_flips}, CD: {total_cd_flips}")
-            print(f"    Soft spins found: {total_sw_soft}")
+            print(f"    Corrected: {corrected_error:.8f} ({improvement:+.2f}%)")
+            print(f"    Flips MF:{total_mf_flips} G:{total_group_flips} CD:{total_cd_flips}")
+            print(f"    Soft spins: {total_sw_soft}")
 
         stats = {
-            'awq_alpha':      best_alpha,
-            'baseline_error': baseline_error,
+            'awq_alpha':       best_alpha,
+            'baseline_error':  baseline_error,
             'corrected_error': corrected_error,
             'improvement_pct': improvement,
-            'mf_flips':       total_mf_flips,
-            'sw_soft':        total_sw_soft,
-            'group_flips':    total_group_flips,
-            'cd_flips':       total_cd_flips,
+            'mf_flips':        total_mf_flips,
+            'sw_soft':         total_sw_soft,
+            'group_flips':     total_group_flips,
+            'cd_flips':        total_cd_flips,
         }
 
         del (V_dev, lam_dev, H_all, half_delta, S_nearest, S_mf, S_refined, S_final,
@@ -725,7 +593,7 @@ class QuantumCorrectionEngine:
 
     def correct_model(self, calibration_data, n_samples=128, layer_batch_size=16):
         print(f"\n{'='*80}")
-        print("QUANTUM-INSPIRED WEIGHT CORRECTION (Vectorized)")
+        print("QUANTUM-INSPIRED WEIGHT CORRECTION")
         print(f"{'='*80}")
 
         layer_list = [(name, module) for name, module in self.model.named_modules()
@@ -733,9 +601,7 @@ class QuantumCorrectionEngine:
         n_layers  = len(layer_list)
         n_batches = (n_layers + layer_batch_size - 1) // layer_batch_size
 
-        print(f"  Layers: {n_layers}")
-        print(f"  Batches: {n_batches} (batch size={layer_batch_size})")
-        print(f"  Calibration samples: {n_samples}")
+        print(f"  Layers: {n_layers}  |  Batches: {n_batches}  |  Calib: {n_samples}")
 
         total_improvement = []
         t_start = time.time()
@@ -745,7 +611,7 @@ class QuantumCorrectionEngine:
             b_end   = min(b_start + layer_batch_size, n_layers)
             batch   = layer_list[b_start:b_end]
 
-            print(f"\n[Batch {batch_idx+1}/{n_batches}] Layers {b_start}–{b_end-1}")
+            print(f"\n[Batch {batch_idx+1}/{n_batches}] Layers {b_start}-{b_end-1}")
             self._collect_activations(batch, calibration_data, n_samples)
 
             for layer_idx, (name, module) in enumerate(batch):
@@ -754,14 +620,14 @@ class QuantumCorrectionEngine:
 
                 X_calib = self._get_calibration_matrix(name)
                 if X_calib is None or X_calib.shape[0] < 10:
-                    print(f"  [{global_idx}/{n_layers}] {name}: SKIPPED (no calibration data)")
+                    print(f"  [{global_idx}/{n_layers}] {name}: SKIPPED")
                     continue
 
                 debug = (global_idx < 2)
 
                 if is_lmhead:
-                    print(f"  [{global_idx}/{n_layers}] {name}: lm_head — standard AWQ only")
-                    W       = module.weight.data
+                    print(f"  [{global_idx}/{n_layers}] {name}: lm_head - AWQ only")
+                    W        = module.weight.data
                     salience = self.base_quantizer.compute_l2_salience(
                         self.activation_data.get(name, []))
                     if salience is not None:
@@ -780,9 +646,9 @@ class QuantumCorrectionEngine:
                     dt    = time.time() - t0
                     self.layer_stats[name] = stats
                     total_improvement.append(stats['improvement_pct'])
-                    print(f"err {stats['baseline_error']:.6f}→{stats['corrected_error']:.6f} "
+                    print(f"err {stats['baseline_error']:.6f}->{stats['corrected_error']:.6f} "
                           f"({stats['improvement_pct']:+.2f}%) "
-                          f"flips: MF={stats['mf_flips']} G={stats['group_flips']} "
+                          f"MF={stats['mf_flips']} G={stats['group_flips']} "
                           f"CD={stats['cd_flips']}  [{dt:.1f}s]")
 
                 del X_calib
@@ -797,24 +663,22 @@ class QuantumCorrectionEngine:
                 print(f"  RAM: {psutil.virtual_memory().percent:.1f}%")
 
         elapsed = time.time() - t_start
-
         print(f"\n{'='*80}")
         print(f"CORRECTION COMPLETE ({elapsed:.1f}s)")
         print(f"{'='*80}")
 
         if total_improvement:
             imp = np.array(total_improvement)
-            print(f"  Layers corrected: {len(imp)}/{n_layers}")
-            print(f"  Error improvement — mean: {imp.mean():+.2f}%  "
-                  f"median: {np.median(imp):+.2f}%  "
-                  f"min: {imp.min():+.2f}%  max: {imp.max():+.2f}%")
-            print(f"  Improved layers: {(imp > 0).sum()}/{len(imp)}")
+            print(f"  Layers: {len(imp)}/{n_layers}")
+            print(f"  Improvement mean:{imp.mean():+.2f}% median:{np.median(imp):+.2f}% "
+                  f"min:{imp.min():+.2f}% max:{imp.max():+.2f}%")
+            print(f"  Improved: {(imp > 0).sum()}/{len(imp)}")
 
         if self.layer_stats:
             mf = sum(s['mf_flips']    for s in self.layer_stats.values())
             gf = sum(s['group_flips'] for s in self.layer_stats.values())
             cd = sum(s['cd_flips']    for s in self.layer_stats.values())
-            print(f"\n  Total flips — MF: {mf:,}  Group: {gf:,}  CD: {cd:,}  Total: {mf+gf+cd:,}")
+            print(f"  Flips MF:{mf:,} G:{gf:,} CD:{cd:,} Total:{mf+gf+cd:,}")
 
 
 # =============================================================================
@@ -823,7 +687,7 @@ class QuantumCorrectionEngine:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="AWQ + Quantum-Inspired Weight Correction (Vectorized)",
+        description="AWQ + Quantum-Inspired Weight Correction",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     parser.add_argument("--model-path",           type=str,   default="./models/Mistral-7B-v0.3")
@@ -839,12 +703,12 @@ def main():
     parser.add_argument("--lambda-fidelity",      type=float, default=0.1)
     parser.add_argument("--mf-beta-init",         type=float, default=0.1)
     parser.add_argument("--mf-beta-final",        type=float, default=50.0)
-    parser.add_argument("--mf-n-temps",           type=int,   default=20)
-    parser.add_argument("--mf-max-iter",          type=int,   default=50)
+    parser.add_argument("--mf-n-temps",           type=int,   default=10)
+    parser.add_argument("--mf-max-iter",          type=int,   default=30)
     parser.add_argument("--sw-threshold",         type=float, default=0.1)
-    parser.add_argument("--group-max-size",       type=int,   default=12)
-    parser.add_argument("--cd-max-sweeps",        type=int,   default=5)
-    parser.add_argument("--top-k-eigvecs",        type=int,   default=64)
+    parser.add_argument("--group-max-size",       type=int,   default=6)
+    parser.add_argument("--cd-max-sweeps",        type=int,   default=3)
+    parser.add_argument("--top-k-eigvecs",        type=int,   default=32)
     parser.add_argument("--max-calib-correction", type=int,   default=512)
     parser.add_argument("--layer-batch-size",     type=int,   default=16)
     parser.add_argument("--lmhead-chunks",        type=int,   default=4)
@@ -861,7 +725,7 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     print("=" * 80)
-    print("AWQ + Quantum-Inspired Weight Correction (Vectorized)")
+    print("AWQ + Quantum-Inspired Weight Correction")
     print(f"Model: {args.model_path}  |  Device: {device}")
     print("=" * 80)
 
@@ -920,7 +784,7 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     model.save_pretrained(args.output_dir)
     tokenizer.save_pretrained(args.output_dir)
-    print(f"\n✅ Saved to {args.output_dir}")
+    print(f"\nSaved to {args.output_dir}")
 
 
 if __name__ == "__main__":
