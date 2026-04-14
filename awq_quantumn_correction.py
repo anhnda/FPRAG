@@ -898,16 +898,17 @@ class QuantumCorrectionEngine:
 
         # X = U S V^T, so X^T X = V S^2 V^T
         # Use randomized SVD for efficiency on GPU
+        X_for_G_f32 = X_for_G.float()
         try:
-            U, S, Vh = torch.linalg.svd(X_for_G, full_matrices=False)
+            U, S, Vh = torch.linalg.svd(X_for_G_f32, full_matrices=False)
             V = Vh[:k].t()  # [in_features, k]
             lam = (S[:k] ** 2) / n_tok  # eigenvalues of G/n_tok (normalized)
         except Exception:
             # Fallback: use torch.svd_lowrank
-            U, S, V = torch.svd_lowrank(X_for_G, q=k)
+            U, S, V = torch.svd_lowrank(X_for_G_f32, q=k)
             lam = (S ** 2) / n_tok
             V = V[:, :k]
-
+        del X_for_G_f32
         del X_for_G, U, S
         if 'Vh' in dir():
             del Vh
