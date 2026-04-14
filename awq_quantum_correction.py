@@ -421,7 +421,11 @@ class TFIsingCorrectionEngine:
         total_mf_flips = 0
 
         # Uncertain = correctable: near midpoint, Gamma above threshold
-        uncertain_mask = Gamma > 0.7   # |D/hd| < 0.7, i.e. within 70% of midpoint
+        # Only uncertain spins where H is weak — coupling could dominate
+        # |H| small means local field doesn't strongly prefer either direction
+        H_magnitude = H_all.abs()
+        H_threshold = H_magnitude.median() * 0.5
+        uncertain_mask = (Gamma > 0.7) & (H_magnitude < H_threshold)
         total_uncertain = uncertain_mask.sum().item()
 
         if debug:
