@@ -1,23 +1,25 @@
 """
-AWQ Quantum-Inspired Weight Correction
-Transverse-Field Ising Model for Rounding Correction
+AWQ + Transverse-Field Ising Model Weight Correction
+awq_tfim_correction.py
 
 Energy formulation:
-    H = Σ_ij J_ij s_i s_j + Σ_i h_i s_i + Σ_i Γ_i σ_x_i
+    E(s) = ||X_corr @ (hd*s - D).T||^2 / n  +  λ||hd*s - D||^2
 
-where:
-    J_ij   = hd_i * G_ij * hd_j      (reconstruction coupling via G = X^T X / n)
-    h_i    = -2*hd_i*(GD)_i - 2*λ*hd_i*D_i  (pull toward nearest rounding)
-    Γ_i    = γ * |D_i / hd_i|        (tunneling cost from grid geometry)
-    D_i    = W_sc_i - midpoint_i     (displacement from midpoint)
+Spin variables: s_i ∈ {-1, +1}
+    s=+1 → ceil,  s=-1 → floor
+    D_i = W_sc_i - midpoint_i  (displacement from midpoint)
+    hd_i = delta_i / 2         (half grid step, always > 0)
 
-Transverse-Field Ising MF equations (Sachdev):
-    E_i   = sqrt(eff_i^2 + Γ_i^2)
-    m^z_i = -tanh(β * E_i) * eff_i / E_i   (rounding decision)
-    m^x_i =  tanh(β * E_i) * Γ_i  / E_i   (quantum uncertainty)
+Transverse field (quantum insight):
+    Γ_i = γ * (1 - |D_i / hd_i|)
+    Γ→1: near midpoint  → uncertain, worth correcting
+    Γ→0: near grid point → certain,  leave at nearest
 
-Uncertain spins: |m^z_i| < |m^x_i|  →  |eff_i| < Γ_i
-These are near-midpoint weights where coupling drives the decision.
+Local field (fidelity only — G_D unreliable at low rank):
+    H_i = -2 * hd_i * λ * D_i
+
+Correction: group exhaustive search on uncertain spins,
+            followed by CD cleanup restricted to uncertain spins.
 """
 
 import torch
@@ -156,50 +158,49 @@ class TFIsingCorrectionEngine:
     """
     Transverse-Field Ising Model correction engine.
 
-    Each weight's rounding decision (floor/ceil) is a spin s_i ∈ {-1, +1}.
-    The transverse field Γ_i = γ * |D_i / hd_i| encodes the cost of flipping
-    away from nearest rounding — derived purely from grid geometry.
-
-    Near-gridpoint weights (Γ_i → 0): classical, pinned at nearest rounding.
-    Near-midpoint weights (Γ_i → 1): quantum, free to be corrected by coupling.
+    Key insight: Γ_i = γ*(1 - |D_i/hd_i|) identifies which weights are
+    genuinely uncertain (near midpoint between floor and ceil).
+    Only these weights are candidates for rounding correction.
+    Near-gridpoint weights are left at nearest rounding — they are classical.
     """
 
     def __init__(self, model, tokenizer, device="cuda", bits=4, group_size=128,
                  n_grid=20, max_tokens_per_sample=2048,
-                 lambda_fidelity=1.0, gamma=1.0,
-                 mf_max_iter=50, mf_beta_init=0.1, mf_beta_final=50.0, mf_n_temps=20,
-                 group_max_size=6, cd_max_sweeps=2,
+                 lambda_fidelity=1.0, gamma=1.0, gamma_threshold=0.7,
+                 group_max_size=6, cd_max_sweeps=3,
                  max_calib_samples=512, top_k_eigvecs=32,
-                 layer_batch_size=16):
+                 layer_batch_size=16, max_rows=512):
 
-        self.model               = model
-        self.tokenizer           = tokenizer
-        self.device              = device
-        self.bits                = bits
-        self.group_size          = group_size
-        self.n_grid              = n_grid
+        self.model                 = model
+        self.tokenizer             = tokenizer
+        self.device                = device
+        self.bits                  = bits
+        self.group_size            = group_size
+        self.n_grid                = n_grid
         self.max_tokens_per_sample = max_tokens_per_sample
-        self.lambda_fidelity     = lambda_fidelity
-        self.gamma               = gamma
-        self.mf_max_iter         = mf_max_iter
-        self.mf_beta_init        = mf_beta_init
-        self.mf_beta_final       = mf_beta_final
-        self.mf_n_temps          = mf_n_temps
-        self.group_max_size      = group_max_size
-        self.cd_max_sweeps       = cd_max_sweeps
-        self.max_calib_samples   = max_calib_samples
-        self.top_k_eigvecs       = top_k_eigvecs
-        self.layer_batch_size    = layer_batch_size
-        self.base_quantizer      = AWQBaseQuantizer(bits=bits, group_size=group_size, n_grid=n_grid)
-        self.activation_data     = {}
-        self.layer_stats         = {}
+        self.lambda_fidelity       = lambda_fidelity
+        self.gamma                 = gamma
+        self.gamma_threshold       = gamma_threshold
+        self.group_max_size        = group_max_size
+        self.cd_max_sweeps         = cd_max_sweeps
+        self.max_calib_samples     = max_calib_samples
+        self.top_k_eigvecs         = top_k_eigvecs
+        self.layer_batch_size      = layer_batch_size
+        self.max_rows              = max_rows
+        self.base_quantizer        = AWQBaseQuantizer(
+            bits=bits, group_size=group_size, n_grid=n_grid)
+        self.activation_data       = {}
+        self.layer_stats           = {}
 
         print(f"\n{'='*80}")
         print(f"Transverse-Field Ising AWQ Correction Engine")
         print(f"{'='*80}")
-        print(f"  Bits:{bits}  GroupSize:{group_size}  lambda_fid:{lambda_fidelity}  gamma:{gamma}")
-        print(f"  MF: beta={mf_beta_init}->{mf_beta_final}  temps={mf_n_temps}  iter={mf_max_iter}")
-        print(f"  Group max:{group_max_size}  CD sweeps:{cd_max_sweeps}  Low-rank k:{top_k_eigvecs}")
+        print(f"  Bits:{bits}  GroupSize:{group_size}  "
+              f"lambda_fid:{lambda_fidelity}  gamma:{gamma}  "
+              f"gamma_threshold:{gamma_threshold}")
+        print(f"  Group max:{group_max_size}(2^g={2**group_max_size})  "
+              f"CD sweeps:{cd_max_sweeps}  Low-rank k:{top_k_eigvecs}")
+        print(f"  Max rows/layer:{max_rows}  Calib samples:{max_calib_samples}")
         print(f"{'='*80}\n")
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -226,8 +227,8 @@ class TFIsingCorrectionEngine:
         successful = 0
         for text in calibration_data[:n_samples]:
             try:
-                inputs = self.tokenizer(text, return_tensors="pt",
-                                        truncation=True, max_length=512)
+                inputs = self.tokenizer(
+                    text, return_tensors="pt", truncation=True, max_length=512)
                 inputs = {k: v.to(self.device) for k, v in inputs.items()}
                 self.model(**inputs, use_cache=False, return_dict=True)
                 successful += 1
@@ -253,18 +254,18 @@ class TFIsingCorrectionEngine:
         return X
 
     # ─────────────────────────────────────────────────────────────────────────
-    # Group clustering for uncertain spins
+    # Group clustering
     # ─────────────────────────────────────────────────────────────────────────
 
-    def _cluster_uncertain_spins(self, J_sub, soft_indices):
-        """Greedy clustering by coupling strength — CPU numpy."""
+    def _cluster_spins(self, J_sub, indices):
+        """Greedy clustering by coupling strength — CPU numpy, no GPU syncs."""
         n = J_sub.shape[0]
         if n == 0:
             return []
         if n == 1:
-            return [[soft_indices[0].item()]]
+            return [[indices[0].item()]]
         J_np  = J_sub.abs().cpu().numpy()
-        si_np = soft_indices.cpu().numpy()
+        si_np = indices.cpu().numpy()
         np.fill_diagonal(J_np, 0)
         row_sums = J_np.sum(axis=1)
         used     = np.zeros(n, dtype=bool)
@@ -328,7 +329,7 @@ class TFIsingCorrectionEngine:
         n_tok = X_corr.shape[0]
         k     = min(self.top_k_eigvecs, n_tok, in_features)
         U, S_sv, V = torch.svd_lowrank(X_corr.float(), q=k, niter=4)
-        lam = (S_sv ** 2) / n_tok      # eigenvalues of G  [k]
+        lam = (S_sv ** 2) / n_tok
         del U, S_sv
         torch.cuda.empty_cache()
         if debug:
@@ -338,128 +339,50 @@ class TFIsingCorrectionEngine:
         midpoint   = grid_info['midpoint'].float().to(device)
         delta_all  = grid_info['delta'].float().to(device)
         nearest    = grid_info['nearest'].float().to(device)
-        half_delta = delta_all / 2                           # hd > 0 always
-        D_all      = W_sc_f32 - midpoint                    # displacement from midpoint
+        half_delta = delta_all / 2
+        D_all      = W_sc_f32 - midpoint
         V_dev      = V.to(device)
         lam_dev    = lam.to(device)
 
-        S_nearest  = torch.sign(nearest - midpoint)
+        S_nearest = torch.sign(nearest - midpoint)
         S_nearest[S_nearest == 0] = 1.0
 
-        # Local field: h_i = -2*hd*(GD)_i - 2*λ*hd*D_i
-        # Pulls s toward sign(D) = S_nearest
-        Vt_D  = D_all @ V_dev                                # [out, k]
-        G_D   = (Vt_D * lam_dev) @ V_dev.t()                # [out, in]
-        H_all = -2.0 * half_delta * (G_D + self.lambda_fidelity * D_all)
-        del G_D, Vt_D
+        # H: fidelity only (G_D unreliable at low rank, sign alignment ~0.5)
+        # H_i = -2*hd_i*λ*D_i  → pulls s toward sign(D) = S_nearest
+        H_all = -2.0 * half_delta * self.lambda_fidelity * D_all
 
-        # ── Transverse field: Γ_i = γ * |D_i / hd_i| ─────────────────────────
-        # Key innovation: cost of flipping derived from grid geometry.
-        # Γ_i → 0: weight near grid point → classical, hard to flip
-        # Γ_i → 1: weight near midpoint   → quantum, free to be corrected
-        Gamma = self.gamma * (1.0 - (D_all.abs() / half_delta.clamp(min=1e-10)).clamp(0, 1))
+        # ── Transverse field: quantum uncertainty from grid geometry ──────────
+        # Γ_i = γ*(1 - |D_i/hd_i|)
+        # Γ→1: near midpoint  → uncertain, candidate for correction
+        # Γ→0: near grid point → certain, leave at nearest rounding
+        Gamma = self.gamma * (
+            1.0 - (D_all.abs() / half_delta.clamp(min=1e-10)).clamp(0, 1))
 
-        if debug:
-            print(f"    Gamma: mean={Gamma.mean():.3f} "
-                  f"frac_uncertain={((Gamma > 0.5).float().mean()):.3f}")
-
-        # ── TFIM Mean-Field Annealing ─────────────────────────────────────────
-        # MF equations for transverse-field Ising model (Sachdev):
-        #   eff_i = h_i + 2*hd_i*(V lam V^T (m^z * hd))_i
-        #   E_i   = sqrt(eff_i^2 + Γ_i^2)
-        #   m^z_i = -tanh(β*E_i) * eff_i / E_i
-        #   m^x_i =  tanh(β*E_i) * Γ_i  / E_i
-        #
-        # Near-gridpoint (Γ→0): E≈|eff|, m^z→-sign(eff)  classical
-        # Near-midpoint  (Γ→1): E≈1,    m^z≈-eff          soft/quantum
-
-        # Initialize from uncoupled solution: m^z_i = -sign(h_i)
-        # (ignores J coupling, but correct direction for local field)
-        Mz = -torch.sign(H_all)
-        Mz[Mz == 0] = 1.0
-        Mz = Mz.float()
-
-        betas = torch.logspace(
-            np.log10(self.mf_beta_init),
-            np.log10(self.mf_beta_final),
-            self.mf_n_temps)
-
-        for beta in betas:
-            beta_val = beta.item()
-            for iteration in range(self.mf_max_iter):
-                # Effective field: h + J*m^z  (low-rank J via V, lam)
-                Mz_hd   = Mz * half_delta                              # [out, in]
-                Vt_Mzhd = Mz_hd @ V_dev                               # [out, k]
-                J_Mz    = 2.0 * (Vt_Mzhd * lam_dev) @ V_dev.t() \
-                          * half_delta                                  # [out, in]
-                eff     = H_all + J_Mz                                 # [out, in]
-
-                # TFIM MF update
-                E       = torch.sqrt(eff ** 2 + Gamma ** 2).clamp(min=1e-10)
-                tanhbE  = torch.tanh(beta_val * E)
-                Mz_next = -tanhbE * eff / E
-
-                if iteration % 5 == 4:
-                    if (Mz_next - Mz).abs().max().item() < 1e-5:
-                        Mz = Mz_next
-                        break
-                Mz = Mz_next
-
-        # Final m^x for uncertainty
-        Mz_hd   = Mz * half_delta
-        Vt_Mzhd = Mz_hd @ V_dev
-        J_Mz    = 2.0 * (Vt_Mzhd * lam_dev) @ V_dev.t() * half_delta
-        eff     = H_all + J_Mz
-        E       = torch.sqrt(eff ** 2 + Gamma ** 2).clamp(min=1e-10)
-        tanhbE  = torch.tanh(self.mf_beta_final * E)
-        Mx      = tanhbE * Gamma / E                                   # quantum uncertainty
-
-        del Vt_Mzhd, J_Mz, tanhbE
-
-        # Rounding decision from m^z
-        S_mf = S_nearest.clone()
-        total_mf_flips = 0
-
-        # Uncertain = correctable: near midpoint, Gamma above threshold
-        # Only uncertain spins where H is weak — coupling could dominate
-        # |H| small means local field doesn't strongly prefer either direction
-        H_magnitude = H_all.abs()
-        H_threshold = H_magnitude.median() * 0.5
-        uncertain_mask = (Gamma > 0.7) & (H_magnitude < H_threshold)
+        # Uncertain spins: near midpoint (Γ > threshold)
+        uncertain_mask  = Gamma > self.gamma_threshold
         total_uncertain = uncertain_mask.sum().item()
 
         if debug:
-            frac_flipped = total_mf_flips / (out_features * in_features)
-            print(f"    MF flip fraction: {frac_flipped:.4f} (expect <0.10)")
-            unc_D  = D_all[uncertain_mask].abs() / half_delta[uncertain_mask].clamp(min=1e-10)
-            cert_D = D_all[~uncertain_mask].abs() / half_delta[~uncertain_mask].clamp(min=1e-10)
-            print(f"    |D/hd| uncertain:{unc_D.mean():.3f}  certain:{cert_D.mean():.3f}")
-            print(f"    (uncertain should be smaller — near midpoint)")
-            S_test = S_mf.clone()
-            W_test = (midpoint + half_delta * S_test).to(original_dtype)
-            Y_test = X_corr @ W_test.float().t()
-            mf_error = (Y_orig - Y_test).pow(2).mean().item()
-            print(f"    MF error: {mf_error:.8f} vs baseline: {baseline_error:.8f}")
-            del S_test, W_test, Y_test, unc_D, cert_D
-            print(f"    MF flips:{total_mf_flips}  Uncertain:{total_uncertain}")
+            frac_unc = total_uncertain / (out_features * in_features)
+            unc_ratio  = (D_all.abs() / half_delta.clamp(min=1e-10))[uncertain_mask]
+            cert_ratio = (D_all.abs() / half_delta.clamp(min=1e-10))[~uncertain_mask]
+            print(f"    Uncertain: {total_uncertain} ({frac_unc*100:.1f}%) "
+                  f"|D/hd| unc:{unc_ratio.mean():.3f} cert:{cert_ratio.mean():.3f}")
+            del unc_ratio, cert_ratio
 
-        del Mz, eff, E, Mx, Mz_hd
-
-        if debug:
-            print(f"    MF flips:{total_mf_flips}  Uncertain:{total_uncertain}")
-
-        # ── Group refinement for uncertain spins ──────────────────────────────
-        # For weights where |eff| < Γ, the quantum fluctuation dominates.
-        # These need joint optimization — exhaustive search over groups.
-        S_refined       = S_mf.clone()
+        # ── Phase 1: Group exhaustive search on uncertain spins ───────────────
+        # For near-midpoint weights, find the jointly optimal floor/ceil
+        # assignment within correlated groups using the exact dE formula.
+        S_refined         = S_nearest.clone()
         total_group_flips = 0
+
         rows_with_uncertain = (uncertain_mask.sum(dim=1) >= 2).nonzero(
             as_tuple=True)[0]
-        # Cap rows to avoid excessive runtime
-        if rows_with_uncertain.shape[0] > 512:
-            # Prioritize rows with most uncertain spins
-            row_counts = uncertain_mask.sum(dim=1)
-            _, top_rows = row_counts.topk(512)
+
+        # Prioritize rows with most uncertain spins, cap at max_rows
+        if rows_with_uncertain.shape[0] > self.max_rows:
+            row_counts          = uncertain_mask.sum(dim=1)
+            _, top_rows         = row_counts.topk(self.max_rows)
             rows_with_uncertain = top_rows
 
         for row_idx in rows_with_uncertain.tolist():
@@ -468,23 +391,23 @@ class TFIsingCorrectionEngine:
             if n_unc == 0:
                 continue
 
-            # Cap at 50 most uncertain per row
+            # Cap at 50 per row — pick most uncertain (smallest |D/hd|)
             if n_unc > 50:
-                # Most uncertain = smallest |eff|/Γ ratio
-                ratio   = (H_all[row_idx] + 0.0).abs()  # reuse H as proxy
-                _, most = ratio[unc_idx].sort()
-                unc_idx = unc_idx[most[:50]]
-                n_unc   = 50
+                ratio    = (D_all[row_idx].abs() /
+                            half_delta[row_idx].clamp(min=1e-10))
+                _, order = ratio[unc_idx].sort()
+                unc_idx  = unc_idx[order[:50]]
+                n_unc    = 50
 
-            hd_row   = half_delta[row_idx]                             # [in]
-            J_V_row  = hd_row.unsqueeze(1) * V_dev                    # [in, k]
-            J_V_unc  = J_V_row[unc_idx]                               # [n_unc, k]
-            J_sub    = J_V_unc @ (lam_dev.unsqueeze(0) * J_V_unc).t() # [n_unc, n_unc]
-            groups   = self._cluster_uncertain_spins(J_sub, unc_idx)
+            hd_row  = half_delta[row_idx]                              # [in]
+            J_V_row = hd_row.unsqueeze(1) * V_dev                     # [in, k]
+            J_V_unc = J_V_row[unc_idx]                                 # [n_unc, k]
+            J_sub   = J_V_unc @ (lam_dev.unsqueeze(0) * J_V_unc).t()  # [n_unc, n_unc]
+            groups  = self._cluster_spins(J_sub, unc_idx)
 
             s_row = S_refined[row_idx].clone()
             h_row = H_all[row_idx]
-            v_row = J_V_row.t() @ s_row                               # [k]
+            v_row = J_V_row.t() @ s_row                                # [k]
 
             for group in groups:
                 g = len(group)
@@ -496,16 +419,17 @@ class TFIsingCorrectionEngine:
                 h_g = h_row[group_idx]
 
                 if g <= self.group_max_size:
-                    # Exhaustive search over 2^g configurations
+                    # Exhaustive: try all 2^g configurations
                     n_configs = 2 ** g
-                    bit_idx  = torch.arange(n_configs, device=device).unsqueeze(1)
-                    bit_pos  = torch.arange(g,         device=device).unsqueeze(0)
-                    flip_mat = ((bit_idx >> bit_pos) & 1).float()      # [2^g, g]
-                    delta_sg = -2.0 * flip_mat * s_g.unsqueeze(0)     # [2^g, g]
-                    delta_v  = delta_sg @ J_g                          # [2^g, k]
-                    # dE = lam^T(2v*dv + dv^2) + h^T*ds
-                    dE = (delta_v * (2.0 * v_row.unsqueeze(0) + delta_v)) @ lam_dev \
-                         + delta_sg @ h_g
+                    bit_idx   = torch.arange(
+                        n_configs, device=device).unsqueeze(1)
+                    bit_pos   = torch.arange(
+                        g,         device=device).unsqueeze(0)
+                    flip_mat  = ((bit_idx >> bit_pos) & 1).float()     # [2^g, g]
+                    delta_sg  = -2.0 * flip_mat * s_g.unsqueeze(0)    # [2^g, g]
+                    delta_v   = delta_sg @ J_g                         # [2^g, k]
+                    dE = (delta_v * (2.0 * v_row.unsqueeze(0) + delta_v)) \
+                         @ lam_dev + delta_sg @ h_g
                     best_idx = dE.argmin()
                     if dE[best_idx] < -1e-12:
                         best_flip = flip_mat[best_idx].bool()
@@ -513,7 +437,7 @@ class TFIsingCorrectionEngine:
                         total_group_flips += best_flip.sum().item()
                         v_row = v_row + delta_v[best_idx]
                 else:
-                    # Sequential for larger groups
+                    # Sequential for oversized groups
                     for idx in group:
                         j_v = J_V_row[idx]
                         ds  = -2.0 * s_row[idx]
@@ -527,14 +451,15 @@ class TFIsingCorrectionEngine:
 
             S_refined[row_idx] = s_row
 
-        del uncertain_mask, rows_with_uncertain
+        del rows_with_uncertain
 
-        # ── Coordinate Descent cleanup (chunked Gauss-Seidel) ─────────────────
-        # Clean up any remaining single-spin improvements
-        diag_J     = (V_dev ** 2) @ lam_dev                           # [in]
-        S_final    = S_refined.clone()
+        # ── Phase 2: CD cleanup — uncertain spins only ────────────────────────
+        # Only flip uncertain spins (near-midpoint).
+        # Near-gridpoint spins stay at nearest rounding — they are classical.
+        diag_J         = (V_dev ** 2) @ lam_dev                       # [in]
+        S_final        = S_refined.clone()
         total_cd_flips = 0
-        chunk_size = 64
+        chunk_size     = 64
 
         for sweep in range(self.cd_max_sweeps):
             sweep_flips = 0
@@ -543,6 +468,10 @@ class TFIsingCorrectionEngine:
             for j_start in range(0, in_features, chunk_size):
                 j_end      = min(j_start + chunk_size, in_features)
                 j_slice    = slice(j_start, j_end)
+
+                unc_chunk = uncertain_mask[:, j_slice]
+                if not unc_chunk.any():
+                    continue
 
                 DS_chunk   = -2.0 * S_final[:, j_slice]
                 hd_chunk   = half_delta[:, j_slice]
@@ -556,7 +485,8 @@ class TFIsingCorrectionEngine:
                 dE    = term1 + term2 + H_chunk * DS_chunk
                 del term1, term2, VsVt_chunk, DS_chunk
 
-                flip_mask     = dE < -1e-12
+                # Only flip uncertain spins with clear energy improvement
+                flip_mask     = (dE < -1e-12) & unc_chunk
                 del dE
                 n_chunk_flips = flip_mask.sum().item()
                 if n_chunk_flips == 0:
@@ -592,14 +522,13 @@ class TFIsingCorrectionEngine:
             'baseline_error':  baseline_error,
             'corrected_error': corrected_error,
             'improvement_pct': improvement,
-            'mf_flips':        total_mf_flips,
             'uncertain':       total_uncertain,
             'group_flips':     total_group_flips,
             'cd_flips':        total_cd_flips,
         }
 
         del (V_dev, lam_dev, H_all, Gamma, half_delta, diag_J,
-             S_nearest, S_mf, S_refined, S_final,
+             uncertain_mask, S_nearest, S_refined, S_final,
              midpoint, delta_all, nearest, W_sc_f32, D_all, W_corrected,
              X_corr, Y_orig, Y_base, Y_corrected, baseline_W_q_sc)
         torch.cuda.empty_cache()
@@ -625,7 +554,8 @@ class TFIsingCorrectionEngine:
             b_start = batch_idx * self.layer_batch_size
             b_end   = min(b_start + self.layer_batch_size, n_layers)
             batch   = layer_list[b_start:b_end]
-            print(f"\n[Batch {batch_idx+1}/{n_batches}] Layers {b_start}-{b_end-1}")
+            print(f"\n[Batch {batch_idx+1}/{n_batches}] "
+                  f"Layers {b_start}-{b_end-1}")
             self._collect_activations(batch, calibration_data, n_samples)
 
             for layer_idx, (name, module) in enumerate(batch):
@@ -635,35 +565,38 @@ class TFIsingCorrectionEngine:
                 if X_calib is None or X_calib.shape[0] < 10:
                     print(f"  [{global_idx}/{n_layers}] {name}: SKIPPED")
                     continue
-                debug = (global_idx < 3)
+                debug = (global_idx < 2)
 
                 if is_lmhead:
-                    # AWQ only for lm_head
-                    print(f"  [{global_idx}/{n_layers}] {name}: lm_head AWQ only")
+                    print(f"  [{global_idx}/{n_layers}] {name}: "
+                          f"lm_head — AWQ only")
                     W        = module.weight.data
                     salience = self.base_quantizer.compute_l2_salience(
                         self.activation_data.get(name, []))
                     if salience is not None:
-                        X_s    = X_calib[:min(1024, X_calib.shape[0])].to(
+                        X_s = X_calib[:min(1024, X_calib.shape[0])].to(
                             self.device).to(W.dtype)
                         scales, _, _ = self.base_quantizer.search_best_scale(
                             W, X_s, salience.to(self.device))
                         del X_s
                         W_sc = W * scales.unsqueeze(0)
-                        W_q  = self.base_quantizer.quantize_weight_groupwise_asymmetric(W_sc)
-                        module.weight.data = (W_q / scales.unsqueeze(0)).to(W.dtype)
+                        W_q  = self.base_quantizer\
+                            .quantize_weight_groupwise_asymmetric(W_sc)
+                        module.weight.data = (
+                            W_q / scales.unsqueeze(0)).to(W.dtype)
                         del W_sc, W_q
                 else:
-                    print(f"  [{global_idx}/{n_layers}] {name}:", end=" ", flush=True)
+                    print(f"  [{global_idx}/{n_layers}] {name}:",
+                          end=" ", flush=True)
                     t0    = time.time()
-                    stats = self._correct_layer(name, module, X_calib, debug=debug)
+                    stats = self._correct_layer(
+                        name, module, X_calib, debug=debug)
                     dt    = time.time() - t0
                     self.layer_stats[name] = stats
                     total_improvement.append(stats['improvement_pct'])
                     print(f"err {stats['baseline_error']:.6f}->"
                           f"{stats['corrected_error']:.6f} "
                           f"({stats['improvement_pct']:+.2f}%) "
-                          f"MF={stats['mf_flips']} "
                           f"unc={stats['uncertain']} "
                           f"G={stats['group_flips']} "
                           f"CD={stats['cd_flips']}  [{dt:.1f}s]")
@@ -683,41 +616,46 @@ class TFIsingCorrectionEngine:
         if total_improvement:
             imp = np.array(total_improvement)
             print(f"  Layers:{len(imp)}/{n_layers}  "
-                  f"mean:{imp.mean():+.2f}%  median:{np.median(imp):+.2f}%  "
-                  f"min:{imp.min():+.2f}%  max:{imp.max():+.2f}%")
+                  f"mean:{imp.mean():+.2f}%  "
+                  f"median:{np.median(imp):+.2f}%  "
+                  f"min:{imp.min():+.2f}%  "
+                  f"max:{imp.max():+.2f}%")
             print(f"  Improved:{(imp > 0).sum()}/{len(imp)}")
         if self.layer_stats:
-            mf = sum(s['mf_flips']    for s in self.layer_stats.values())
             gf = sum(s['group_flips'] for s in self.layer_stats.values())
             cd = sum(s['cd_flips']    for s in self.layer_stats.values())
-            print(f"  Flips  MF:{mf:,}  G:{gf:,}  CD:{cd:,}")
+            print(f"  Flips  G:{gf:,}  CD:{cd:,}  Total:{gf+cd:,}")
 
 
 def main():
     parser = argparse.ArgumentParser(
         description="AWQ + Transverse-Field Ising Correction",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("--model-path",           type=str,   default="./models/Mistral-7B-v0.3")
-    parser.add_argument("--output-dir",           type=str,   default="./quantized_models/model_tfim")
-    parser.add_argument("--bits",                 type=int,   default=4, choices=[3, 4])
+    parser.add_argument("--model-path",           type=str,
+                        default="./models/Mistral-7B-v0.3")
+    parser.add_argument("--output-dir",           type=str,
+                        default="./quantized_models/model_tfim")
+    parser.add_argument("--bits",                 type=int,
+                        default=4, choices=[3, 4])
     parser.add_argument("--group-size",           type=int,   default=128)
     parser.add_argument("--n-grid",               type=int,   default=20)
     parser.add_argument("--n-calib",              type=int,   default=128)
     parser.add_argument("--calib-dataset",        type=str,   default="c4",
                         choices=["c4", "wikitext2", "wikitext2-simple"])
     parser.add_argument("--max-tokens-per-sample",type=int,   default=2048)
-    parser.add_argument("--cache-dir",            type=str,   default="./calibration_cache")
+    parser.add_argument("--cache-dir",            type=str,
+                        default="./calibration_cache")
     parser.add_argument("--lambda-fidelity",      type=float, default=1.0)
     parser.add_argument("--gamma",                type=float, default=1.0,
-                        help="Transverse field scale: Gamma_i = gamma*|D_i/hd_i|")
-    parser.add_argument("--mf-beta-init",         type=float, default=0.1)
-    parser.add_argument("--mf-beta-final",        type=float, default=50.0)
-    parser.add_argument("--mf-n-temps",           type=int,   default=20)
-    parser.add_argument("--mf-max-iter",          type=int,   default=50)
+                        help="Transverse field scale")
+    parser.add_argument("--gamma-threshold",      type=float, default=0.7,
+                        help="Gamma threshold for uncertain spins (0-1)")
     parser.add_argument("--group-max-size",       type=int,   default=6)
-    parser.add_argument("--cd-max-sweeps",        type=int,   default=2)
+    parser.add_argument("--cd-max-sweeps",        type=int,   default=3)
     parser.add_argument("--top-k-eigvecs",        type=int,   default=32)
     parser.add_argument("--max-calib-correction", type=int,   default=512)
+    parser.add_argument("--max-rows",             type=int,   default=512,
+                        help="Max rows per layer for group refinement")
     parser.add_argument("--layer-batch-size",     type=int,   default=16)
     parser.add_argument("--seed",                 type=int,   default=42)
     args = parser.parse_args()
@@ -730,10 +668,12 @@ def main():
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print("=" * 80)
-    print(f"AWQ + TFIM Correction  |  Model:{args.model_path}  Device:{device}")
+    print(f"AWQ + TFIM Correction  |  "
+          f"Model:{args.model_path}  Device:{device}")
     print("=" * 80)
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model_path, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -748,7 +688,8 @@ def main():
             tokenizer, n_samples=args.n_calib, seqlen=2048,
             seed=args.seed, cache_dir=args.cache_dir)
     elif args.calib_dataset == "wikitext2-simple":
-        dataset     = load_dataset('wikitext', 'wikitext-2-raw-v1', split='train')
+        dataset     = load_dataset('wikitext', 'wikitext-2-raw-v1',
+                                   split='train')
         calib_texts = [t['text'] for t in dataset
                        if len(t['text'].strip()) > 100][:args.n_calib]
     else:
@@ -760,13 +701,14 @@ def main():
         model=model, tokenizer=tokenizer, device=device,
         bits=args.bits, group_size=args.group_size, n_grid=args.n_grid,
         max_tokens_per_sample=args.max_tokens_per_sample,
-        lambda_fidelity=args.lambda_fidelity, gamma=args.gamma,
-        mf_max_iter=args.mf_max_iter, mf_beta_init=args.mf_beta_init,
-        mf_beta_final=args.mf_beta_final, mf_n_temps=args.mf_n_temps,
-        group_max_size=args.group_max_size, cd_max_sweeps=args.cd_max_sweeps,
+        lambda_fidelity=args.lambda_fidelity,
+        gamma=args.gamma, gamma_threshold=args.gamma_threshold,
+        group_max_size=args.group_max_size,
+        cd_max_sweeps=args.cd_max_sweeps,
         max_calib_samples=args.max_calib_correction,
         top_k_eigvecs=args.top_k_eigvecs,
         layer_batch_size=args.layer_batch_size,
+        max_rows=args.max_rows,
     )
 
     corrector.correct_model(calib_texts, n_samples=args.n_calib)
