@@ -421,7 +421,7 @@ class TFIsingCorrectionEngine:
         total_mf_flips = 0
 
         # Uncertain = correctable: near midpoint, Gamma above threshold
-        uncertain_mask = Gamma > 0.3   # |D/hd| < 0.7, i.e. within 70% of midpoint
+        uncertain_mask = Gamma > 0.7   # |D/hd| < 0.7, i.e. within 70% of midpoint
         total_uncertain = uncertain_mask.sum().item()
 
         if debug:
@@ -451,6 +451,12 @@ class TFIsingCorrectionEngine:
         total_group_flips = 0
         rows_with_uncertain = (uncertain_mask.sum(dim=1) >= 2).nonzero(
             as_tuple=True)[0]
+        # Cap rows to avoid excessive runtime
+        if rows_with_uncertain.shape[0] > 512:
+            # Prioritize rows with most uncertain spins
+            row_counts = uncertain_mask.sum(dim=1)
+            _, top_rows = row_counts.topk(512)
+            rows_with_uncertain = top_rows
 
         for row_idx in rows_with_uncertain.tolist():
             unc_idx = uncertain_mask[row_idx].nonzero(as_tuple=True)[0]
