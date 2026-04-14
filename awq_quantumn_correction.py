@@ -374,7 +374,18 @@ class QuantumCorrectionEngine:
         # MF free energy gradient w.r.t. m[i,j]:
         #   eff[i,j] = H[i,j] + 2*hd[i,j] * (V lam V^T (m[i]*hd[i]))_j
         # Fixed-point: m = -tanh(beta * eff)
-        M    = S_nearest.clone()
+                # ── Phase 1: Mean-Field Annealing ─────────────────────────────────────
+        # MF free energy gradient w.r.t. m[i,j]:
+        #   eff[i,j] = H[i,j] + 2*hd[i,j] * (V lam V^T (m[i]*hd[i]))_j
+        # Fixed-point: m = -tanh(beta * eff)
+        # Init: flip any spin where H*s > 0 (opposes its own field under truncated G)
+        S_init = S_nearest.clone()
+        wrong_init = (H_all * S_init) > 0
+        S_init[wrong_init] *= -1
+        if debug:
+            print(f"    Init pre-flips: {wrong_init.sum().item()}")
+        M = S_init.float()
+        del S_init, wrong_init
         betas = torch.logspace(
             np.log10(self.mf_beta_init),
             np.log10(self.mf_beta_final),
