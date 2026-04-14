@@ -345,6 +345,28 @@ class QuantumCorrectionEngine:
         H_all = -2.0 * half_delta * (G_D + self.lambda_fidelity * D_all)
         del G_D, Vt_D
 
+        # ── Sanity check (remove after confirming fix) ────────────────────────
+        if debug:
+            row = 0
+            s   = S_nearest[row]
+            hd  = half_delta[row]
+            h   = H_all[row]
+            v   = (s * hd) @ V_dev          # [k]
+            dE_sample = []
+            for j in range(min(20, in_features)):
+                dv_j = (-2.0 * s[j]) * hd[j] * V_dev[j]
+                dE_j = ((2.0 * v + dv_j) * dv_j * lam_dev).sum() \
+                       + h[j] * (-2.0 * s[j])
+                dE_sample.append(dE_j.item())
+            n_pos = sum(x > 0 for x in dE_sample)
+            n_neg = sum(x < 0 for x in dE_sample)
+            print(f"    Sanity dE@S_nearest (first 20 spins): "
+                  f"{n_pos} positive, {n_neg} negative")
+            print(f"    D_all mean sign: {D_all[row].sign().mean().item():.3f}, "
+                  f"S_nearest mean: {S_nearest[row].mean().item():.3f}")
+            print(f"    H_all[0,:5]: {H_all[row,:5].tolist()}")
+            print(f"    S_nearest[0,:5]: {S_nearest[row,:5].tolist()}")
+            print(f"    D_all[0,:5]: {D_all[row,:5].tolist()}")
         # Sanity: at S_nearest, dE > 0 for all spins (nearest is a local minimum
         # of the uncoupled problem).  The coupling (lam) may cause some flips.
 
