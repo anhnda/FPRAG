@@ -343,6 +343,9 @@ class QuantumCorrectionEngine:
         Vt_D  = D_all @ V_dev               # [out, k]
         G_D   = (Vt_D * lam_dev) @ V_dev.t()  # [out, in]  row-wise G @ D
         H_all = -2.0 * half_delta * (G_D + self.lambda_fidelity * D_all)
+        if debug:
+            print(f"    V shape: {V_dev.shape}, n_tok={n_tok}, in_features={in_features}")
+            print(f"    G_D[0,:3]: {G_D[0,:3].tolist()}, D_all[0,:3]: {D_all[0,:3].tolist()}")
         del G_D, Vt_D
 
         # ── Sanity check (remove after confirming fix) ────────────────────────
