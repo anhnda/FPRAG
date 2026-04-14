@@ -417,12 +417,11 @@ class TFIsingCorrectionEngine:
         del Vt_Mzhd, J_Mz, tanhbE
 
         # Rounding decision from m^z
-        S_mf = torch.sign(Mz)
-        S_mf[S_mf == 0] = 1.0
-        total_mf_flips = (S_mf != S_nearest).sum().item()
+        S_mf = S_nearest.clone()
+        total_mf_flips = 0
 
-        # Uncertain spins: |m^z| < |m^x|  ↔  |eff| < Γ
-        uncertain_mask = eff.abs() < Gamma
+        # Uncertain = correctable: near midpoint, Gamma above threshold
+        uncertain_mask = Gamma > 0.3   # |D/hd| < 0.7, i.e. within 70% of midpoint
         total_uncertain = uncertain_mask.sum().item()
 
         if debug:
