@@ -343,7 +343,7 @@ class QuantumCorrectionEngine:
         # Pulls s toward sign(D) = S_nearest, so S_nearest minimizes uncoupled E
         Vt_D  = D_all @ V_dev
         G_D   = (Vt_D * lam_dev) @ V_dev.t()
-        H_all = -2.0 * half_delta * (G_D + self.lambda_fidelity * D_all)
+        H_all = -2.0 * half_delta * self.lambda_fidelity * D_all
         if debug:
             print(f"    D_all[0,:5]: {D_all[0,:5].tolist()}")
             print(f"    S_nearest[0,:5]: {S_nearest[0,:5].tolist()}")
