@@ -495,29 +495,42 @@ class QuantumCorrectionEngine:
             self.mf_n_temps
         )
 
+        # FIX: track converged rows, check convergence every 5 iters not every iter
+        active = torch.ones(out_features, dtype=torch.bool, device=device)
+
         for beta in betas:
             beta_val = beta.item()
-            for _ in range(self.mf_max_iter):
-                M_old   = M.clone()
-                M_hd    = M * half_delta                          # [out, in]
-                Vt_Mhd  = M_hd @ V_dev                           # [out, k]
-                JM      = (Vt_Mhd * lam_dev) @ V_dev.t()         # [out, in]
-                JM     *= half_delta                               # [out, in]
-                Eff     = H_all + JM                              # [out, in]
-                M_new   = -torch.tanh(beta_val * Eff)
-                M       = 0.5 * M_new + 0.5 * M_old
+            for iteration in range(self.mf_max_iter):
+                M_act  = M[active]                                    # [n_act, in]
+                hd_act = half_delta[active]                           # [n_act, in]
+                H_act  = H_all[active]                                # [n_act, in]
 
-                # Per-row convergence check — stop updating rows that converged
-                row_change = (M - M_old).abs().max(dim=1).values  # [out]
-                if (row_change < 1e-6).all():
-                    break
+                M_hd   = M_act * hd_act                               # [n_act, in]
+                Vt_Mhd = M_hd @ V_dev                                 # [n_act, k]
+                JM     = (Vt_Mhd * lam_dev) @ V_dev.t() * hd_act     # [n_act, in]
+                Eff    = H_act + JM                                   # [n_act, in]
+                M_new  = -torch.tanh(beta_val * Eff)                  # [n_act, in]
+                M_act_new = 0.5 * M_new + 0.5 * M_act                # no clone needed
 
-            del M_hd, Vt_Mhd, JM, Eff, M_new, M_old
+                M[active] = M_act_new
+
+                # FIX: sync only every 5 iters instead of every iter
+                if iteration % 5 == 4:
+                    row_change = (M_act_new - M_act).abs().max(dim=1).values
+                    converged  = row_change < 1e-6
+                    active_idx = active.nonzero(as_tuple=True)[0]
+                    active[active_idx[converged]] = False
+                    if not active.any():
+                        break
+
+                del M_hd, Vt_Mhd, JM, Eff, M_new, M_act, hd_act, H_act, M_act_new
+
+            active.fill_(True)  # reset for next temperature
 
         S_mf = torch.sign(M)
         S_mf[S_mf == 0] = 1.0
         total_mf_flips = (S_mf != S_nearest).sum().item()
-        del M
+        del M, active
 
         # ── Phase 2: Batched Spin-Wave Stability ──────────────────────────────
         # stability[i,j] = s[i,j] * (H[i,j] + (J_i s_i)_j)
@@ -610,12 +623,12 @@ class QuantumCorrectionEngine:
                     dE_lin   = delta_sg @ h_g                                                # [2^g]
                     dE       = dE_quad + dE_lin                                              # [2^g]
 
-                    best = dE.argmin().item()
-                    if dE[best].item() < -1e-12:
-                        best_flip = flip_mat[best].bool()              # [g]
+                    best_idx = dE.argmin()                   # tensor, no sync yet
+                    if dE[best_idx] < -1e-12:                # one sync here (unavoidable)
+                        best_flip = flip_mat[best_idx].bool()
                         s_row[group_idx[best_flip]] *= -1
                         total_group_flips += best_flip.sum().item()
-                        v_row = v_row + delta_v[best]                  # incremental update
+                        v_row = v_row + delta_v[best_idx]            # incremental update
 
                 else:
                     # Greedy: flip one at a time, O(g * k) total
