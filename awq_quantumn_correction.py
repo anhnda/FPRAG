@@ -440,11 +440,21 @@ class QuantumCorrectionEngine:
 
         # Low-rank representation: J_V = (Δ/2) * V, so coupling is J_V diag(λ) J_V^T
         # This avoids forming the full [in_features, in_features] J matrix
+ # Cast all inputs to float32 for numerical stability
+        delta = delta.float()
+        d_row = d_row.float()
+        G_lowrank_V = G_lowrank_V.float()
+        G_lowrank_lam = G_lowrank_lam.float()
+        mid_row_f = grid_info_row['midpoint'].float()
+        nearest_f = grid_info_row['nearest'].float()
+
+        s_nearest = torch.sign(nearest_f - mid_row_f)
+        s_nearest[s_nearest == 0] = 1.0
+
         half_delta = delta / 2  # [in_features]
         J_V = half_delta.unsqueeze(1) * G_lowrank_V  # [in_features, k]
 
         # Local field from reconstruction: h_recon_j = Δ_j * Σ_k G_{jk} d_k
-        # Using low-rank: G d ≈ V Λ V^T d
         Vt_d = G_lowrank_V.t() @ d_row  # [k]
         G_d = G_lowrank_V @ (G_lowrank_lam * Vt_d)  # [in_features]
         h_recon = delta * G_d
@@ -951,14 +961,14 @@ class QuantumCorrectionEngine:
                 # Build row-specific grid info
                 nearest_row = grid_info['nearest'][row_idx].to(device)
                 row_grid_info = {
-                    'floor': floor_row, 'ceil': ceil_row,
-                    'midpoint': mid_row, 'delta': delta_row,
-                    'nearest': nearest_row,
+                    'floor': floor_row.float(), 'ceil': ceil_row.float(),
+                    'midpoint': mid_row.float(), 'delta': delta_row.float(),
+                    'nearest': nearest_row.float(),
                 }
 
                 # Build Ising model for this row
                 h, J_V_row, delta_r, s_nearest = self._build_ising_model_for_row(
-                    w_row, row_grid_info, V, lam, d_row
+                    w_row.float(), row_grid_info, V, lam, d_row.float()
                 )
 
                 # Phase 1: Mean-field annealing
@@ -982,7 +992,7 @@ class QuantumCorrectionEngine:
 
                 # Reconstruct weight from spins
                 # w_q[j] = midpoint[j] + (delta[j]/2) * s[j]
-                W_corrected[row_idx] = mid_row + (delta_r / 2) * s_final
+                W_corrected[row_idx] = (mid_row.float() + (delta_r / 2) * s_final).to(W_scaled.dtype)
 
             # Periodic cleanup
             if row_start % 256 == 0 and row_start > 0:
