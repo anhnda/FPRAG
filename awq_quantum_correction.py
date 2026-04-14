@@ -275,8 +275,7 @@ class QuantumCorrectionEngine:
     # ─────────────────────────────────────────────────────────────────────────
     # Core per-layer correction
     # ─────────────────────────────────────────────────────────────────────────
-
-    @torch.no_grad()
+@torch.no_grad()
     def _correct_layer(self, name, module, X_calib, debug=False):
         W = module.weight.data
         original_dtype           = W.dtype
@@ -295,24 +294,28 @@ class QuantumCorrectionEngine:
         if debug:
             print(f"    AWQ: alpha={best_alpha:.3f}")
 
+        # ── Work entirely in scaled space (reference: James-Stein AWQ) ────────
         W_scaled      = W * best_scales.unsqueeze(0)
         grid_info     = self.base_quantizer.get_quantization_grid_info(W_scaled)
-        baseline_W_q  = grid_info['nearest'] / best_scales.unsqueeze(0)
         X_corr        = X_calib[:min(self.max_calib_samples,
                                      X_calib.shape[0])].to(device).to(original_dtype)
-        Y_orig        = X_corr @ W.t()
-        Y_base        = X_corr @ baseline_W_q.t()
-        baseline_error = (Y_orig - Y_base).pow(2).mean().item()
+
+        # Error measured in scaled space: ||X_corr @ (W_q_scaled - W_scaled).T||^2
+        baseline_W_q_sc = grid_info['nearest']               # already in scaled space
+        W_sc_f32        = W_scaled.float()
+        Y_orig          = X_corr @ W_sc_f32.t()              # scaled space
+        Y_base          = X_corr @ baseline_W_q_sc.float().t()
+        baseline_error  = (Y_orig - Y_base).pow(2).mean().item()
         if debug:
             print(f"    Baseline error: {baseline_error:.8f}")
 
-        # ── Low-rank G via truncated SVD ──────────────────────────────────────
-        X_for_G = X_corr / best_scales.unsqueeze(0).to(X_corr.dtype)
-        n_tok   = X_for_G.shape[0]
-        k       = min(self.top_k_eigvecs_G, n_tok, in_features)
-        U, S_sv, V = torch.svd_lowrank(X_for_G.float(), q=k, niter=4)
-        lam = (S_sv ** 2) / n_tok    # eigenvalues of (1/n) X^T X  [k]
-        del X_for_G, U, S_sv
+        # ── Low-rank G = X_corr^T X_corr / n (raw activations, no X scaling) ─
+        # Matches James-Stein: Y_orig = X_corr @ W_scaled.T, G = X_corr^T X_corr / n
+        n_tok = X_corr.shape[0]
+        k     = min(self.top_k_eigvecs_G, n_tok, in_features)
+        U, S_sv, V = torch.svd_lowrank(X_corr.float(), q=k, niter=4)
+        lam = (S_sv ** 2) / n_tok
+        del U, S_sv
         torch.cuda.empty_cache()
         if debug:
             print(f"    G: top-{k}, lam_1={lam[0]:.4f}, lam_k={lam[-1]:.6f}")
@@ -321,13 +324,11 @@ class QuantumCorrectionEngine:
         midpoint   = grid_info['midpoint'].float().to(device)
         delta_all  = grid_info['delta'].float().to(device)
         nearest    = grid_info['nearest'].float().to(device)
-        W_sc_f32   = W_scaled.float()
-        half_delta = delta_all / 2          # always > 0  (ceil > floor)
+        half_delta = delta_all / 2
 
-        # D[i,j] = displacement of original (scaled) weight from midpoint
-        # positive  → weight is above midpoint → nearest is ceil  → S_nearest = +1
-        # negative  → weight is below midpoint → nearest is floor → S_nearest = -1
-        D_all = W_sc_f32 - midpoint         # SIGN FIX: was midpoint - W_sc_f32
+        # D[i,j] = W_scaled[i,j] - midpoint[i,j]
+        # sign(D) = sign(nearest - midpoint) = S_nearest
+        D_all = W_sc_f32 - midpoint
 
         S_nearest = torch.sign(nearest - midpoint)
         S_nearest[S_nearest == 0] = 1.0
@@ -335,60 +336,23 @@ class QuantumCorrectionEngine:
         V_dev   = V.to(device)
         lam_dev = lam.to(device)
 
-        # Full energy (per row i):
-        #   E_i(s) = (hd*s - D)^T G (hd*s - D) + lambda_fid ||hd*s - D||^2
-        # Linear term in s:  H[i,j] * s[i,j]
-        #   H[i,j] = -2*hd[i,j]*(GD[i])_j  -  2*lambda_fid*hd[i,j]*D[i,j]
-        # (factor of 2 is absorbed here so dE = lam^T(2v*dv+dv^2) + H*ds is exact)
-        Vt_D  = D_all @ V_dev               # [out, k]
-        G_D   = (Vt_D * lam_dev) @ V_dev.t()  # [out, in]  row-wise G @ D
+        # H[i,j] = -2*hd*(GD)_j - 2*lam_fid*hd*D
+        # Pulls s toward sign(D) = S_nearest, so S_nearest minimizes uncoupled E
+        Vt_D  = D_all @ V_dev
+        G_D   = (Vt_D * lam_dev) @ V_dev.t()
         H_all = -2.0 * half_delta * (G_D + self.lambda_fidelity * D_all)
-        if debug:
-            print(f"    V shape: {V_dev.shape}, n_tok={n_tok}, in_features={in_features}")
-            print(f"    G_D[0,:3]: {G_D[0,:3].tolist()}, D_all[0,:3]: {D_all[0,:3].tolist()}")
         del G_D, Vt_D
 
-        # ── Sanity check (remove after confirming fix) ────────────────────────
-        if debug:
-            row = 0
-            s   = S_nearest[row]
-            hd  = half_delta[row]
-            h   = H_all[row]
-            v   = (s * hd) @ V_dev          # [k]
-            dE_sample = []
-            for j in range(min(20, in_features)):
-                dv_j = (-2.0 * s[j]) * hd[j] * V_dev[j]
-                dE_j = ((2.0 * v + dv_j) * dv_j * lam_dev).sum() \
-                       + h[j] * (-2.0 * s[j])
-                dE_sample.append(dE_j.item())
-            n_pos = sum(x > 0 for x in dE_sample)
-            n_neg = sum(x < 0 for x in dE_sample)
-            print(f"    Sanity dE@S_nearest (first 20 spins): "
-                  f"{n_pos} positive, {n_neg} negative")
-            print(f"    D_all mean sign: {D_all[row].sign().mean().item():.3f}, "
-                  f"S_nearest mean: {S_nearest[row].mean().item():.3f}")
-            print(f"    H_all[0,:5]: {H_all[row,:5].tolist()}")
-            print(f"    S_nearest[0,:5]: {S_nearest[row,:5].tolist()}")
-            print(f"    D_all[0,:5]: {D_all[row,:5].tolist()}")
-        # Sanity: at S_nearest, dE > 0 for all spins (nearest is a local minimum
-        # of the uncoupled problem).  The coupling (lam) may cause some flips.
-
         # ── Phase 1: Mean-Field Annealing ─────────────────────────────────────
-        # MF free energy gradient w.r.t. m[i,j]:
-        #   eff[i,j] = H[i,j] + 2*hd[i,j] * (V lam V^T (m[i]*hd[i]))_j
-        # Fixed-point: m = -tanh(beta * eff)
-                # ── Phase 1: Mean-Field Annealing ─────────────────────────────────────
-        # MF free energy gradient w.r.t. m[i,j]:
-        #   eff[i,j] = H[i,j] + 2*hd[i,j] * (V lam V^T (m[i]*hd[i]))_j
-        # Fixed-point: m = -tanh(beta * eff)
-        # Init: flip any spin where H*s > 0 (opposes its own field under truncated G)
-        S_init = S_nearest.clone()
+        # Init: start from S_nearest, pre-flip spins opposing their local field
+        S_init     = S_nearest.clone()
         wrong_init = (H_all * S_init) > 0
         S_init[wrong_init] *= -1
         if debug:
             print(f"    Init pre-flips: {wrong_init.sum().item()}")
         M = S_init.float()
         del S_init, wrong_init
+
         betas = torch.logspace(
             np.log10(self.mf_beta_init),
             np.log10(self.mf_beta_final),
@@ -397,9 +361,9 @@ class QuantumCorrectionEngine:
         for beta in betas:
             beta_val = beta.item()
             for iteration in range(self.mf_max_iter):
-                M_hd   = M * half_delta                                    # [out, in]
-                Vt_Mhd = M_hd @ V_dev                                     # [out, k]
-                JM     = 2.0 * (Vt_Mhd * lam_dev) @ V_dev.t() * half_delta  # [out, in]
+                M_hd   = M * half_delta
+                Vt_Mhd = M_hd @ V_dev
+                JM     = 2.0 * (Vt_Mhd * lam_dev) @ V_dev.t() * half_delta
                 M_next = -torch.tanh(beta_val * (H_all + JM))
                 if iteration % 5 == 4:
                     if (M_next - M).abs().max().item() < 1e-5:
@@ -413,13 +377,9 @@ class QuantumCorrectionEngine:
         del M
 
         # ── Phase 2: Spin-Wave Stability ──────────────────────────────────────
-        # stability[i,j] = s[i,j] * (partial E / partial s[i,j])
-        #                = s[i,j] * (H[i,j] + 2*hd[i,j]*(V lam V^T (s[i]*hd[i]))_j)
-        # positive → spin is stable (moving it increases E)
-        # negative → spin is wrong  (moving it decreases E) → flip immediately
-        S_hd    = S_mf * half_delta
-        Vt_Shd  = S_hd @ V_dev
-        JS      = 2.0 * (Vt_Shd * lam_dev) @ V_dev.t() * half_delta
+        S_hd      = S_mf * half_delta
+        Vt_Shd    = S_hd @ V_dev
+        JS        = 2.0 * (Vt_Shd * lam_dev) @ V_dev.t() * half_delta
         Stability = S_mf * (H_all + JS)
         del S_hd, Vt_Shd, JS
 
@@ -427,16 +387,14 @@ class QuantumCorrectionEngine:
         S_mf[wrong_mask] *= -1
         total_immediate_flips = wrong_mask.sum().item()
 
-        # Recompute stability after immediate flips
-        S_hd2   = S_mf * half_delta
-        Vt_Shd2 = S_hd2 @ V_dev
-        JS2     = 2.0 * (Vt_Shd2 * lam_dev) @ V_dev.t() * half_delta
+        S_hd2      = S_mf * half_delta
+        Vt_Shd2    = S_hd2 @ V_dev
+        JS2        = 2.0 * (Vt_Shd2 * lam_dev) @ V_dev.t() * half_delta
         Stability2 = S_mf * (H_all + JS2)
         del S_hd2, Vt_Shd2, JS2
 
         median_stab = Stability2.abs().median(dim=1, keepdim=True).values
         threshold   = self.sw_soft_threshold * median_stab.clamp(min=1e-10)
-        # Soft: stable but low-confidence (0 < stability < threshold)
         soft_masks  = (Stability2 >= 0) & (Stability2 < threshold)
         total_sw_soft = soft_masks.sum().item()
         del Stability, Stability2, median_stab, threshold, wrong_mask
@@ -451,8 +409,6 @@ class QuantumCorrectionEngine:
             n_soft   = soft_idx.shape[0]
             if n_soft == 0:
                 continue
-
-            # Cap at 50 worst (lowest stability) soft spins per row
             if n_soft > 50:
                 hd_tmp   = half_delta[row_idx]
                 s_tmp    = S_mf[row_idx]
@@ -463,14 +419,14 @@ class QuantumCorrectionEngine:
                 n_soft   = 50
 
             hd_row   = half_delta[row_idx]
-            J_V_row  = hd_row.unsqueeze(1) * V_dev          # [in, k]
-            J_V_soft = J_V_row[soft_idx]                    # [n_soft, k]
+            J_V_row  = hd_row.unsqueeze(1) * V_dev
+            J_V_soft = J_V_row[soft_idx]
             J_sub    = J_V_soft @ (lam_dev.unsqueeze(0) * J_V_soft).t()
             groups   = self._cluster_soft_spins(J_sub, soft_idx)
 
             s_row = S_refined[row_idx].clone()
             h_row = H_all[row_idx]
-            v_row = J_V_row.t() @ s_row                     # [k]
+            v_row = J_V_row.t() @ s_row
 
             for group in groups:
                 g = len(group)
@@ -513,31 +469,29 @@ class QuantumCorrectionEngine:
         del soft_masks, rows_with_soft
 
         # ── Phase 4: Coordinate Descent (chunked Gauss-Seidel) ────────────────
-        # Process chunk_size columns at a time; update V_s incrementally after
-        # each chunk so later chunks see the effect of earlier flips.
-        diag_J     = (V_dev ** 2) @ lam_dev    # [in]  diagonal of J matrix
+        diag_J     = (V_dev ** 2) @ lam_dev
         S_final    = S_refined.clone()
         total_cd_flips = 0
         chunk_size = 64
 
         for sweep in range(self.cd_max_sweeps):
             sweep_flips = 0
-            V_s = (S_final * half_delta) @ V_dev    # [out, k]
+            V_s = (S_final * half_delta) @ V_dev
 
             for j_start in range(0, in_features, chunk_size):
                 j_end      = min(j_start + chunk_size, in_features)
                 j_slice    = slice(j_start, j_end)
 
-                DS_chunk   = -2.0 * S_final[:, j_slice]       # [out, chunk]
-                hd_chunk   = half_delta[:, j_slice]            # [out, chunk]
-                V_chunk    = V_dev[j_start:j_end, :]           # [chunk, k]
-                VsVt_chunk = V_s @ V_chunk.t()                 # [out, chunk]
-                diag_chunk = diag_J[j_slice]                   # [chunk]
-                H_chunk    = H_all[:, j_slice]                 # [out, chunk]
+                DS_chunk   = -2.0 * S_final[:, j_slice]
+                hd_chunk   = half_delta[:, j_slice]
+                V_chunk    = V_dev[j_start:j_end, :]
+                VsVt_chunk = V_s @ V_chunk.t()
+                diag_chunk = diag_J[j_slice]
+                H_chunk    = H_all[:, j_slice]
 
                 term1 = 2.0 * DS_chunk * hd_chunk * VsVt_chunk
                 term2 = (hd_chunk * DS_chunk) ** 2 * diag_chunk
-                dE    = term1 + term2 + H_chunk * DS_chunk     # [out, chunk]
+                dE    = term1 + term2 + H_chunk * DS_chunk
                 del term1, term2, VsVt_chunk, DS_chunk
 
                 flip_mask     = dE < -1e-12
@@ -546,9 +500,9 @@ class QuantumCorrectionEngine:
                 if n_chunk_flips == 0:
                     continue
 
-                flip_float   = flip_mask.float()
-                ds_accepted  = -2.0 * S_final[:, j_slice] * flip_float
-                dV_s         = (ds_accepted * hd_chunk) @ V_chunk  # [out, k]
+                flip_float  = flip_mask.float()
+                ds_accepted = -2.0 * S_final[:, j_slice] * flip_float
+                dV_s        = (ds_accepted * hd_chunk) @ V_chunk
 
                 S_final[:, j_slice][flip_mask] *= -1
                 V_s         = V_s + dV_s
@@ -558,12 +512,13 @@ class QuantumCorrectionEngine:
             if sweep_flips == 0:
                 break
 
-        # ── Reconstruct and write back ────────────────────────────────────────
+        # ── Reconstruct in scaled space, unscale once at the end ─────────────
         W_corrected        = (midpoint + half_delta * S_final).to(original_dtype)
         W_final            = W_corrected / best_scales.unsqueeze(0)
         module.weight.data = W_final
 
-        Y_corrected     = X_corr @ W_final.t()
+        # Error in scaled space (consistent with baseline_error)
+        Y_corrected     = X_corr @ W_corrected.float().t()
         corrected_error = (Y_orig - Y_corrected).pow(2).mean().item()
         improvement     = (baseline_error - corrected_error) / max(baseline_error, 1e-12) * 100
 
@@ -588,10 +543,9 @@ class QuantumCorrectionEngine:
         del (V_dev, lam_dev, H_all, half_delta, diag_J,
              S_nearest, S_mf, S_refined, S_final,
              midpoint, delta_all, nearest, W_sc_f32, D_all, W_corrected,
-             X_corr, Y_orig, Y_base, Y_corrected, baseline_W_q)
+             X_corr, Y_orig, Y_base, Y_corrected, baseline_W_q_sc)
         torch.cuda.empty_cache()
         return stats
-
     # ─────────────────────────────────────────────────────────────────────────
     # Model-level loop
     # ─────────────────────────────────────────────────────────────────────────
