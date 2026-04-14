@@ -342,7 +342,18 @@ class QuantumCorrectionEngine:
         G_D   = (Vt_D * lam_dev) @ V_dev.t()
         H_all = -2.0 * half_delta * (G_D + self.lambda_fidelity * D_all)
         del G_D, Vt_D
-
+        # Add this debug right after the SVD
+        if debug:
+            # Verify: G_approx @ D should have same sign as D on average
+            G_D_test = (D_all[:2] @ V_dev) * lam_dev @ V_dev.t()
+            align = (G_D_test.sign() == D_all[:2].sign()).float().mean()
+            print(f"    G_D sign alignment with D: {align:.3f} (should be >0.5)")
+            # Also verify V is right singular vectors: X.T @ X @ V ≈ V * lam
+            XV = X_corr.float() @ V_dev          # [n, k]
+            XtXV = X_corr.float().t() @ XV / n_tok  # [in, k]
+            lam_check = (XtXV * V_dev).sum(0)    # [k]
+            print(f"    lam check: {lam_check[:3].tolist()}")
+            print(f"    lam actual: {lam_dev[:3].tolist()}")
         # ── Phase 1: Mean-Field Annealing ─────────────────────────────────────
         # Init: start from S_nearest, pre-flip spins opposing their local field
         S_init     = S_nearest.clone()
