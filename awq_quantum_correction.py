@@ -325,7 +325,10 @@ class QuantumCorrectionEngine:
         delta_all  = grid_info['delta'].float().to(device)
         nearest    = grid_info['nearest'].float().to(device)
         half_delta = delta_all / 2
-
+        if debug:
+            print(f"    half_delta min={half_delta.min().item():.6f} max={half_delta.max().item():.6f}")
+            print(f"    delta_all min={delta_all.min().item():.6f} max={delta_all.max().item():.6f}")
+            print(f"    half_delta[0,:5]: {half_delta[0,:5].tolist()}")
         # D[i,j] = W_scaled[i,j] - midpoint[i,j]
         # sign(D) = sign(nearest - midpoint) = S_nearest
         D_all = W_sc_f32 - midpoint
