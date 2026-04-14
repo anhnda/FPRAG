@@ -297,14 +297,14 @@ class QuantumCorrectionEngine:
         # ── Work entirely in scaled space (reference: James-Stein AWQ) ────────
         W_scaled      = W * best_scales.unsqueeze(0)
         grid_info     = self.base_quantizer.get_quantization_grid_info(W_scaled)
-        X_corr        = X_calib[:min(self.max_calib_samples,
-                                    X_calib.shape[0])].to(device).to(original_dtype)
+        X_corr  = X_calib[:min(self.max_calib_samples,
+                               X_calib.shape[0])].to(device).float()  # float32 throughout
 
         # Error measured in scaled space: ||X_corr @ (W_q_scaled - W_scaled).T||^2
         baseline_W_q_sc = grid_info['nearest']               # already in scaled space
         W_sc_f32        = W_scaled.float()
-        Y_orig          = X_corr @ W_sc_f32.t()              # scaled space
-        Y_base          = X_corr @ baseline_W_q_sc.float().t()
+        Y_orig          = X_corr.float() @ W_sc_f32.t()              # scaled space
+        Y_base          = X_corr.float() @ baseline_W_q_sc.float().t()
         baseline_error  = (Y_orig - Y_base).pow(2).mean().item()
         if debug:
             print(f"    Baseline error: {baseline_error:.8f}")
