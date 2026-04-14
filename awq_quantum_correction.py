@@ -341,6 +341,11 @@ class QuantumCorrectionEngine:
         Vt_D  = D_all @ V_dev
         G_D   = (Vt_D * lam_dev) @ V_dev.t()
         H_all = -2.0 * half_delta * (G_D + self.lambda_fidelity * D_all)
+        if debug:
+            print(f"    D_all[0,:5]: {D_all[0,:5].tolist()}")
+            print(f"    S_nearest[0,:5]: {S_nearest[0,:5].tolist()}")
+            print(f"    H_all[0,:5]: {H_all[0,:5].tolist()}")
+            print(f"    H*S sign (should be all negative): {(H_all[0,:5] * S_nearest[0,:5]).tolist()}")
         del G_D, Vt_D
         # Add this debug right after the SVD
         if debug:
