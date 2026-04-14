@@ -418,31 +418,27 @@ class TFIsingCorrectionEngine:
 
         # Rounding decision from m^z
         S_mf = torch.sign(Mz)
+        S_mf[S_mf == 0] = 1.0
+        total_mf_flips = (S_mf != S_nearest).sum().item()
+
+        # Uncertain spins: |m^z| < |m^x|  ↔  |eff| < Γ
+        uncertain_mask = eff.abs() < Gamma
+        total_uncertain = uncertain_mask.sum().item()
+
         if debug:
-            # Sanity 1: MF flips should be small fraction — near-gridpoint spins stay put
             frac_flipped = total_mf_flips / (out_features * in_features)
             print(f"    MF flip fraction: {frac_flipped:.4f} (expect <0.10)")
-            
-            # Sanity 2: uncertain spins should be near-midpoint weights
-            unc_D = D_all[uncertain_mask].abs() / half_delta[uncertain_mask].clamp(min=1e-10)
+            unc_D  = D_all[uncertain_mask].abs() / half_delta[uncertain_mask].clamp(min=1e-10)
             cert_D = D_all[~uncertain_mask].abs() / half_delta[~uncertain_mask].clamp(min=1e-10)
             print(f"    |D/hd| uncertain:{unc_D.mean():.3f}  certain:{cert_D.mean():.3f}")
             print(f"    (uncertain should be smaller — near midpoint)")
-            
-            # Sanity 3: after correction, error should decrease
             S_test = S_mf.clone()
             W_test = (midpoint + half_delta * S_test).to(original_dtype)
             Y_test = X_corr @ W_test.float().t()
             mf_error = (Y_orig - Y_test).pow(2).mean().item()
             print(f"    MF error: {mf_error:.8f} vs baseline: {baseline_error:.8f}")
-            del S_test, W_test, Y_test
-        S_mf[S_mf == 0] = 1.0
-        total_mf_flips = (S_mf != S_nearest).sum().item()
-
-        # Uncertain spins: |m^z| < |m^x|  ↔  |eff| < Γ
-        # These are near-midpoint weights where coupling drives the decision
-        uncertain_mask = eff.abs() < Gamma
-        total_uncertain = uncertain_mask.sum().item()
+            del S_test, W_test, Y_test, unc_D, cert_D
+            print(f"    MF flips:{total_mf_flips}  Uncertain:{total_uncertain}")
 
         del Mz, eff, E, Mx, Mz_hd
 
