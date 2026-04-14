@@ -1,15 +1,18 @@
 """
 AWQ Quantum-Inspired Weight Correction (awq_quantum_correction.py)
 
-Energy formulation (verified with unit test):
+Energy formulation:
     E(s) = sum_alpha lam_alpha (J_V^T s)_alpha^2 + H^T s
     J_V[j] = half_delta[j] * V[j]
-    H[j]   = delta[j]*(G D)[j] + lambda_fid*delta[j]*D[j]
+    D[i,j] = W_sc[i,j] - midpoint[i,j]   (displacement of original weight from midpoint)
+    H[i,j] = -2 * half_delta[i,j] * (G D[i])_j - 2 * lambda_fid * half_delta[i,j] * D[i,j]
 
-Delta-energy for flipping spin j (ds=-2*s_j, dv=J_V[j]*ds):
-    dE = lam^T(2v*dv + dv^2) + H[j]*ds
+Delta-energy for flipping spin (i,j), ds=-2*s[i,j], dv=J_V[i,j]*ds:
+    dE = lam^T(2v*dv + dv^2) + H[i,j]*ds
 
-All phases use this formula. Verified correct on unit test.
+Sign convention: S_nearest[i,j] = +1 means nearest grid point is ceil,
+                                   -1 means nearest grid point is floor.
+E is minimized at S_nearest when interactions are zero; H pulls toward sign(D).
 """
 
 import torch
@@ -86,28 +89,28 @@ class AWQBaseQuantizer:
         zp = torch.round(-w_min / scale).clamp(0, max_int)
         W_div = W_g / scale + zp
         W_int_nearest = torch.round(W_div).clamp(0, max_int)
-        W_int_floor = torch.floor(W_div).clamp(0, max_int)
-        W_int_ceil = torch.ceil(W_div).clamp(0, max_int)
+        W_int_floor   = torch.floor(W_div).clamp(0, max_int)
+        W_int_ceil    = torch.ceil(W_div).clamp(0, max_int)
         exact_mask = (W_int_floor == W_int_ceil)
-        W_int_ceil[exact_mask & (W_int_ceil < max_int)] += 1
-        W_int_floor[exact_mask & (W_int_floor > 0)] -= 1
-        floor_val = (W_int_floor - zp) * scale
-        ceil_val = (W_int_ceil - zp) * scale
+        W_int_ceil[exact_mask  & (W_int_ceil  < max_int)] += 1
+        W_int_floor[exact_mask & (W_int_floor > 0)]       -= 1
+        floor_val   = (W_int_floor   - zp) * scale
+        ceil_val    = (W_int_ceil    - zp) * scale
         nearest_val = (W_int_nearest - zp) * scale
-        floor_val = floor_val.reshape(out_features, padded)[:, :in_features]
-        ceil_val = ceil_val.reshape(out_features, padded)[:, :in_features]
+        floor_val   = floor_val.reshape(out_features,   padded)[:, :in_features]
+        ceil_val    = ceil_val.reshape(out_features,    padded)[:, :in_features]
         nearest_val = nearest_val.reshape(out_features, padded)[:, :in_features]
         return {
             'floor': floor_val, 'ceil': ceil_val, 'nearest': nearest_val,
             'midpoint': (floor_val + ceil_val) / 2,
-            'delta': ceil_val - floor_val,
+            'delta':     ceil_val - floor_val,
         }
 
     @torch.no_grad()
     def compute_l2_salience(self, activation_data):
         if not activation_data:
             return None
-        total = sum(x.reshape(-1, x.shape[-1]).shape[0] for x in activation_data)
+        total  = sum(x.reshape(-1, x.shape[-1]).shape[0] for x in activation_data)
         in_feat = activation_data[0].shape[-1]
         acc = torch.zeros(in_feat, dtype=torch.float32)
         for x in activation_data:
@@ -118,24 +121,24 @@ class AWQBaseQuantizer:
     @torch.no_grad()
     def search_best_scale(self, W, X_calib, activation_salience):
         device = W.device
-        dtype = W.dtype
+        dtype  = W.dtype
         activation_salience = activation_salience.to(device).to(dtype).clamp(min=1e-5)
-        X = X_calib.to(device).to(dtype)
+        X      = X_calib.to(device).to(dtype)
         Y_orig = X @ W.t()
-        best_error = float('inf')
-        best_alpha = 0.0
+        best_error  = float('inf')
+        best_alpha  = 0.0
         best_scales = torch.ones(W.shape[1], device=device, dtype=dtype)
         for grid_idx in range(self.n_grid + 1):
-            alpha = grid_idx / self.n_grid
+            alpha  = grid_idx / self.n_grid
             scales = activation_salience.pow(alpha)
             W_scaled = W * scales.unsqueeze(0)
-            W_q = self.quantize_weight_groupwise_asymmetric(W_scaled)
-            W_recon = W_q / scales.unsqueeze(0)
-            Y_q = X @ W_recon.t()
-            error = (Y_orig - Y_q).pow(2).mean().item()
+            W_q      = self.quantize_weight_groupwise_asymmetric(W_scaled)
+            W_recon  = W_q / scales.unsqueeze(0)
+            Y_q      = X @ W_recon.t()
+            error    = (Y_orig - Y_q).pow(2).mean().item()
             if error < best_error:
-                best_error = error
-                best_alpha = alpha
+                best_error  = error
+                best_alpha  = alpha
                 best_scales = scales.clone()
             del W_scaled, W_q, W_recon, Y_q
         del X, Y_orig
@@ -151,27 +154,27 @@ class QuantumCorrectionEngine:
                  sw_soft_threshold=0.1, group_max_size=6, cd_max_sweeps=3,
                  max_calib_samples_correction=512, top_k_eigvecs_G=32):
 
-        self.model = model
-        self.tokenizer = tokenizer
-        self.device = device
-        self.bits = bits
-        self.group_size = group_size
-        self.n_grid = n_grid
+        self.model               = model
+        self.tokenizer           = tokenizer
+        self.device              = device
+        self.bits                = bits
+        self.group_size          = group_size
+        self.n_grid              = n_grid
         self.max_tokens_per_sample = max_tokens_per_sample
-        self.lmhead_chunks = lmhead_chunks
-        self.lambda_fidelity = lambda_fidelity
-        self.mf_max_iter = mf_max_iter
-        self.mf_beta_init = mf_beta_init
-        self.mf_beta_final = mf_beta_final
-        self.mf_n_temps = mf_n_temps
-        self.sw_soft_threshold = sw_soft_threshold
-        self.group_max_size = group_max_size
-        self.cd_max_sweeps = cd_max_sweeps
-        self.max_calib_samples = max_calib_samples_correction
-        self.top_k_eigvecs_G = top_k_eigvecs_G
-        self.base_quantizer = AWQBaseQuantizer(bits=bits, group_size=group_size, n_grid=n_grid)
-        self.activation_data = {}
-        self.layer_stats = {}
+        self.lmhead_chunks       = lmhead_chunks
+        self.lambda_fidelity     = lambda_fidelity
+        self.mf_max_iter         = mf_max_iter
+        self.mf_beta_init        = mf_beta_init
+        self.mf_beta_final       = mf_beta_final
+        self.mf_n_temps          = mf_n_temps
+        self.sw_soft_threshold   = sw_soft_threshold
+        self.group_max_size      = group_max_size
+        self.cd_max_sweeps       = cd_max_sweeps
+        self.max_calib_samples   = max_calib_samples_correction
+        self.top_k_eigvecs_G     = top_k_eigvecs_G
+        self.base_quantizer      = AWQBaseQuantizer(bits=bits, group_size=group_size, n_grid=n_grid)
+        self.activation_data     = {}
+        self.layer_stats         = {}
 
         print(f"\n{'='*80}")
         print(f"Quantum-Inspired AWQ Correction Engine")
@@ -181,6 +184,10 @@ class QuantumCorrectionEngine:
         print(f"  SW threshold:{sw_soft_threshold}  Group max:{group_max_size}(2^g={2**group_max_size})")
         print(f"  CD sweeps:{cd_max_sweeps}  Low-rank k:{top_k_eigvecs_G}")
         print(f"{'='*80}\n")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Activation collection
+    # ─────────────────────────────────────────────────────────────────────────
 
     def _get_hook(self, name):
         def hook(_module, input, _output):
@@ -202,7 +209,8 @@ class QuantumCorrectionEngine:
         successful = 0
         for text in calibration_data[:n_samples]:
             try:
-                inputs = self.tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
+                inputs = self.tokenizer(
+                    text, return_tensors="pt", truncation=True, max_length=512)
                 inputs = {k: v.to(self.device) for k, v in inputs.items()}
                 self.model(**inputs, use_cache=False, return_dict=True)
                 successful += 1
@@ -226,34 +234,37 @@ class QuantumCorrectionEngine:
         X = torch.cat([x.reshape(-1, x.shape[-1]) for x in X_list], dim=0).float()
         if X.shape[0] > max_samples:
             idx = torch.randperm(X.shape[0])[:max_samples]
-            X = X[idx]
+            X   = X[idx]
         return X
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # Group clustering (CPU numpy, no GPU syncs)
+    # ─────────────────────────────────────────────────────────────────────────
+
     def _cluster_soft_spins(self, J_sub_gpu, soft_indices_gpu):
-        """Greedy clustering on CPU numpy — zero GPU syncs."""
         n = J_sub_gpu.shape[0]
         if n == 0:
             return []
         if n == 1:
             return [[soft_indices_gpu[0].item()]]
-        J_np = J_sub_gpu.abs().cpu().numpy()
+        J_np  = J_sub_gpu.abs().cpu().numpy()
         si_np = soft_indices_gpu.cpu().numpy()
         np.fill_diagonal(J_np, 0)
         row_sums = J_np.sum(axis=1)
-        used = np.zeros(n, dtype=bool)
-        groups = []
+        used     = np.zeros(n, dtype=bool)
+        groups   = []
         while not used.all():
-            tmp = row_sums.copy()
+            tmp       = row_sums.copy()
             tmp[used] = -1.0
-            seed = int(tmp.argmax())
-            group = [seed]
+            seed      = int(tmp.argmax())
+            group     = [seed]
             used[seed] = True
             for _ in range(self.group_max_size - 1):
                 if used.all():
                     break
-                coupling = J_np[:, group].sum(axis=1)
+                coupling       = J_np[:, group].sum(axis=1)
                 coupling[used] = -1.0
-                best = int(coupling.argmax())
+                best           = int(coupling.argmax())
                 if coupling[best] < 0.1 * row_sums[seed] / max(len(group), 1):
                     break
                 group.append(best)
@@ -261,14 +272,18 @@ class QuantumCorrectionEngine:
             groups.append([int(si_np[i]) for i in group])
         return groups
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # Core per-layer correction
+    # ─────────────────────────────────────────────────────────────────────────
+
     @torch.no_grad()
     def _correct_layer(self, name, module, X_calib, debug=False):
         W = module.weight.data
-        original_dtype = W.dtype
+        original_dtype           = W.dtype
         out_features, in_features = W.shape
-        device = W.device
+        device                   = W.device
 
-        # ── AWQ scaling (unchanged) ───────────────────────────────────────────────
+        # ── AWQ scaling ───────────────────────────────────────────────────────
         salience = self.base_quantizer.compute_l2_salience(
             self.activation_data.get(name, []))
         if salience is None:
@@ -280,33 +295,39 @@ class QuantumCorrectionEngine:
         if debug:
             print(f"    AWQ: alpha={best_alpha:.3f}")
 
-        W_scaled = W * best_scales.unsqueeze(0)
-        grid_info = self.base_quantizer.get_quantization_grid_info(W_scaled)
-        baseline_W_q = grid_info['nearest'] / best_scales.unsqueeze(0)
-        X_corr = X_calib[:min(self.max_calib_samples, X_calib.shape[0])].to(device).to(original_dtype)
-        Y_orig  = X_corr @ W.t()
-        Y_base  = X_corr @ baseline_W_q.t()
+        W_scaled      = W * best_scales.unsqueeze(0)
+        grid_info     = self.base_quantizer.get_quantization_grid_info(W_scaled)
+        baseline_W_q  = grid_info['nearest'] / best_scales.unsqueeze(0)
+        X_corr        = X_calib[:min(self.max_calib_samples,
+                                     X_calib.shape[0])].to(device).to(original_dtype)
+        Y_orig        = X_corr @ W.t()
+        Y_base        = X_corr @ baseline_W_q.t()
         baseline_error = (Y_orig - Y_base).pow(2).mean().item()
         if debug:
             print(f"    Baseline error: {baseline_error:.8f}")
 
-        # ── Low-rank G (unchanged) ────────────────────────────────────────────────
+        # ── Low-rank G via truncated SVD ──────────────────────────────────────
         X_for_G = X_corr / best_scales.unsqueeze(0).to(X_corr.dtype)
-        n_tok = X_for_G.shape[0]
-        k = min(self.top_k_eigvecs_G, n_tok, in_features)
+        n_tok   = X_for_G.shape[0]
+        k       = min(self.top_k_eigvecs_G, n_tok, in_features)
         U, S_sv, V = torch.svd_lowrank(X_for_G.float(), q=k, niter=4)
-        lam = (S_sv ** 2) / n_tok
+        lam = (S_sv ** 2) / n_tok    # eigenvalues of (1/n) X^T X  [k]
         del X_for_G, U, S_sv
         torch.cuda.empty_cache()
         if debug:
             print(f"    G: top-{k}, lam_1={lam[0]:.4f}, lam_k={lam[-1]:.6f}")
 
-        # ── Ising tensors ─────────────────────────────────────────────────────────
-        midpoint  = grid_info['midpoint'].float().to(device)
-        delta_all = grid_info['delta'].float().to(device)
-        nearest   = grid_info['nearest'].float().to(device)
-        W_sc_f32  = W_scaled.float()
-        D_all     = midpoint - W_sc_f32
+        # ── Ising tensors ─────────────────────────────────────────────────────
+        midpoint   = grid_info['midpoint'].float().to(device)
+        delta_all  = grid_info['delta'].float().to(device)
+        nearest    = grid_info['nearest'].float().to(device)
+        W_sc_f32   = W_scaled.float()
+        half_delta = delta_all / 2          # always > 0  (ceil > floor)
+
+        # D[i,j] = displacement of original (scaled) weight from midpoint
+        # positive  → weight is above midpoint → nearest is ceil  → S_nearest = +1
+        # negative  → weight is below midpoint → nearest is floor → S_nearest = -1
+        D_all = W_sc_f32 - midpoint         # SIGN FIX: was midpoint - W_sc_f32
 
         S_nearest = torch.sign(nearest - midpoint)
         S_nearest[S_nearest == 0] = 1.0
@@ -314,16 +335,24 @@ class QuantumCorrectionEngine:
         V_dev   = V.to(device)
         lam_dev = lam.to(device)
 
-        Vt_D  = D_all @ V_dev
-        G_D   = (Vt_D * lam_dev) @ V_dev.t()
-        H_all = delta_all * G_D + self.lambda_fidelity * delta_all * D_all
+        # Full energy (per row i):
+        #   E_i(s) = (hd*s - D)^T G (hd*s - D) + lambda_fid ||hd*s - D||^2
+        # Linear term in s:  H[i,j] * s[i,j]
+        #   H[i,j] = -2*hd[i,j]*(GD[i])_j  -  2*lambda_fid*hd[i,j]*D[i,j]
+        # (factor of 2 is absorbed here so dE = lam^T(2v*dv+dv^2) + H*ds is exact)
+        Vt_D  = D_all @ V_dev               # [out, k]
+        G_D   = (Vt_D * lam_dev) @ V_dev.t()  # [out, in]  row-wise G @ D
+        H_all = -2.0 * half_delta * (G_D + self.lambda_fidelity * D_all)
         del G_D, Vt_D
 
-        half_delta = delta_all / 2
+        # Sanity: at S_nearest, dE > 0 for all spins (nearest is a local minimum
+        # of the uncoupled problem).  The coupling (lam) may cause some flips.
 
-        # ── Phase 1: Mean-Field Annealing — FIX: pure tanh, no momentum bias ─────
-        # Fixed-point eq: M = tanh(-beta * (H + 2*hd*(V lam V^T)(M*hd)))
-        M = S_nearest.clone()
+        # ── Phase 1: Mean-Field Annealing ─────────────────────────────────────
+        # MF free energy gradient w.r.t. m[i,j]:
+        #   eff[i,j] = H[i,j] + 2*hd[i,j] * (V lam V^T (m[i]*hd[i]))_j
+        # Fixed-point: m = -tanh(beta * eff)
+        M    = S_nearest.clone()
         betas = torch.logspace(
             np.log10(self.mf_beta_init),
             np.log10(self.mf_beta_final),
@@ -332,10 +361,9 @@ class QuantumCorrectionEngine:
         for beta in betas:
             beta_val = beta.item()
             for iteration in range(self.mf_max_iter):
-                M_hd   = M * half_delta                           # [out, in]
-                Vt_Mhd = M_hd @ V_dev                            # [out, k]
+                M_hd   = M * half_delta                                    # [out, in]
+                Vt_Mhd = M_hd @ V_dev                                     # [out, k]
                 JM     = 2.0 * (Vt_Mhd * lam_dev) @ V_dev.t() * half_delta  # [out, in]
-                # FIX: pure tanh fixed-point (no 0.5*M momentum term)
                 M_next = -torch.tanh(beta_val * (H_all + JM))
                 if iteration % 5 == 4:
                     if (M_next - M).abs().max().item() < 1e-5:
@@ -348,21 +376,22 @@ class QuantumCorrectionEngine:
         total_mf_flips = (S_mf != S_nearest).sum().item()
         del M
 
-        # ── Phase 2: Spin-Wave Stability — FIX: correct soft-spin definition ──────
-        # stability_j = s_j * (dE/ds_j)|_{s=S_mf}  — positive = stable, negative = wrong
-        S_hd   = S_mf * half_delta
-        Vt_Shd = S_hd @ V_dev
-        JS     = 2.0 * (Vt_Shd * lam_dev) @ V_dev.t() * half_delta
-        Stability = S_mf * (H_all + JS)          # positive = stable
+        # ── Phase 2: Spin-Wave Stability ──────────────────────────────────────
+        # stability[i,j] = s[i,j] * (partial E / partial s[i,j])
+        #                = s[i,j] * (H[i,j] + 2*hd[i,j]*(V lam V^T (s[i]*hd[i]))_j)
+        # positive → spin is stable (moving it increases E)
+        # negative → spin is wrong  (moving it decreases E) → flip immediately
+        S_hd    = S_mf * half_delta
+        Vt_Shd  = S_hd @ V_dev
+        JS      = 2.0 * (Vt_Shd * lam_dev) @ V_dev.t() * half_delta
+        Stability = S_mf * (H_all + JS)
         del S_hd, Vt_Shd, JS
 
-        # FIX: "soft" = positive stability below threshold (uncertain, not wrong)
-        # "wrong" = negative stability → flip immediately
         wrong_mask = Stability < 0.0
         S_mf[wrong_mask] *= -1
         total_immediate_flips = wrong_mask.sum().item()
 
-        # Now recompute stability for the corrected spins
+        # Recompute stability after immediate flips
         S_hd2   = S_mf * half_delta
         Vt_Shd2 = S_hd2 @ V_dev
         JS2     = 2.0 * (Vt_Shd2 * lam_dev) @ V_dev.t() * half_delta
@@ -371,22 +400,23 @@ class QuantumCorrectionEngine:
 
         median_stab = Stability2.abs().median(dim=1, keepdim=True).values
         threshold   = self.sw_soft_threshold * median_stab.clamp(min=1e-10)
-        # Soft spins: stable but low-confidence (0 < stability < threshold)
+        # Soft: stable but low-confidence (0 < stability < threshold)
         soft_masks  = (Stability2 >= 0) & (Stability2 < threshold)
         total_sw_soft = soft_masks.sum().item()
         del Stability, Stability2, median_stab, threshold, wrong_mask
 
-        # ── Phase 3: Group Refinement (logic unchanged, inputs now correct) ───────
-        S_refined = S_mf.clone()
+        # ── Phase 3: Group Refinement ─────────────────────────────────────────
+        S_refined       = S_mf.clone()
         total_group_flips = 0
-        rows_with_soft = (soft_masks.sum(dim=1) >= 3).nonzero(as_tuple=True)[0]
+        rows_with_soft  = (soft_masks.sum(dim=1) >= 3).nonzero(as_tuple=True)[0]
 
         for row_idx in rows_with_soft.tolist():
             soft_idx = soft_masks[row_idx].nonzero(as_tuple=True)[0]
-            n_soft = soft_idx.shape[0]
+            n_soft   = soft_idx.shape[0]
             if n_soft == 0:
                 continue
 
+            # Cap at 50 worst (lowest stability) soft spins per row
             if n_soft > 50:
                 hd_tmp   = half_delta[row_idx]
                 s_tmp    = S_mf[row_idx]
@@ -397,14 +427,14 @@ class QuantumCorrectionEngine:
                 n_soft   = 50
 
             hd_row   = half_delta[row_idx]
-            J_V_row  = hd_row.unsqueeze(1) * V_dev
-            J_V_soft = J_V_row[soft_idx]
+            J_V_row  = hd_row.unsqueeze(1) * V_dev          # [in, k]
+            J_V_soft = J_V_row[soft_idx]                    # [n_soft, k]
             J_sub    = J_V_soft @ (lam_dev.unsqueeze(0) * J_V_soft).t()
             groups   = self._cluster_soft_spins(J_sub, soft_idx)
 
             s_row = S_refined[row_idx].clone()
             h_row = H_all[row_idx]
-            v_row = J_V_row.t() @ s_row
+            v_row = J_V_row.t() @ s_row                     # [k]
 
             for group in groups:
                 g = len(group)
@@ -418,12 +448,12 @@ class QuantumCorrectionEngine:
                 if g <= self.group_max_size:
                     n_configs = 2 ** g
                     bit_idx  = torch.arange(n_configs, device=device).unsqueeze(1)
-                    bit_pos  = torch.arange(g, device=device).unsqueeze(0)
+                    bit_pos  = torch.arange(g,         device=device).unsqueeze(0)
                     flip_mat = ((bit_idx >> bit_pos) & 1).float()
                     delta_sg = -2.0 * flip_mat * s_g.unsqueeze(0)
                     delta_v  = delta_sg @ J_g
                     dE = (delta_v * (2.0 * v_row.unsqueeze(0) + delta_v)) @ lam_dev \
-                        + delta_sg @ h_g
+                         + delta_sg @ h_g
                     best_idx = dE.argmin()
                     if dE[best_idx] < -1e-12:
                         best_flip = flip_mat[best_idx].bool()
@@ -435,7 +465,8 @@ class QuantumCorrectionEngine:
                         j_v = J_V_row[idx]
                         ds  = -2.0 * s_row[idx]
                         dv  = ds * j_v
-                        dE  = ((2.0 * v_row + dv) * dv * lam_dev).sum() + h_row[idx] * ds
+                        dE  = ((2.0 * v_row + dv) * dv * lam_dev).sum() \
+                              + h_row[idx] * ds
                         if dE.item() < -1e-12:
                             s_row[idx] *= -1
                             v_row = v_row + dv
@@ -445,92 +476,94 @@ class QuantumCorrectionEngine:
 
         del soft_masks, rows_with_soft
 
-        # ── Phase 4: Coordinate Descent — FIX: sequential (Gauss-Seidel) ─────────
-        # Process in chunks of columns; update V_s after each chunk.
-        # Full sequential (1 flip at a time) is correct but O(in_features) syncs.
-        # Chunk size = 64 gives a ~64x speedup vs fully sequential while keeping
-        # interactions within a chunk small enough to be nearly conflict-free.
-        diag_J = (V_dev ** 2) @ lam_dev    # [in]
-
-        S_final = S_refined.clone()
+        # ── Phase 4: Coordinate Descent (chunked Gauss-Seidel) ────────────────
+        # Process chunk_size columns at a time; update V_s incrementally after
+        # each chunk so later chunks see the effect of earlier flips.
+        diag_J     = (V_dev ** 2) @ lam_dev    # [in]  diagonal of J matrix
+        S_final    = S_refined.clone()
         total_cd_flips = 0
-        chunk_size = 64   # tune: larger = faster but slightly less accurate
+        chunk_size = 64
 
         for sweep in range(self.cd_max_sweeps):
             sweep_flips = 0
-            V_s = (S_final * half_delta) @ V_dev    # [out, k]  — recompute each sweep
+            V_s = (S_final * half_delta) @ V_dev    # [out, k]
 
             for j_start in range(0, in_features, chunk_size):
-                j_end   = min(j_start + chunk_size, in_features)
-                j_slice = slice(j_start, j_end)
+                j_end      = min(j_start + chunk_size, in_features)
+                j_slice    = slice(j_start, j_end)
 
-                # dE for flipping column block [j_start:j_end]
-                # ds = -2*S[:,j_slice]
-                DS_chunk   = -2.0 * S_final[:, j_slice]          # [out, chunk]
-                hd_chunk   = half_delta[:, j_slice]               # [out, chunk]
-                V_chunk    = V_dev[j_start:j_end, :]              # [chunk, k]
-                VsVt_chunk = V_s @ V_chunk.t()                    # [out, chunk]
-                diag_chunk = diag_J[j_slice]                      # [chunk]
-                H_chunk    = H_all[:, j_slice]                    # [out, chunk]
+                DS_chunk   = -2.0 * S_final[:, j_slice]       # [out, chunk]
+                hd_chunk   = half_delta[:, j_slice]            # [out, chunk]
+                V_chunk    = V_dev[j_start:j_end, :]           # [chunk, k]
+                VsVt_chunk = V_s @ V_chunk.t()                 # [out, chunk]
+                diag_chunk = diag_J[j_slice]                   # [chunk]
+                H_chunk    = H_all[:, j_slice]                 # [out, chunk]
 
                 term1 = 2.0 * DS_chunk * hd_chunk * VsVt_chunk
                 term2 = (hd_chunk * DS_chunk) ** 2 * diag_chunk
-                dE    = term1 + term2 + H_chunk * DS_chunk        # [out, chunk]
+                dE    = term1 + term2 + H_chunk * DS_chunk     # [out, chunk]
                 del term1, term2, VsVt_chunk, DS_chunk
 
-                flip_mask = dE < -1e-12
+                flip_mask     = dE < -1e-12
                 del dE
                 n_chunk_flips = flip_mask.sum().item()
                 if n_chunk_flips == 0:
                     continue
 
-                # Apply flips and update V_s incrementally
-                # delta_V_s = sum over flipped (j,i): -2*S[i,j]*hd[i,j]*V[j]
-                flip_float = flip_mask.float()                    # [out, chunk]
-                ds_accepted = -2.0 * S_final[:, j_slice] * flip_float  # [out, chunk]
-                dV_s = (ds_accepted * hd_chunk) @ V_chunk         # [out, k]
+                flip_float   = flip_mask.float()
+                ds_accepted  = -2.0 * S_final[:, j_slice] * flip_float
+                dV_s         = (ds_accepted * hd_chunk) @ V_chunk  # [out, k]
 
                 S_final[:, j_slice][flip_mask] *= -1
-                V_s = V_s + dV_s
+                V_s         = V_s + dV_s
                 sweep_flips += n_chunk_flips
 
             total_cd_flips += sweep_flips
             if sweep_flips == 0:
                 break
 
-        # ── Reconstruct ───────────────────────────────────────────────────────────
-        W_corrected = (midpoint + half_delta * S_final).to(original_dtype)
-        W_final     = W_corrected / best_scales.unsqueeze(0)
+        # ── Reconstruct and write back ────────────────────────────────────────
+        W_corrected        = (midpoint + half_delta * S_final).to(original_dtype)
+        W_final            = W_corrected / best_scales.unsqueeze(0)
         module.weight.data = W_final
 
-        Y_corrected    = X_corr @ W_final.t()
+        Y_corrected     = X_corr @ W_final.t()
         corrected_error = (Y_orig - Y_corrected).pow(2).mean().item()
         improvement     = (baseline_error - corrected_error) / max(baseline_error, 1e-12) * 100
 
         if debug:
             print(f"    Corrected: {corrected_error:.8f} ({improvement:+.2f}%)")
             print(f"    Flips MF:{total_mf_flips} imm:{total_immediate_flips} "
-                f"G:{total_group_flips} CD:{total_cd_flips}")
+                  f"G:{total_group_flips} CD:{total_cd_flips}")
             print(f"    Soft spins: {total_sw_soft}")
 
         stats = {
-            'awq_alpha': best_alpha, 'baseline_error': baseline_error,
-            'corrected_error': corrected_error, 'improvement_pct': improvement,
-            'mf_flips': total_mf_flips, 'sw_soft': total_sw_soft,
-            'group_flips': total_group_flips, 'cd_flips': total_cd_flips,
-            'immediate_flips': total_immediate_flips,
+            'awq_alpha':        best_alpha,
+            'baseline_error':   baseline_error,
+            'corrected_error':  corrected_error,
+            'improvement_pct':  improvement,
+            'mf_flips':         total_mf_flips,
+            'immediate_flips':  total_immediate_flips,
+            'sw_soft':          total_sw_soft,
+            'group_flips':      total_group_flips,
+            'cd_flips':         total_cd_flips,
         }
 
         del (V_dev, lam_dev, H_all, half_delta, diag_J,
-            S_nearest, S_mf, S_refined, S_final,
-            midpoint, delta_all, nearest, W_sc_f32, D_all, W_corrected,
-            X_corr, Y_orig, Y_base, Y_corrected, baseline_W_q)
+             S_nearest, S_mf, S_refined, S_final,
+             midpoint, delta_all, nearest, W_sc_f32, D_all, W_corrected,
+             X_corr, Y_orig, Y_base, Y_corrected, baseline_W_q)
         torch.cuda.empty_cache()
         return stats
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # Model-level loop
+    # ─────────────────────────────────────────────────────────────────────────
+
     def correct_model(self, calibration_data, n_samples=128, layer_batch_size=16):
         print(f"\n{'='*80}\nQUANTUM-INSPIRED WEIGHT CORRECTION\n{'='*80}")
-        layer_list = [(name, module) for name, module in self.model.named_modules()
+        layer_list = [(name, module)
+                      for name, module in self.model.named_modules()
                       if isinstance(module, nn.Linear)]
         n_layers  = len(layer_list)
         n_batches = (n_layers + layer_batch_size - 1) // layer_batch_size
@@ -549,7 +582,7 @@ class QuantumCorrectionEngine:
             for layer_idx, (name, module) in enumerate(batch):
                 global_idx = b_start + layer_idx
                 is_lmhead  = 'lm_head' in name.lower()
-                X_calib = self._get_calibration_matrix(name)
+                X_calib    = self._get_calibration_matrix(name)
                 if X_calib is None or X_calib.shape[0] < 10:
                     print(f"  [{global_idx}/{n_layers}] {name}: SKIPPED")
                     continue
@@ -557,11 +590,13 @@ class QuantumCorrectionEngine:
 
                 if is_lmhead:
                     print(f"  [{global_idx}/{n_layers}] {name}: lm_head - AWQ only")
-                    W = module.weight.data
-                    salience = self.base_quantizer.compute_l2_salience(self.activation_data.get(name, []))
+                    W        = module.weight.data
+                    salience = self.base_quantizer.compute_l2_salience(
+                        self.activation_data.get(name, []))
                     if salience is not None:
-                        X_s = X_calib[:min(1024, X_calib.shape[0])].to(self.device).to(W.dtype)
-                        scales, _, _ = self.base_quantizer.search_best_scale(W, X_s, salience.to(self.device))
+                        X_s    = X_calib[:min(1024, X_calib.shape[0])].to(self.device).to(W.dtype)
+                        scales, _, _ = self.base_quantizer.search_best_scale(
+                            W, X_s, salience.to(self.device))
                         del X_s
                         W_sc = W * scales.unsqueeze(0)
                         W_q  = self.base_quantizer.quantize_weight_groupwise_asymmetric(W_sc)
@@ -576,8 +611,8 @@ class QuantumCorrectionEngine:
                     total_improvement.append(stats['improvement_pct'])
                     print(f"err {stats['baseline_error']:.6f}->{stats['corrected_error']:.6f} "
                           f"({stats['improvement_pct']:+.2f}%) "
-                          f"MF={stats['mf_flips']} G={stats['group_flips']} "
-                          f"CD={stats['cd_flips']}  [{dt:.1f}s]")
+                          f"MF={stats['mf_flips']} imm={stats['immediate_flips']} "
+                          f"G={stats['group_flips']} CD={stats['cd_flips']}  [{dt:.1f}s]")
 
                 del X_calib
                 torch.cuda.empty_cache()
@@ -598,11 +633,12 @@ class QuantumCorrectionEngine:
                   f"min:{imp.min():+.2f}%  max:{imp.max():+.2f}%")
             print(f"  Improved:{(imp>0).sum()}/{len(imp)}")
         if self.layer_stats:
-            mf = sum(s['mf_flips']    for s in self.layer_stats.values())
-            gf = sum(s['group_flips'] for s in self.layer_stats.values())
-            cd = sum(s['cd_flips']    for s in self.layer_stats.values())
-            print(f"  Flips MF:{mf:,} G:{gf:,} CD:{cd:,} Total:{mf+gf+cd:,}")
-
+            mf  = sum(s['mf_flips']       for s in self.layer_stats.values())
+            imm = sum(s['immediate_flips'] for s in self.layer_stats.values())
+            gf  = sum(s['group_flips']     for s in self.layer_stats.values())
+            cd  = sum(s['cd_flips']        for s in self.layer_stats.values())
+            print(f"  Flips MF:{mf:,} imm:{imm:,} G:{gf:,} CD:{cd:,} "
+                  f"Total:{mf+imm+gf+cd:,}")
 
 def main():
     parser = argparse.ArgumentParser(description="AWQ + Quantum-Inspired Weight Correction",
