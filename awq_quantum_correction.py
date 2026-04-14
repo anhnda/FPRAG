@@ -3,30 +3,28 @@ AWQ + Transverse-Field Ising Model Weight Correction
 awq_tfim_correction.py
 
 Energy formulation:
-    E(s) = ||X_corr @ (hd*s).T||^2_G / n  +  λ||hd*s - D||^2
+    E(s) = ||X_corr @ R(s).T||^2 / n  +  λ * ||R(s)||^2
 
-    where G = X_corr^T X_corr / n ≈ V diag(lam) V^T  (low-rank SVD)
+    where R(s)[i,j] = hd[i,j]*s[i,j] - D[i,j]
+          D[i,j]    = W_sc[i,j] - midpoint[i,j]   (displacement from midpoint)
+          hd[i,j]   = delta[i,j] / 2               (half grid step, > 0)
+          s[i,j]    ∈ {-1, +1}                     (-1→floor, +1→ceil)
 
-Spin variables: s_i ∈ {-1, +1}
-    s=+1 → ceil,  s=-1 → floor
-    D_i = W_sc_i - midpoint_i  (displacement from midpoint)
-    hd_i = delta_i / 2         (half grid step, always > 0)
+    Energy change when spin (i,j) flips (ds = -2*s[i,j]):
+        dv[i]      = ds * hd[i,j] * V_lam[j]
+        dE_quad    = 2*(dv[i] · V_s[i])  +  ||dv[i]||^2
+        dE_fid_eff = 2λ * ds * hd[i,j] * R[i,j]   (constant 4λ*hd^2 dropped)
+        dE_total   = dE_quad + dE_fid_eff
 
-Transverse field (quantum insight):
-    Γ_i = γ * (1 - |D_i / hd_i|)
-    Γ→1: near midpoint  → uncertain, worth correcting
-    Γ→0: near grid point → certain,  leave at nearest
+    where V_s[i] = R[i] @ V_lam  is the lam-weighted residual projection,
+    and   V_lam  = V * sqrt(lam)  absorbs eigenvalues once (no separate lam_dev).
 
-Local field (fidelity only — G_D unreliable at low rank):
-    H_i = -2 * hd_i * λ * D_i
-
-Key fix: lam is absorbed into V_lam = V * sqrt(lam) once, so that all
-inner-product computations V_s @ V_lam.t() are automatically lam-weighted.
-This ensures Phase 1 and Phase 2 use a consistent energy metric and the
-dE sign/magnitude is correct, preventing bad flips.
-
-Correction: group exhaustive search on uncertain spins,
-            followed by CD cleanup restricted to uncertain spins.
+Key design:
+    1. V_s is centered on the *residual* R(s)=hd*s-D, not on hd*s.
+       The quadratic dE_quad is then exact w.r.t. the true objective.
+    2. sqrt(lam) absorbed into V_lam once; all inner products auto-weighted.
+    3. Γ_i = γ*(1-|D_i/hd_i|) selects uncertain spins; certain spins frozen.
+    4. Phase 1: group exhaustive search, Phase 2: CD cleanup (uncertain only).
 """
 
 import torch
@@ -56,6 +54,10 @@ except ImportError:
         raise NotImplementedError("Please provide calibration_utils.py")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# AWQ base quantizer
+# ─────────────────────────────────────────────────────────────────────────────
+
 class AWQBaseQuantizer:
     def __init__(self, bits=4, group_size=128, n_grid=20):
         self.bits = bits
@@ -72,12 +74,12 @@ class AWQBaseQuantizer:
             W_pad[:, :in_features] = W
         else:
             W_pad = W
-        W_g = W_pad.reshape(out_features, n_groups, self.group_size)
+        W_g   = W_pad.reshape(out_features, n_groups, self.group_size)
         w_min = W_g.min(dim=2, keepdim=True)[0]
         w_max = W_g.max(dim=2, keepdim=True)[0]
         max_int = 2 ** self.bits - 1
         scale = ((w_max - w_min) / max_int).clamp(min=1e-8)
-        zp = torch.round(-w_min / scale).clamp(0, max_int)
+        zp    = torch.round(-w_min / scale).clamp(0, max_int)
         W_int = torch.round(W_g / scale + zp).clamp(0, max_int)
         W_deq = (W_int - zp) * scale
         W_deq = W_deq.reshape(out_features, padded)
@@ -89,19 +91,19 @@ class AWQBaseQuantizer:
     def get_quantization_grid_info(self, W):
         out_features, in_features = W.shape
         n_groups = (in_features + self.group_size - 1) // self.group_size
-        padded = n_groups * self.group_size
-        max_int = 2 ** self.bits - 1
+        padded   = n_groups * self.group_size
+        max_int  = 2 ** self.bits - 1
         if padded > in_features:
             W_pad = torch.zeros(out_features, padded, device=W.device, dtype=W.dtype)
             W_pad[:, :in_features] = W
         else:
             W_pad = W
-        W_g = W_pad.reshape(out_features, n_groups, self.group_size)
+        W_g   = W_pad.reshape(out_features, n_groups, self.group_size)
         w_min = W_g.min(dim=2, keepdim=True)[0]
         w_max = W_g.max(dim=2, keepdim=True)[0]
         scale = ((w_max - w_min) / max_int).clamp(min=1e-8)
-        zp = torch.round(-w_min / scale).clamp(0, max_int)
-        W_div = W_g / scale + zp
+        zp    = torch.round(-w_min / scale).clamp(0, max_int)
+        W_div         = W_g / scale + zp
         W_int_nearest = torch.round(W_div).clamp(0, max_int)
         W_int_floor   = torch.floor(W_div).clamp(0, max_int)
         W_int_ceil    = torch.ceil(W_div).clamp(0, max_int)
@@ -131,7 +133,7 @@ class AWQBaseQuantizer:
         acc = torch.zeros(in_feat, dtype=torch.float32)
         for x in activation_data:
             x_flat = x.reshape(-1, x.shape[-1]).float()
-            acc += x_flat.pow(2).sum(dim=0)
+            acc   += x_flat.pow(2).sum(dim=0)
         return acc / total
 
     @torch.no_grad()
@@ -161,20 +163,17 @@ class AWQBaseQuantizer:
         return best_scales, best_alpha, best_error
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# TFIM correction engine
+# ─────────────────────────────────────────────────────────────────────────────
+
 class TFIsingCorrectionEngine:
     """
     Transverse-Field Ising Model correction engine.
 
-    Key insight: Γ_i = γ*(1 - |D_i/hd_i|) identifies which weights are
-    genuinely uncertain (near midpoint between floor and ceil).
-    Only these weights are candidates for rounding correction.
-    Near-gridpoint weights are left at nearest rounding — they are classical.
-
-    Energy metric fix: lam eigenvalues are absorbed into V_lam = V * sqrt(lam)
-    once at the start of _correct_layer. All subsequent inner products
-    V_s @ V_lam.t() are automatically lam-weighted, making Phase 1 and
-    Phase 2 use a consistent quadratic energy. The explicit @ lam_dev
-    multiplications in Phase 1 are dropped to avoid double-counting.
+    Γ_i = γ*(1 - |D_i/hd_i|) selects uncertain spins (near midpoint).
+    Only uncertain spins are candidates for correction.
+    Near-gridpoint spins (Γ ≈ 0) are frozen at nearest rounding.
     """
 
     def __init__(self, model, tokenizer, device="cuda", bits=4, group_size=128,
@@ -216,9 +215,7 @@ class TFIsingCorrectionEngine:
         print(f"  Max rows/layer:{max_rows}  Calib samples:{max_calib_samples}")
         print(f"{'='*80}\n")
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Activation collection
-    # ─────────────────────────────────────────────────────────────────────────
+    # ── Activation collection ─────────────────────────────────────────────────
 
     def _get_hook(self, name):
         def hook(_module, input, _output):
@@ -266,9 +263,7 @@ class TFIsingCorrectionEngine:
             X   = X[idx]
         return X
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Group clustering
-    # ─────────────────────────────────────────────────────────────────────────
+    # ── Group clustering ──────────────────────────────────────────────────────
 
     def _cluster_spins(self, J_sub, indices):
         """Greedy clustering by coupling strength — CPU numpy, no GPU syncs."""
@@ -302,9 +297,7 @@ class TFIsingCorrectionEngine:
             groups.append([int(si_np[i]) for i in group])
         return groups
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Core per-layer correction
-    # ─────────────────────────────────────────────────────────────────────────
+    # ── Core per-layer correction ─────────────────────────────────────────────
 
     @torch.no_grad()
     def _correct_layer(self, name, module, X_calib, debug=False):
@@ -338,51 +331,39 @@ class TFIsingCorrectionEngine:
         if debug:
             print(f"    Baseline error: {baseline_error:.8f}")
 
-        # ── Low-rank G = X_corr^T X_corr / n ─────────────────────────────────
+        # ── Low-rank G = X_corr^T X_corr / n, absorb sqrt(lam) into V ────────
         n_tok = X_corr.shape[0]
         k     = min(self.top_k_eigvecs, n_tok, in_features)
         U, S_sv, V = torch.svd_lowrank(X_corr.float(), q=k, niter=4)
-        lam = (S_sv ** 2) / n_tok
+        lam    = (S_sv ** 2) / n_tok                                   # [k]
         del U, S_sv
         torch.cuda.empty_cache()
         if debug:
             print(f"    G: top-{k}, lam_1={lam[0]:.4f}, lam_k={lam[-1]:.6f}")
 
-        # ── Absorb sqrt(lam) into V once ──────────────────────────────────────
-        # V_lam[j, r] = V[j, r] * sqrt(lam[r])
-        # All inner products  a^T G b  =  (a^T V_lam)(V_lam^T b)
-        # This makes every Phase-1 and Phase-2 dE formula automatically
-        # lam-weighted without any explicit @ lam_dev term.
-        lam_sqrt = lam.sqrt().to(device)                               # [k]
+        # V_lam[j,r] = V[j,r] * sqrt(lam[r])
+        # Inner product:  a · G · b  =  (a @ V_lam) · (b @ V_lam)
+        lam_sqrt = lam.sqrt().to(device)
         V_lam    = V.to(device) * lam_sqrt.unsqueeze(0)                # [in, k]
         del V, lam, lam_sqrt
         torch.cuda.empty_cache()
 
-        # ── Ising tensors ─────────────────────────────────────────────────────
-        midpoint   = grid_info['midpoint'].float().to(device)
-        delta_all  = grid_info['delta'].float().to(device)
-        nearest    = grid_info['nearest'].float().to(device)
-        half_delta = delta_all / 2
-        D_all      = W_sc_f32 - midpoint
+        # ── Grid geometry ─────────────────────────────────────────────────────
+        midpoint   = grid_info['midpoint'].float().to(device)          # [out, in]
+        delta_all  = grid_info['delta'].float().to(device)             # [out, in]
+        nearest    = grid_info['nearest'].float().to(device)           # [out, in]
+        half_delta = delta_all / 2                                     # hd[i,j]
 
-        S_nearest = torch.sign(nearest - midpoint)
+        # D[i,j] = W_sc[i,j] - midpoint[i,j]   signed displacement ∈ (-hd, +hd)
+        D_all = W_sc_f32 - midpoint                                    # [out, in]
+
+        # Initial spins: nearest rounding
+        S_nearest             = torch.sign(D_all)
         S_nearest[S_nearest == 0] = 1.0
 
-        # H: fidelity only (G_D unreliable at low rank, sign alignment ~0.5)
-        # H_i = -2*hd_i*λ*D_i  → pulls s toward sign(D) = S_nearest
-        H_all = -2.0 * half_delta * self.lambda_fidelity * D_all
-
-        # diag of G in input space: diag_J[j] = ||V_lam[j]||^2 = lam-weighted
-        diag_J = (V_lam ** 2).sum(dim=1)                               # [in]
-
-        # ── Transverse field: quantum uncertainty from grid geometry ──────────
-        # Γ_i = γ*(1 - |D_i/hd_i|)
-        # Γ→1: near midpoint  → uncertain, candidate for correction
-        # Γ→0: near grid point → certain, leave at nearest rounding
+        # Transverse field: selects uncertain spins
         Gamma = self.gamma * (
             1.0 - (D_all.abs() / half_delta.clamp(min=1e-10)).clamp(0, 1))
-
-        # Uncertain spins: near midpoint (Γ > threshold)
         uncertain_mask  = Gamma > self.gamma_threshold
         total_uncertain = uncertain_mask.sum().item()
 
@@ -394,19 +375,25 @@ class TFIsingCorrectionEngine:
                   f"|D/hd| unc:{unc_ratio.mean():.3f} cert:{cert_ratio.mean():.3f}")
             del unc_ratio, cert_ratio
 
+        # diag_J[j] = ||V_lam[j]||^2  = (lam-weighted diagonal of G)
+        diag_J = (V_lam ** 2).sum(dim=1)                               # [in]
+
         # ── Phase 1: Group exhaustive search on uncertain spins ───────────────
-        # Energy: dE = ||v_row + delta_v||^2 - ||v_row||^2 + h^T ds
-        #            = delta_v · (2*v_row + delta_v)  +  h^T ds
-        # where v_row = V_lam^T (hd * s)   [k-vector, lam already absorbed]
-        # and   delta_v = J_g^T delta_sg    (J_g uses V_lam rows)
-        # No explicit lam_dev needed — lam is inside V_lam.
+        # R(s)[i,j] = hd[i,j]*s[i,j] - D[i,j]   (quantization residual)
+        # V_s[i]    = R[i] @ V_lam               (lam-weighted residual projection)
+        #
+        # dE when spin (i,j) flips (ds = -2*s[i,j]):
+        #   dv        = ds * hd[j] * V_lam[j]
+        #   dE_quad   = dv · (2*V_s[i] + dv)            [exact quadratic]
+        #   dE_fid    = 2λ * ds * hd[j] * R[i,j]        [linear fidelity]
         S_refined         = S_nearest.clone()
         total_group_flips = 0
 
+        # R at initial (nearest) state
+        R_state = half_delta * S_refined - D_all                       # [out, in]
+
         rows_with_uncertain = (uncertain_mask.sum(dim=1) >= 2).nonzero(
             as_tuple=True)[0]
-
-        # Prioritize rows with most uncertain spins, cap at max_rows
         if rows_with_uncertain.shape[0] > self.max_rows:
             row_counts          = uncertain_mask.sum(dim=1)
             _, top_rows         = row_counts.topk(self.max_rows)
@@ -427,86 +414,93 @@ class TFIsingCorrectionEngine:
                 n_unc    = 50
 
             hd_row  = half_delta[row_idx]                              # [in]
-            # J_V_row[j] = hd[j] * V_lam[j]  →  used in v = J_V_row^T s
+            R_row   = R_state[row_idx]                                 # [in]  (mutable view)
+            # J_V_row[j] = hd[j] * V_lam[j]
             J_V_row = hd_row.unsqueeze(1) * V_lam                     # [in, k]
             J_V_unc = J_V_row[unc_idx]                                 # [n_unc, k]
-            # J_sub[i,j] = J_V_unc[i] · J_V_unc[j]  (lam already in V_lam)
             J_sub   = J_V_unc @ J_V_unc.t()                           # [n_unc, n_unc]
             groups  = self._cluster_spins(J_sub, unc_idx)
 
             s_row = S_refined[row_idx].clone()
-            h_row = H_all[row_idx]
-            # v_row = V_lam^T (hd * s)  [k]
-            v_row = J_V_row.t() @ s_row                               # [k]
+            # v_row = R_row @ V_lam  (residual projection)
+            v_row = R_row @ V_lam                                      # [k]
 
             for group in groups:
                 g = len(group)
                 if g == 0:
                     continue
                 group_idx = torch.tensor(group, device=device, dtype=torch.long)
-                s_g = s_row[group_idx]
-                J_g = J_V_row[group_idx]                              # [g, k]
-                h_g = h_row[group_idx]
+                s_g  = s_row[group_idx]                                # [g]
+                J_g  = J_V_row[group_idx]                             # [g, k]
+                hd_g = hd_row[group_idx]                              # [g]
+                R_g  = R_row[group_idx]                               # [g]
 
                 if g <= self.group_max_size:
-                    # Exhaustive: try all 2^g configurations
                     n_configs = 2 ** g
                     bit_idx   = torch.arange(
                         n_configs, device=device).unsqueeze(1)
                     bit_pos   = torch.arange(
                         g,         device=device).unsqueeze(0)
                     flip_mat  = ((bit_idx >> bit_pos) & 1).float()    # [2^g, g]
-                    delta_sg  = -2.0 * flip_mat * s_g.unsqueeze(0)   # [2^g, g]
+                    delta_sg  = -2.0 * flip_mat * s_g.unsqueeze(0)   # [2^g, g]  ds
                     delta_v   = delta_sg @ J_g                        # [2^g, k]
-                    # dE = delta_v·(2*v + delta_v) + h·ds
-                    # lam already absorbed: no @ lam_dev needed
-                    dE = (delta_v * (2.0 * v_row.unsqueeze(0) + delta_v)
-                          ).sum(dim=1) + delta_sg @ h_g               # [2^g]
+
+                    # dE_quad: exact quadratic change
+                    dE_quad = (delta_v * (2.0 * v_row.unsqueeze(0) + delta_v)
+                               ).sum(dim=1)                            # [2^g]
+                    # dE_fid: linear fidelity term  2λ * sum_i(ds_i * hd_i * R_i)
+                    dE_fid  = (2.0 * self.lambda_fidelity *
+                               (delta_sg * hd_g.unsqueeze(0) * R_g.unsqueeze(0))
+                               ).sum(dim=1)                            # [2^g]
+                    dE = dE_quad + dE_fid
+
                     best_idx = dE.argmin()
                     if dE[best_idx] < -1e-12:
-                        best_flip = flip_mat[best_idx].bool()
+                        best_flip = flip_mat[best_idx].bool()         # [g]
+                        ds_best   = delta_sg[best_idx]                # [g]
+                        # Update residual for this row's group entries
+                        R_row[group_idx] = R_row[group_idx] + ds_best * hd_g
                         s_row[group_idx[best_flip]] *= -1
                         total_group_flips += best_flip.sum().item()
                         v_row = v_row + delta_v[best_idx]
                 else:
                     # Sequential for oversized groups
                     for idx in group:
-                        j_v = J_V_row[idx]                            # [k]
-                        ds  = -2.0 * s_row[idx]
-                        dv  = ds * j_v
-                        # dE = dv·(2*v + dv) + h*ds
-                        dE  = ((2.0 * v_row + dv) * dv).sum() \
-                              + h_row[idx] * ds
-                        if dE.item() < -1e-12:
+                        j_v  = J_V_row[idx]                           # [k]
+                        hd_j = hd_row[idx]
+                        R_j  = R_row[idx]
+                        ds   = -2.0 * s_row[idx]
+                        dv   = ds * j_v
+                        dE_quad = ((2.0 * v_row + dv) * dv).sum()
+                        dE_fid  = 2.0 * self.lambda_fidelity * ds * hd_j * R_j
+                        if (dE_quad + dE_fid).item() < -1e-12:
+                            R_row[idx] = R_row[idx] + ds * hd_j
                             s_row[idx] *= -1
-                            v_row = v_row + dv
+                            v_row      = v_row + dv
                             total_group_flips += 1
 
             S_refined[row_idx] = s_row
+            # R_state[row_idx] was mutated in-place via R_row (it's a view)
 
         del rows_with_uncertain
 
         # ── Phase 2: CD cleanup — uncertain spins only ────────────────────────
-        # dE for flipping spin (i,j):
-        #   ds    = -2 * s[i,j]
-        #   dv[i] = ds * hd[i,j] * V_lam[j]
-        #   dE    = dv[i]·(2*V_s[i] + dv[i])  +  H[i,j]*ds
-        #         = 2*ds*hd[i,j]*(V_s[i]·V_lam[j])
-        #           + (ds*hd[i,j])^2 * ||V_lam[j]||^2
-        #           + H[i,j]*ds
-        # where V_s[i] = sum_j' s[i,j']*hd[i,j']*V_lam[j']  (lam-weighted)
-        # diag_J[j] = ||V_lam[j]||^2  (precomputed above)
+        # V_s[i] = R_cd[i] @ V_lam  updated live as flips are accepted.
         #
-        # Only flip uncertain spins (near-midpoint).
-        # Near-gridpoint spins stay at nearest rounding — they are classical.
+        # dE for flipping spin (i,j):
+        #   ds         = -2 * s[i,j]
+        #   dv[i]      = ds * hd[i,j] * V_lam[j]          shape [k]
+        #   dE_quad    = 2*(V_s[i]·V_lam[j])*ds*hd  +  (ds*hd)^2*diag_J[j]
+        #   dE_fid_eff = 2λ * ds * hd[i,j] * R[i,j]
         S_final        = S_refined.clone()
+        R_cd           = R_state.clone()                               # [out, in]
         total_cd_flips = 0
         chunk_size     = 64
 
         for sweep in range(self.cd_max_sweeps):
             sweep_flips = 0
-            # V_s[i] = sum_j s[i,j]*hd[i,j]*V_lam[j]  shape [out, k]
-            V_s = (S_final * half_delta) @ V_lam                      # [out, k]
+            # V_s[i] = R_cd[i] @ V_lam   [out, k]
+            V_s = R_cd @ V_lam
 
             for j_start in range(0, in_features, chunk_size):
                 j_end   = min(j_start + chunk_size, in_features)
@@ -516,22 +510,22 @@ class TFIsingCorrectionEngine:
                 if not unc_chunk.any():
                     continue
 
-                DS_chunk   = -2.0 * S_final[:, j_slice]               # [out, chunk]
-                hd_chunk   = half_delta[:, j_slice]                    # [out, chunk]
-                V_chunk    = V_lam[j_start:j_end, :]                  # [chunk, k]  lam-weighted
-                # V_s @ V_chunk.t() = sum_r V_s[i,r]*V_lam[j,r]  (lam-weighted dot)
-                VsVt_chunk = V_s @ V_chunk.t()                        # [out, chunk]
+                s_chunk    = S_final[:, j_slice]                      # [out, chunk]
+                DS_chunk   = -2.0 * s_chunk                           # proposed ds
+                hd_chunk   = half_delta[:, j_slice]                   # [out, chunk]
+                R_chunk    = R_cd[:, j_slice]                         # [out, chunk]
+                V_chunk    = V_lam[j_start:j_end, :]                  # [chunk, k]
                 diag_chunk = diag_J[j_slice]                          # [chunk]
-                H_chunk    = H_all[:, j_slice]                        # [out, chunk]
 
-                # term1 = 2 * ds * hd * (V_s · V_lam[j])
-                term1 = 2.0 * DS_chunk * hd_chunk * VsVt_chunk
-                # term2 = (ds * hd)^2 * ||V_lam[j]||^2
-                term2 = (hd_chunk * DS_chunk) ** 2 * diag_chunk
-                dE    = term1 + term2 + H_chunk * DS_chunk
-                del term1, term2, VsVt_chunk, DS_chunk
+                # dE_quad = 2*ds*hd*(V_s·V_lam[j]) + (ds*hd)^2*diag[j]
+                VsVt_chunk = V_s @ V_chunk.t()                        # [out, chunk]
+                term1      = 2.0 * DS_chunk * hd_chunk * VsVt_chunk
+                term2      = (hd_chunk * DS_chunk) ** 2 * diag_chunk
+                # dE_fid_eff = 2λ * ds * hd * R
+                term3      = 2.0 * self.lambda_fidelity * DS_chunk * hd_chunk * R_chunk
+                dE         = term1 + term2 + term3
+                del term1, term2, term3, VsVt_chunk
 
-                # Only flip uncertain spins with clear energy improvement
                 flip_mask     = (dE < -1e-12) & unc_chunk
                 del dE
                 n_chunk_flips = flip_mask.sum().item()
@@ -539,10 +533,12 @@ class TFIsingCorrectionEngine:
                     continue
 
                 flip_float  = flip_mask.float()
-                ds_accepted = -2.0 * S_final[:, j_slice] * flip_float
-                dV_s        = (ds_accepted * hd_chunk) @ V_chunk      # [out, k]
-                S_final[:, j_slice][flip_mask] *= -1
+                ds_accepted = DS_chunk * flip_float                   # 0 where not flipped
+                dR_chunk    = ds_accepted * hd_chunk                  # [out, chunk]
+                R_cd[:, j_slice] = R_chunk + dR_chunk
+                dV_s        = dR_chunk @ V_chunk                      # [out, k]
                 V_s         = V_s + dV_s
+                S_final[:, j_slice][flip_mask] *= -1
                 sweep_flips += n_chunk_flips
 
             total_cd_flips += sweep_flips
@@ -573,16 +569,15 @@ class TFIsingCorrectionEngine:
             'cd_flips':        total_cd_flips,
         }
 
-        del (V_lam, H_all, Gamma, half_delta, diag_J,
+        del (V_lam, diag_J, Gamma, half_delta,
              uncertain_mask, S_nearest, S_refined, S_final,
-             midpoint, delta_all, nearest, W_sc_f32, D_all, W_corrected,
+             midpoint, delta_all, nearest, W_sc_f32, D_all,
+             R_state, R_cd, W_corrected,
              X_corr, Y_orig, Y_base, Y_corrected, baseline_W_q_sc)
         torch.cuda.empty_cache()
         return stats
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Model-level loop
-    # ─────────────────────────────────────────────────────────────────────────
+    # ── Model-level loop ──────────────────────────────────────────────────────
 
     def correct_model(self, calibration_data, n_samples=128):
         print(f"\n{'='*80}\nTFIM WEIGHT CORRECTION\n{'='*80}")
@@ -614,8 +609,7 @@ class TFIsingCorrectionEngine:
                 debug = (global_idx < 2)
 
                 if is_lmhead:
-                    print(f"  [{global_idx}/{n_layers}] {name}: "
-                          f"lm_head — AWQ only")
+                    print(f"  [{global_idx}/{n_layers}] {name}: lm_head — AWQ only")
                     W        = module.weight.data
                     salience = self.base_quantizer.compute_l2_salience(
                         self.activation_data.get(name, []))
@@ -673,6 +667,10 @@ class TFIsingCorrectionEngine:
             print(f"  Flips  G:{gf:,}  CD:{cd:,}  Total:{gf+cd:,}")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Entry point
+# ─────────────────────────────────────────────────────────────────────────────
+
 def main():
     parser = argparse.ArgumentParser(
         description="AWQ + Transverse-Field Ising Correction",
@@ -714,8 +712,7 @@ def main():
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print("=" * 80)
-    print(f"AWQ + TFIM Correction  |  "
-          f"Model:{args.model_path}  Device:{device}")
+    print(f"AWQ + TFIM Correction  |  Model:{args.model_path}  Device:{device}")
     print("=" * 80)
 
     tokenizer = AutoTokenizer.from_pretrained(
@@ -734,8 +731,7 @@ def main():
             tokenizer, n_samples=args.n_calib, seqlen=2048,
             seed=args.seed, cache_dir=args.cache_dir)
     elif args.calib_dataset == "wikitext2-simple":
-        dataset     = load_dataset('wikitext', 'wikitext-2-raw-v1',
-                                   split='train')
+        dataset     = load_dataset('wikitext', 'wikitext-2-raw-v1', split='train')
         calib_texts = [t['text'] for t in dataset
                        if len(t['text'].strip()) > 100][:args.n_calib]
     else:
