@@ -357,7 +357,7 @@ class TFIsingCorrectionEngine:
         # Key innovation: cost of flipping derived from grid geometry.
         # Γ_i → 0: weight near grid point → classical, hard to flip
         # Γ_i → 1: weight near midpoint   → quantum, free to be corrected
-        Gamma = self.gamma * (D_all.abs() / half_delta.clamp(min=1e-10)).clamp(0, 1)
+        Gamma = self.gamma * (1.0 - (D_all.abs() / half_delta.clamp(min=1e-10)).clamp(0, 1))
 
         if debug:
             print(f"    Gamma: mean={Gamma.mean():.3f} "
