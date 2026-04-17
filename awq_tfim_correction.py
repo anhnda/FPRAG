@@ -309,6 +309,9 @@ class TFIsingCorrectionEngine:
         # ── Exact G ──────────────────────────────────────────────────────────
         n_tok  = X_corr.shape[0]
         G      = (X_corr.t() @ X_corr) / n_tok
+        percdamp = 0.01
+        damp = percdamp * torch.diagonal(G).mean()
+        G.diagonal().add_(damp)
         diag_G = torch.diagonal(G).clone()
         if debug:
             mem_mb = G.element_size() * G.nelement() / 1e6
@@ -645,7 +648,7 @@ def main():
     parser.add_argument("--lambda-fidelity",       type=float, default=0.0,
                         help="0 = pure MSE minimization (recommended)")
     parser.add_argument("--gamma",                 type=float, default=1.0)
-    parser.add_argument("--gamma-threshold",       type=float, default=0.7)
+    parser.add_argument("--gamma-threshold",       type=float, default=0.85)
     parser.add_argument("--group-max-size",        type=int, default=6)
     parser.add_argument("--cd-max-sweeps",         type=int, default=3)
     parser.add_argument("--max-calib-correction",  type=int, default=512)
