@@ -475,12 +475,32 @@ class TFIsingCorrectionEngine:
                   f"Δ vs baseline: {mse_p1 - baseline_error:+.2e}")
 
         # ── Phase 2: column-sequential CD with exact G ────────────────────────
-        # Maintain RG[i,:] = R[i,:] @ G
         S_final        = S_refined.clone()
         R_cd           = half_delta * S_final - D_all
-        RG             = R_cd @ G                                   # [out, in]
+        RG             = R_cd @ G
         total_cd_flips = 0
 
+        # ── Global dE noise scale (computed once per layer) ───────────────────
+        # Estimate typical |dE| magnitude from the initial state:
+        # dE_linear ≈ 2·hd·(RG) — use the vectorized form directly
+        with torch.no_grad():
+            ds_all   = -2.0 * S_final                      # [out, in]
+            dshd_all = ds_all * half_delta                 # [out, in]
+            dE_all   = 2.0 * dshd_all * RG + dshd_all**2 * diag_G.unsqueeze(0)
+            # Take only uncertain entries for a representative sample
+            dE_unc = dE_all[uncertain_mask]
+            if dE_unc.numel() > 100:
+                # Robust scale via median absolute value — NOT std
+                dE_scale = dE_unc.abs().median().item()
+                dE_threshold = -2.0 * dE_scale
+            else:
+                dE_threshold = -1e-10
+            del dE_all, dE_unc, ds_all, dshd_all
+
+        if debug:
+            print(f"    dE threshold: {dE_threshold:.4e}  (2× median |dE| across uncertain)")
+
+        # ── CD sweeps ─────────────────────────────────────────────────────────
         for sweep in range(self.cd_max_sweeps):
             sweep_flips = 0
             col_order   = torch.randperm(in_features, device=device).tolist()
@@ -500,11 +520,10 @@ class TFIsingCorrectionEngine:
                 ds_col   = -2.0 * s_col
                 dshd_col = ds_col * hd_col
                 dE_quad  = 2.0 * dshd_col * RG_col + dshd_col ** 2 * Gjj
-                dE_fid   = self.lambda_fidelity * (
-                    2.0 * dshd_col * R_col + dshd_col ** 2)
+                dE_fid   = self.lambda_fidelity * (2.0 * dshd_col * R_col + dshd_col ** 2)
                 dE       = dE_quad + dE_fid
-                dE_threshold = -3.0 * torch.std(dE[unc_col]).item()  # 3-sigma cutoff
-                flip_mask = (dE < dE_threshold) & unc_col
+
+                flip_mask = (dE < dE_threshold) & unc_col     # ← fixed global threshold
                 n_flips   = flip_mask.sum().item()
                 if n_flips == 0:
                     continue
@@ -521,10 +540,9 @@ class TFIsingCorrectionEngine:
             if debug:
                 mse_s = _state_mse(S_final)
                 print(f"    CD sweep {sweep}: flips={sweep_flips}  "
-                      f"MSE={mse_s:.8f}  Δ vs baseline: {mse_s - baseline_error:+.2e}")
+                    f"MSE={mse_s:.8f}  Δ vs baseline: {mse_s - baseline_error:+.2e}")
             if sweep_flips == 0:
                 break
-
         # ── Reconstruct ───────────────────────────────────────────────────────
         W_corrected        = (midpoint + half_delta * S_final).to(original_dtype)
         W_final            = W_corrected / best_scales.unsqueeze(0)
