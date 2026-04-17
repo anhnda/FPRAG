@@ -312,6 +312,20 @@ class TFIsingCorrectionEngine:
         percdamp = 0.01
         damp = percdamp * torch.diagonal(G).mean()
         G.diagonal().add_(damp)
+
+        if debug:
+            diag_raw = diag_G - damp   # recover pre-damp diagonal
+            print(f"    Ridge: percdamp={percdamp}  damp={damp.item():.4e}")
+            print(f"    diag_G pre-damp:  min={diag_raw.min().item():.4e}  "
+                f"median={diag_raw.median().item():.4e}  "
+                f"max={diag_raw.max().item():.4e}")
+            print(f"    diag_G post-damp: min={diag_G.min().item():.4e}  "
+                f"median={diag_G.median().item():.4e}  "
+                f"max={diag_G.max().item():.4e}")
+            ratio = damp / diag_raw.clamp(min=1e-20)
+            n_dominated = (ratio > 1.0).sum().item()
+            print(f"    Directions where damp > G_jj: {n_dominated}/{in_features}")
+
         diag_G = torch.diagonal(G).clone()
         if debug:
             mem_mb = G.element_size() * G.nelement() / 1e6
