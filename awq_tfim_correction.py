@@ -665,7 +665,7 @@ def main():
     parser.add_argument("--gamma-threshold",       type=float, default=0.85)
     parser.add_argument("--group-max-size",        type=int, default=6)
     parser.add_argument("--cd-max-sweeps",         type=int, default=3)
-    parser.add_argument("--max-calib-correction",  type=int, default=512)
+    parser.add_argument("--max-calib-correction",  type=int, default=2048)
     parser.add_argument("--max-rows",              type=int, default=512)
     parser.add_argument("--layer-batch-size",      type=int, default=16)
     parser.add_argument("--seed",                  type=int, default=42)
