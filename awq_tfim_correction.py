@@ -1,30 +1,25 @@
 """
 AWQ + Transverse-Field Ising Model Weight Correction
-awq_tfim_correction.py
+awq_tfim_correction.py  (PATCHED v2)
 
-Energy formulation:
+Bugs fixed in this version:
+  1. get_quantization_grid_info: removed "exact_mask expansion" that made
+     floor/ceil 2 integer steps apart for weights exactly on a grid point,
+     causing S_nearest to NOT reconstruct the nearest-rounded weight.
+     The mismatch produced fake "uncertainty" and oscillating CD flips.
+  2. CD Phase 2: changed from chunked-parallel (race on cross-terms) to
+     column-sequential. Rows within a column are independent; V_s is
+     refreshed before the next column so inter-column cross-terms are
+     captured exactly.
+  3. Degenerate spins (floor == ceil, i.e. hd = 0) are now frozen out of
+     the optimization via an 'active' mask; they have no degree of freedom.
+
+Energy formulation (unchanged):
     E(s) = ||X_corr @ R(s).T||^2 / n  +  λ * ||R(s)||^2
-
-    where R(s)[i,j] = hd[i,j]*s[i,j] - D[i,j]
-          D[i,j]    = W_sc[i,j] - midpoint[i,j]   (displacement from midpoint)
-          hd[i,j]   = delta[i,j] / 2               (half grid step, > 0)
-          s[i,j]    ∈ {-1, +1}                     (-1→floor, +1→ceil)
-
-    Energy change when spin (i,j) flips (ds = -2*s[i,j]):
-        dv[i]      = ds * hd[i,j] * V_lam[j]
-        dE_quad    = 2*(dv[i] · V_s[i])  +  ||dv[i]||^2
-        dE_fid_eff = 2λ * ds * hd[i,j] * R[i,j]   (constant 4λ*hd^2 dropped)
-        dE_total   = dE_quad + dE_fid_eff
-
-    where V_s[i] = R[i] @ V_lam  is the lam-weighted residual projection,
-    and   V_lam  = V * sqrt(lam)  absorbs eigenvalues once (no separate lam_dev).
-
-Key design:
-    1. V_s is centered on the *residual* R(s)=hd*s-D, not on hd*s.
-       The quadratic dE_quad is then exact w.r.t. the true objective.
-    2. sqrt(lam) absorbed into V_lam once; all inner products auto-weighted.
-    3. Γ_i = γ*(1-|D_i/hd_i|) selects uncertain spins; certain spins frozen.
-    4. Phase 1: group exhaustive search, Phase 2: CD cleanup (uncertain only).
+    R(s)[i,j] = hd[i,j]*s[i,j] - D[i,j]
+    D[i,j]    = W_sc[i,j] - midpoint[i,j]
+    hd[i,j]   = delta[i,j] / 2   (can be 0 for exact-grid weights)
+    s[i,j]    ∈ {-1, +1}
 """
 
 import torch
@@ -89,6 +84,12 @@ class AWQBaseQuantizer:
 
     @torch.no_grad()
     def get_quantization_grid_info(self, W):
+        """
+        FIXED: No exact-mask expansion. floor and ceil are the true
+        neighboring grid points (1 integer step apart). For weights
+        EXACTLY on a grid point or clamped to the boundary, floor == ceil
+        and delta = 0 (handled as degenerate by _correct_layer).
+        """
         out_features, in_features = W.shape
         n_groups = (in_features + self.group_size - 1) // self.group_size
         padded   = n_groups * self.group_size
@@ -107,9 +108,11 @@ class AWQBaseQuantizer:
         W_int_nearest = torch.round(W_div).clamp(0, max_int)
         W_int_floor   = torch.floor(W_div).clamp(0, max_int)
         W_int_ceil    = torch.ceil(W_div).clamp(0, max_int)
-        exact_mask = (W_int_floor == W_int_ceil)
-        W_int_ceil[exact_mask  & (W_int_ceil  < max_int)] += 1
-        W_int_floor[exact_mask & (W_int_floor > 0)]       -= 1
+
+        # NO expansion. If W_int_floor == W_int_ceil (exact grid point or
+        # clamped to boundary), the weight has no rounding choice: it stays
+        # at nearest. Downstream code handles this via the 'active' mask.
+
         floor_val   = (W_int_floor   - zp) * scale
         ceil_val    = (W_int_ceil    - zp) * scale
         nearest_val = (W_int_nearest - zp) * scale
@@ -168,14 +171,6 @@ class AWQBaseQuantizer:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TFIsingCorrectionEngine:
-    """
-    Transverse-Field Ising Model correction engine.
-
-    Γ_i = γ*(1 - |D_i/hd_i|) selects uncertain spins (near midpoint).
-    Only uncertain spins are candidates for correction.
-    Near-gridpoint spins (Γ ≈ 0) are frozen at nearest rounding.
-    """
-
     def __init__(self, model, tokenizer, device="cuda", bits=4, group_size=128,
                  n_grid=20, max_tokens_per_sample=2048,
                  lambda_fidelity=1.0, gamma=1.0, gamma_threshold=0.7,
@@ -205,7 +200,7 @@ class TFIsingCorrectionEngine:
         self.layer_stats           = {}
 
         print(f"\n{'='*80}")
-        print(f"Transverse-Field Ising AWQ Correction Engine")
+        print(f"TFIM AWQ Correction (v2: fixed grid + column-sequential CD)")
         print(f"{'='*80}")
         print(f"  Bits:{bits}  GroupSize:{group_size}  "
               f"lambda_fid:{lambda_fidelity}  gamma:{gamma}  "
@@ -266,7 +261,6 @@ class TFIsingCorrectionEngine:
     # ── Group clustering ──────────────────────────────────────────────────────
 
     def _cluster_spins(self, J_sub, indices):
-        """Greedy clustering by coupling strength — CPU numpy, no GPU syncs."""
         n = J_sub.shape[0]
         if n == 0:
             return []
@@ -298,8 +292,6 @@ class TFIsingCorrectionEngine:
         return groups
 
     # ── Core per-layer correction ─────────────────────────────────────────────
-
-# ── Core per-layer correction (FIXED) ────────────────────────────────────
 
     @torch.no_grad()
     def _correct_layer(self, name, module, X_calib, debug=False):
@@ -337,44 +329,72 @@ class TFIsingCorrectionEngine:
         n_tok = X_corr.shape[0]
         k     = min(self.top_k_eigvecs, n_tok, in_features)
         U, S_sv, V = torch.svd_lowrank(X_corr.float(), q=k, niter=4)
-        lam    = (S_sv ** 2) / n_tok                                   # [k]
+        lam    = (S_sv ** 2) / n_tok
         del U, S_sv
         torch.cuda.empty_cache()
         if debug:
             print(f"    G: top-{k}, lam_1={lam[0]:.4f}, lam_k={lam[-1]:.6f}")
 
         lam_sqrt = lam.sqrt().to(device)
-        V_lam    = V.to(device) * lam_sqrt.unsqueeze(0)                # [in, k]
+        V_lam    = V.to(device) * lam_sqrt.unsqueeze(0)
         del V, lam, lam_sqrt
         torch.cuda.empty_cache()
 
         # ── Grid geometry ─────────────────────────────────────────────────────
-        midpoint   = grid_info['midpoint'].float().to(device)          # [out, in]
-        delta_all  = grid_info['delta'].float().to(device)             # [out, in]
-        nearest    = grid_info['nearest'].float().to(device)           # [out, in]
-        half_delta = delta_all / 2                                     # hd[i,j]
+        midpoint   = grid_info['midpoint'].float().to(device)
+        delta_all  = grid_info['delta'].float().to(device)
+        nearest    = grid_info['nearest'].float().to(device)
+        half_delta = delta_all / 2                                     # may be 0
+
+        # 'active' = spin has a real rounding choice (hd > 0).
+        # Degenerate spins (exact grid / clamped boundary) are frozen.
+        active = delta_all > 1e-12                                     # [out, in] bool
 
         D_all = W_sc_f32 - midpoint                                    # [out, in]
 
-        S_nearest                 = torch.sign(D_all)
-        S_nearest[S_nearest == 0] = 1.0
+        # S_nearest: sign of displacement for active spins.
+        # For degenerate spins (hd = 0), the sign doesn't affect reconstruction
+        # since midpoint + 0*s = midpoint = exact grid point. Use +1 by convention.
+        S_nearest = torch.where(
+            D_all > 0,
+            torch.ones_like(D_all),
+            torch.where(
+                D_all < 0,
+                -torch.ones_like(D_all),
+                torch.ones_like(D_all),
+            ),
+        )
 
-        Gamma = self.gamma * (
-            1.0 - (D_all.abs() / half_delta.clamp(min=1e-10)).clamp(0, 1))
-        uncertain_mask  = Gamma > self.gamma_threshold
+        # Sanity: midpoint + hd * S_nearest must equal 'nearest' for all spins.
+        if debug:
+            W_recon_check = midpoint + half_delta * S_nearest
+            max_diff      = (W_recon_check - nearest).abs().max().item()
+            print(f"    Sanity: reconstruction vs nearest max diff = {max_diff:.2e}")
+            del W_recon_check
+
+        # Γ: only meaningful for active spins. Force Γ = 0 on degenerate ones.
+        ratio = torch.where(
+            active,
+            D_all.abs() / half_delta.clamp(min=1e-10),
+            torch.ones_like(D_all),  # = 1 → Γ = 0 → frozen
+        )
+        Gamma          = self.gamma * (1.0 - ratio.clamp(0, 1))
+        uncertain_mask = (Gamma > self.gamma_threshold) & active
         total_uncertain = uncertain_mask.sum().item()
+        n_degenerate    = (~active).sum().item()
 
         if debug:
-            frac_unc   = total_uncertain / (out_features * in_features)
-            unc_ratio  = (D_all.abs() / half_delta.clamp(min=1e-10))[uncertain_mask]
-            cert_ratio = (D_all.abs() / half_delta.clamp(min=1e-10))[~uncertain_mask]
-            print(f"    Uncertain: {total_uncertain} ({frac_unc*100:.1f}%) "
-                  f"|D/hd| unc:{unc_ratio.mean():.3f} cert:{cert_ratio.mean():.3f}")
-            del unc_ratio, cert_ratio
+            frac_unc  = total_uncertain / (out_features * in_features)
+            frac_deg  = n_degenerate / (out_features * in_features)
+            unc_ratio = ratio[uncertain_mask]
+            print(f"    Uncertain: {total_uncertain} ({frac_unc*100:.1f}%)  "
+                  f"degenerate: {n_degenerate} ({frac_deg*100:.2f}%)  "
+                  f"|D/hd| unc mean: {unc_ratio.mean():.3f}")
+            del unc_ratio
 
         diag_J = (V_lam ** 2).sum(dim=1)                               # [in]
 
-        # ── Sanity helper: compute the actual MSE of a state ────────────────
+        # ── Sanity helper: compute actual MSE of a state ────────────────────
         def _state_mse(S_state):
             W_q_sc = midpoint + half_delta * S_state
             Y_q    = X_corr @ W_q_sc.float().t()
@@ -382,8 +402,9 @@ class TFIsingCorrectionEngine:
 
         if debug:
             mse_init = _state_mse(S_nearest)
-            print(f"    MSE check @ nearest: {mse_init:.8f} "
-                  f"(should match baseline {baseline_error:.8f})")
+            print(f"    MSE @ S_nearest: {mse_init:.8f}  "
+                  f"baseline: {baseline_error:.8f}  "
+                  f"Δ: {mse_init - baseline_error:+.2e}")
 
         # ── Phase 1: Group exhaustive search on uncertain spins ───────────────
         S_refined         = S_nearest.clone()
@@ -404,9 +425,9 @@ class TFIsingCorrectionEngine:
                 continue
 
             if n_unc > 50:
-                ratio    = (D_all[row_idx].abs() /
-                            half_delta[row_idx].clamp(min=1e-10))
-                _, order = ratio[unc_idx].sort()
+                r = (D_all[row_idx].abs() /
+                     half_delta[row_idx].clamp(min=1e-10))
+                _, order = r[unc_idx].sort()
                 unc_idx  = unc_idx[order[:50]]
                 n_unc    = 50
 
@@ -418,7 +439,7 @@ class TFIsingCorrectionEngine:
             groups  = self._cluster_spins(J_sub, unc_idx)
 
             s_row = S_refined[row_idx].clone()
-            v_row = R_row @ V_lam                                      # [k]
+            v_row = R_row @ V_lam
 
             for group in groups:
                 g = len(group)
@@ -432,10 +453,8 @@ class TFIsingCorrectionEngine:
 
                 if g <= self.group_max_size:
                     n_configs = 2 ** g
-                    bit_idx   = torch.arange(
-                        n_configs, device=device).unsqueeze(1)
-                    bit_pos   = torch.arange(
-                        g,         device=device).unsqueeze(0)
+                    bit_idx   = torch.arange(n_configs, device=device).unsqueeze(1)
+                    bit_pos   = torch.arange(g,         device=device).unsqueeze(0)
                     flip_mat  = ((bit_idx >> bit_pos) & 1).float()
                     delta_sg  = -2.0 * flip_mat * s_g.unsqueeze(0)
                     delta_v   = delta_sg @ J_g
@@ -475,41 +494,37 @@ class TFIsingCorrectionEngine:
         del rows_with_uncertain
 
         if debug:
-            mse_after_p1 = _state_mse(S_refined)
-            print(f"    MSE after Phase 1: {mse_after_p1:.8f} "
-                  f"(Δ vs baseline: {mse_after_p1 - baseline_error:+.2e})")
+            mse_p1 = _state_mse(S_refined)
+            print(f"    MSE after Phase 1: {mse_p1:.8f}  "
+                  f"Δ vs baseline: {mse_p1 - baseline_error:+.2e}")
 
-        # ── Phase 2: CD cleanup — COLUMN-SEQUENTIAL (FIXED) ────────────────────
-        # Process one column at a time. All rows in a column are mutually
-        # independent (they don't share any R[i,j]), so they flip in parallel
-        # without cross-term errors. V_s is updated before the next column,
-        # so inter-column cross-terms are captured exactly.
+        # ── Phase 2: Column-sequential CD on uncertain spins ──────────────────
+        # For each column j: evaluate all rows in parallel (they're
+        # independent), flip the ones that improve, then refresh V_s.
+        # This captures inter-column cross-terms exactly.
 
         S_final        = S_refined.clone()
-        R_cd           = half_delta * S_final - D_all                  # recompute
-        V_s            = R_cd @ V_lam                                  # [out, k]
+        R_cd           = half_delta * S_final - D_all
+        V_s            = R_cd @ V_lam
         total_cd_flips = 0
 
         for sweep in range(self.cd_max_sweeps):
             sweep_flips = 0
+            col_order   = torch.randperm(in_features, device=device).tolist()
 
-            # Optional: permute column order each sweep to reduce bias
-            col_order = torch.randperm(in_features, device=device)
-
-            for j_perm in col_order.tolist():
-                j = j_perm
+            for j in col_order:
                 unc_col = uncertain_mask[:, j]
                 if not unc_col.any():
                     continue
 
-                s_col  = S_final[:, j]                                 # [out]
-                hd_col = half_delta[:, j]                              # [out]
-                R_col  = R_cd[:, j]                                    # [out]
-                v_j    = V_lam[j, :]                                   # [k]
-                diag_j = diag_J[j]                                     # scalar
+                s_col  = S_final[:, j]
+                hd_col = half_delta[:, j]
+                R_col  = R_cd[:, j]
+                v_j    = V_lam[j, :]
+                diag_j = diag_J[j]
 
                 ds_col     = -2.0 * s_col
-                VsVj       = V_s @ v_j                                 # [out]
+                VsVj       = V_s @ v_j
                 term_quad1 = 2.0 * ds_col * hd_col * VsVj
                 term_quad2 = (ds_col * hd_col) ** 2 * diag_j
                 term_fid   = 2.0 * self.lambda_fidelity * ds_col * hd_col * R_col
@@ -522,19 +537,20 @@ class TFIsingCorrectionEngine:
 
                 ds_accepted = torch.where(
                     flip_mask, ds_col, torch.zeros_like(ds_col))
-                dR_col      = ds_accepted * hd_col
+                dR_col = ds_accepted * hd_col
 
-                R_cd[:, j] = R_col + dR_col
-                V_s        = V_s + dR_col.unsqueeze(1) * v_j.unsqueeze(0)
+                R_cd[:, j]    = R_col + dR_col
+                V_s           = V_s + dR_col.unsqueeze(1) * v_j.unsqueeze(0)
                 S_final[:, j] = torch.where(flip_mask, -s_col, s_col)
 
                 sweep_flips += n_flips
 
             total_cd_flips += sweep_flips
             if debug:
-                mse_sweep = _state_mse(S_final)
+                mse_s = _state_mse(S_final)
                 print(f"    CD sweep {sweep}: flips={sweep_flips}  "
-                      f"MSE={mse_sweep:.8f}")
+                      f"MSE={mse_s:.8f}  "
+                      f"Δ vs baseline: {mse_s - baseline_error:+.2e}")
             if sweep_flips == 0:
                 break
 
@@ -562,13 +578,14 @@ class TFIsingCorrectionEngine:
             'cd_flips':        total_cd_flips,
         }
 
-        del (V_lam, diag_J, Gamma, half_delta,
+        del (V_lam, diag_J, Gamma, half_delta, active,
              uncertain_mask, S_nearest, S_refined, S_final,
              midpoint, delta_all, nearest, W_sc_f32, D_all,
              R_state, R_cd, V_s, W_corrected,
              X_corr, Y_orig, Y_base, Y_corrected, baseline_W_q_sc)
         torch.cuda.empty_cache()
         return stats
+
     # ── Model-level loop ──────────────────────────────────────────────────────
 
     def correct_model(self, calibration_data, n_samples=128):
@@ -587,8 +604,7 @@ class TFIsingCorrectionEngine:
             b_start = batch_idx * self.layer_batch_size
             b_end   = min(b_start + self.layer_batch_size, n_layers)
             batch   = layer_list[b_start:b_end]
-            print(f"\n[Batch {batch_idx+1}/{n_batches}] "
-                  f"Layers {b_start}-{b_end-1}")
+            print(f"\n[Batch {batch_idx+1}/{n_batches}] Layers {b_start}-{b_end-1}")
             self._collect_activations(batch, calibration_data, n_samples)
 
             for layer_idx, (name, module) in enumerate(batch):
@@ -614,15 +630,12 @@ class TFIsingCorrectionEngine:
                         W_sc = W * scales.unsqueeze(0)
                         W_q  = self.base_quantizer\
                             .quantize_weight_groupwise_asymmetric(W_sc)
-                        module.weight.data = (
-                            W_q / scales.unsqueeze(0)).to(W.dtype)
+                        module.weight.data = (W_q / scales.unsqueeze(0)).to(W.dtype)
                         del W_sc, W_q
                 else:
-                    print(f"  [{global_idx}/{n_layers}] {name}:",
-                          end=" ", flush=True)
+                    print(f"  [{global_idx}/{n_layers}] {name}:", end=" ", flush=True)
                     t0    = time.time()
-                    stats = self._correct_layer(
-                        name, module, X_calib, debug=debug)
+                    stats = self._correct_layer(name, module, X_calib, debug=debug)
                     dt    = time.time() - t0
                     self.layer_stats[name] = stats
                     total_improvement.append(stats['improvement_pct'])
@@ -667,33 +680,26 @@ def main():
     parser = argparse.ArgumentParser(
         description="AWQ + Transverse-Field Ising Correction",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("--model-path",            type=str,
-                        default="./models/Mistral-7B-v0.3")
-    parser.add_argument("--output-dir",            type=str,
-                        default="./quantized_models/model_tfim")
-    parser.add_argument("--bits",                  type=int,
-                        default=4, choices=[3, 4])
-    parser.add_argument("--group-size",            type=int,   default=128)
-    parser.add_argument("--n-grid",                type=int,   default=20)
-    parser.add_argument("--n-calib",               type=int,   default=128)
-    parser.add_argument("--calib-dataset",         type=str,   default="c4",
+    parser.add_argument("--model-path",            type=str, default="./models/Mistral-7B-v0.3")
+    parser.add_argument("--output-dir",            type=str, default="./quantized_models/model_tfim")
+    parser.add_argument("--bits",                  type=int, default=4, choices=[3, 4])
+    parser.add_argument("--group-size",            type=int, default=128)
+    parser.add_argument("--n-grid",                type=int, default=20)
+    parser.add_argument("--n-calib",               type=int, default=128)
+    parser.add_argument("--calib-dataset",         type=str, default="c4",
                         choices=["c4", "wikitext2", "wikitext2-simple"])
-    parser.add_argument("--max-tokens-per-sample", type=int,   default=2048)
-    parser.add_argument("--cache-dir",             type=str,
-                        default="./calibration_cache")
+    parser.add_argument("--max-tokens-per-sample", type=int, default=2048)
+    parser.add_argument("--cache-dir",             type=str, default="./calibration_cache")
     parser.add_argument("--lambda-fidelity",       type=float, default=1.0)
-    parser.add_argument("--gamma",                 type=float, default=1.0,
-                        help="Transverse field scale")
-    parser.add_argument("--gamma-threshold",       type=float, default=0.7,
-                        help="Gamma threshold for uncertain spins (0-1)")
-    parser.add_argument("--group-max-size",        type=int,   default=6)
-    parser.add_argument("--cd-max-sweeps",         type=int,   default=3)
-    parser.add_argument("--top-k-eigvecs",         type=int,   default=32)
-    parser.add_argument("--max-calib-correction",  type=int,   default=512)
-    parser.add_argument("--max-rows",              type=int,   default=512,
-                        help="Max rows per layer for group refinement")
-    parser.add_argument("--layer-batch-size",      type=int,   default=16)
-    parser.add_argument("--seed",                  type=int,   default=42)
+    parser.add_argument("--gamma",                 type=float, default=1.0)
+    parser.add_argument("--gamma-threshold",       type=float, default=0.7)
+    parser.add_argument("--group-max-size",        type=int, default=6)
+    parser.add_argument("--cd-max-sweeps",         type=int, default=3)
+    parser.add_argument("--top-k-eigvecs",         type=int, default=32)
+    parser.add_argument("--max-calib-correction",  type=int, default=512)
+    parser.add_argument("--max-rows",              type=int, default=512)
+    parser.add_argument("--layer-batch-size",      type=int, default=16)
+    parser.add_argument("--seed",                  type=int, default=42)
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -704,11 +710,10 @@ def main():
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print("=" * 80)
-    print(f"AWQ + TFIM Correction  |  Model:{args.model_path}  Device:{device}")
+    print(f"AWQ + TFIM Correction (v2)  |  Model:{args.model_path}  Device:{device}")
     print("=" * 80)
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.model_path, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
