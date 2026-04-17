@@ -309,8 +309,8 @@ class TFIsingCorrectionEngine:
         # ── Exact G ──────────────────────────────────────────────────────────
         n_tok  = X_corr.shape[0]
         G      = (X_corr.t() @ X_corr) / n_tok
-        percdamp = 0.01
-        damp = percdamp * torch.diagonal(G).mean()
+        percdamp = 0.1
+        damp = percdamp * torch.diagonal(G).median()
         G.diagonal().add_(damp)
         diag_G = torch.diagonal(G).clone()
 
