@@ -312,6 +312,7 @@ class TFIsingCorrectionEngine:
         percdamp = 0.01
         damp = percdamp * torch.diagonal(G).mean()
         G.diagonal().add_(damp)
+        diag_G = torch.diagonal(G).clone()
 
         if debug:
             diag_raw = diag_G - damp   # recover pre-damp diagonal
@@ -326,7 +327,6 @@ class TFIsingCorrectionEngine:
             n_dominated = (ratio > 1.0).sum().item()
             print(f"    Directions where damp > G_jj: {n_dominated}/{in_features}")
 
-        diag_G = torch.diagonal(G).clone()
         if debug:
             mem_mb = G.element_size() * G.nelement() / 1e6
             print(f"    Exact G: [{in_features},{in_features}]  "
