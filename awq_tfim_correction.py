@@ -538,6 +538,7 @@ class TFIsingCorrectionEngine:
              R_state, R_cd, W_corrected,
              X_corr, Y_orig, Y_base, Y_corrected, baseline_W_q_sc)
         torch.cuda.empty_cache()
+        gc.collect()
         return stats
 
     def correct_model(self, calibration_data, n_samples=128):
@@ -588,6 +589,9 @@ class TFIsingCorrectionEngine:
                     print(f"  [{global_idx}/{n_layers}] {name}:", end=" ", flush=True)
                     t0    = time.time()
                     stats = self._correct_layer(name, module, X_calib, debug=debug)
+                    if name in self.activation_data:
+                        del self.activation_data[name]
+                    gc.collect()
                     dt    = time.time() - t0
                     self.layer_stats[name] = stats
                     total_improvement.append(stats['improvement_pct'])
