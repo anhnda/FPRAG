@@ -309,23 +309,23 @@ class TFIsingCorrectionEngine:
         # ── Exact G ──────────────────────────────────────────────────────────
         n_tok  = X_corr.shape[0]
         G      = (X_corr.t() @ X_corr) / n_tok
-        percdamp = 0.1
-        damp = percdamp * torch.diagonal(G).median()
-        G.diagonal().add_(damp)
+        #percdamp = 0.1
+        #damp = percdamp * torch.diagonal(G).median()
+        #G.diagonal().add_(damp)
         diag_G = torch.diagonal(G).clone()
 
-        if debug:
-            diag_raw = diag_G - damp   # recover pre-damp diagonal
-            print(f"    Ridge: percdamp={percdamp}  damp={damp.item():.4e}")
-            print(f"    diag_G pre-damp:  min={diag_raw.min().item():.4e}  "
-                f"median={diag_raw.median().item():.4e}  "
-                f"max={diag_raw.max().item():.4e}")
-            print(f"    diag_G post-damp: min={diag_G.min().item():.4e}  "
-                f"median={diag_G.median().item():.4e}  "
-                f"max={diag_G.max().item():.4e}")
-            ratio = damp / diag_raw.clamp(min=1e-20)
-            n_dominated = (ratio > 1.0).sum().item()
-            print(f"    Directions where damp > G_jj: {n_dominated}/{in_features}")
+        # if debug:
+        #     diag_raw = diag_G - damp   # recover pre-damp diagonal
+        #     print(f"    Ridge: percdamp={percdamp}  damp={damp.item():.4e}")
+        #     print(f"    diag_G pre-damp:  min={diag_raw.min().item():.4e}  "
+        #         f"median={diag_raw.median().item():.4e}  "
+        #         f"max={diag_raw.max().item():.4e}")
+        #     print(f"    diag_G post-damp: min={diag_G.min().item():.4e}  "
+        #         f"median={diag_G.median().item():.4e}  "
+        #         f"max={diag_G.max().item():.4e}")
+        #     ratio = damp / diag_raw.clamp(min=1e-20)
+        #     n_dominated = (ratio > 1.0).sum().item()
+        #     print(f"    Directions where damp > G_jj: {n_dominated}/{in_features}")
 
         if debug:
             mem_mb = G.element_size() * G.nelement() / 1e6
@@ -503,8 +503,8 @@ class TFIsingCorrectionEngine:
                 dE_fid   = self.lambda_fidelity * (
                     2.0 * dshd_col * R_col + dshd_col ** 2)
                 dE       = dE_quad + dE_fid
-
-                flip_mask = (dE < -1e-10) & unc_col
+                dE_threshold = -3.0 * torch.std(dE[unc_col]).item()  # 3-sigma cutoff
+                flip_mask = (dE < dE_threshold) & unc_col
                 n_flips   = flip_mask.sum().item()
                 if n_flips == 0:
                     continue
