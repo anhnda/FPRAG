@@ -24,11 +24,11 @@ Key algorithmic components retained from EGBC (Document 12):
 
 Usage:
     # EGBC-only (reproduces Document 12 behaviour):
-    python awq_uegbc.py --model-path /models/Llama-3-8B \
-                        --output-dir ./models/Llama-3-8B_uegbc_linear
+    python ubc.py --model-path /models/Llama-3-8B \
+                        --output-dir ./models/Llama-3-8B_ubc
 
     # EGBC + QK instance on top (new unified method):
-    python awq_uegbc.py --model-path /models/Llama-3-8B \
+    python ubc.py --model-path /models/Llama-3-8B \
                         --output-dir ./models/Llama-3-8B_uegbc_full \
                         --apply-qk-correction \
                         --qk-max-flip-pct 0.01
