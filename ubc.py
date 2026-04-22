@@ -483,7 +483,45 @@ class UnifiedEGBCQuantizer(JamesSteinHeuristicAWQQuantizerXL):
             gc.collect()
 
         print(f"  ✓ Refined {refined}/{len(groups)} attention blocks")
+    # ==================================================================== #
+    # Head-dim inference for GQA.                                           #
+    # ==================================================================== #
 
+    def infer_head_dim(self, k_out):
+        """
+        Infer head_dim from the K-projection output size.
+
+        Preference order:
+          1. model.config.head_dim (LLaMA-3 and newer expose this)
+          2. model.config.hidden_size / model.config.num_attention_heads
+             (works for most transformer configs)
+          3. Largest-divisor heuristic over common head_dim values, checked
+             in descending order. Descending is important: for LLaMA-3 K-out
+             of 1024, head_dim=128 gives 8 K-heads (correct) while checking
+             64 first would give 16 "fake" heads.
+
+        The model config is the source of truth whenever it's available;
+        the divisor heuristic is only a fallback.
+        """
+        cfg = getattr(self.model, "config", None)
+
+        if cfg is not None and getattr(cfg, "head_dim", None) is not None:
+            return int(cfg.head_dim)
+
+        if cfg is not None:
+            hidden = getattr(cfg, "hidden_size", None)
+            n_heads = getattr(cfg, "num_attention_heads", None)
+            if hidden is not None and n_heads is not None and n_heads > 0:
+                cand = hidden // n_heads
+                if cand > 0 and cand <= k_out and k_out % cand == 0:
+                    return int(cand)
+
+        # Fallback: check common head_dim values in descending order.
+        for hd in (256, 192, 160, 128, 96, 80, 72, 64, 48, 32):
+            if k_out % hd == 0:
+                return int(hd)
+
+        return int(k_out)
     @torch.no_grad()
     def _correct_q_for_block(self, q_entry, k_entry):
         """Apply the QK instance of U-EGBC to the Q projection of one block."""
