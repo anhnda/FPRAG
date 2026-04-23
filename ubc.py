@@ -307,6 +307,22 @@ class UnifiedEGBCQuantizer(JamesSteinHeuristicAWQQuantizerXL):
             W_int.scatter_add_(1, sorted_idx, sorted_flip_dir)
             W_int.clamp_(0, max_int)
 
+            # --- Linear EGBC error-reduction debug ---
+            W_quant_after = (W_int - zp_flat) * scale_flat
+            error_after = ((W_pad - W_quant_after) * act_pad.unsqueeze(0)).sum(dim=1)
+            abs_before_lin = current_error.abs()
+            abs_after_lin  = error_after.abs()
+            mean_b = abs_before_lin.mean().item()
+            mean_a = abs_after_lin.mean().item()
+            pct = (1.0 - mean_a / max(mean_b, 1e-12)) * 100.0
+            rows_improved = (abs_after_lin < abs_before_lin).sum().item()
+            n_flips_lin = sorted_flip_dir.ne(0).sum().item()
+            print(f"      [Lin] rows={out_features}  flips={n_flips_lin}  "
+                  f"|err|: {mean_b:.4e} → {mean_a:.4e} ({pct:+.1f}%)  "
+                  f"rows_improved={rows_improved}/{out_features}  "
+                  f"max|err|: {abs_before_lin.max().item():.4e} → "
+                  f"{abs_after_lin.max().item():.4e}")
+
         W_dequant = (W_int - zp_flat) * scale_flat
         if padded_in > in_features:
             W_dequant = W_dequant[:, :in_features]
