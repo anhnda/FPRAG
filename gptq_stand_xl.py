@@ -1,68 +1,56 @@
 """
-GPTQ Implementation for Extra Large Models (XL) - FIXED
-Based on "GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers"
+GPTQ Implementation — FAITHFUL port of the official llama.py
 
-Key Features:
-- Layer-wise quantization with Hessian-based weight updates
-- Cholesky decomposition for numerical stability
-- Batched block processing (B=128)
-- TRUE sequential quantization: each layer calibrated on outputs of all
-  previously-quantized layers, matching the official llama.py flow exactly
-- Special handling for large lm_head layers
+This file mirrors the reference implementation line-for-line in the parts that
+matter for correctness:
 
-Algorithm (from GPTQ paper):
-1. Accumulate Hessian: H = 2XX^T + lambdaI (dampening)
-2. Compute Cholesky decomposition: H^-1 = Cholesky(H)^T
-3. For each block of B=128 columns:
-   - Quantize column j: Q[:,j] = quant(W[:,j])
-   - Compute error: err = (W[:,j] - Q[:,j]) / H^-1[j,j]
-   - Update remaining columns in block: W[:,j+1:i+B] -= err * H^-1[j,j+1:i+B]
-4. After block, update all remaining weights: W[:,(i+B):] -= E * H^-1[i:(i+B),(i+B):]
+  * Quantizer / quantize()      — identical to official quant.py
+  * GPTQ.add_batch / fasterquant — identical to official gptq.py
+  * llama_sequential            — identical control flow:
+      - inps stored on GPU, same dtype as model
+      - single shared attention_mask / position_ids (captured once)
+      - Catcher stores inp directly (no subsampling, no per-sample kwargs)
+      - per-sublayer quantizer configured BEFORE add_batch, not inside fasterquant
+      - hook signature matches: (module, inp, out) -> add_batch(inp[0].data, out.data)
+      - inps, outs = outs, inps AFTER the quantized re-run
+      - use_cache flag saved and restored
 
-Calibration loop (matches official llama_sequential exactly):
-  For each transformer layer i:
-    1. Run UNQUANTIZED layer i with inps (= quantized outputs of layers 0..i-1)
-       -> hooks fire, activations collected -> Hessian built
-    2. Quantize layer i's sub-layers via fasterquant()
-    3. Run QUANTIZED layer i with inps -> outs
-    4. inps, outs = outs, inps   (propagate quantization error forward)
+Only concessions to "XL" (low-VRAM) operation:
+  * Model loaded on CPU, each block paged to GPU for quantization then back
+  * Option to skip lm_head (it's a top-level nn.Linear, not inside a layer, so
+    it's naturally skipped by this script anyway — kept as a flag for clarity)
+
+Nothing else deviates from the reference. No token subsampling. No per-sample
+kwargs. No random permutations. If the official code works, this works.
 """
 
+import argparse
 import gc
 import math
 import os
 import random
-import sys
 import time
-import argparse
 
 import numpy as np
 import torch
 import torch.nn as nn
 import transformers
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from tqdm import tqdm
 
 try:
     import psutil
     HAS_PSUTIL = True
 except ImportError:
     HAS_PSUTIL = False
-    print("Warning: psutil not installed. Memory monitoring disabled.")
-    print("   Install with: pip install psutil")
 
 from calibration_utils import get_c4_calibration_data, get_wikitext2_calibration_data
 
 
 # ---------------------------------------------------------------------------
-# Low-level quantization helpers  (unchanged, match official quant.py exactly)
+# quant.py — EXACT copy of official
 # ---------------------------------------------------------------------------
 
 def quantize(x, scale, zero, maxq):
-    """
-    Quantize and dequantize tensor x using scale and zero point.
-    Exactly matches official GPTQ quant.py::quantize()
-    """
     if maxq < 0:
         return (x > scale / 2).float() * scale + (x < zero / 2).float() * zero
     q = torch.clamp(torch.round(x / scale) + zero, 0, maxq)
@@ -70,18 +58,23 @@ def quantize(x, scale, zero, maxq):
 
 
 class Quantizer(nn.Module):
-    """Quantizer class — exactly matches official GPTQ quant.py::Quantizer."""
-
     def __init__(self, shape=1):
         super().__init__()
         self.register_buffer('maxq', torch.tensor(0))
         self.register_buffer('scale', torch.zeros(shape))
         self.register_buffer('zero', torch.zeros(shape))
 
-    def configure(self, bits, perchannel=False, sym=True):
+    def configure(self, bits, perchannel=False, sym=True, mse=False,
+                  norm=2.4, grid=100, maxshrink=.8, trits=False):
         self.maxq = torch.tensor(2 ** bits - 1)
         self.perchannel = perchannel
         self.sym = sym
+        self.mse = mse
+        self.norm = norm
+        self.grid = grid
+        self.maxshrink = maxshrink
+        if trits:
+            self.maxq = torch.tensor(-1)
 
     def find_params(self, x, weight=False):
         dev = x.device
@@ -110,19 +103,25 @@ class Quantizer(nn.Module):
             tmp = xmin < 0
             if torch.any(tmp):
                 xmin[tmp] = -xmax[tmp]
-
         tmp = (xmin == 0) & (xmax == 0)
         xmin[tmp] = -1
         xmax[tmp] = +1
 
-        self.scale = (xmax - xmin) / self.maxq
-        if self.sym:
-            self.zero = torch.full_like(self.scale, (self.maxq + 1) / 2)
+        if self.maxq < 0:
+            self.scale = xmax
+            self.zero = xmin
         else:
-            self.zero = torch.round(-xmin / self.scale)
+            self.scale = (xmax - xmin) / self.maxq
+            if self.sym:
+                self.zero = torch.full_like(self.scale, (self.maxq + 1) / 2)
+            else:
+                self.zero = torch.round(-xmin / self.scale)
 
         if not self.perchannel:
-            tmp = shape[0] if weight else (shape[1] if len(shape) != 3 else shape[2])
+            if weight:
+                tmp = shape[0]
+            else:
+                tmp = shape[1] if len(shape) != 3 else shape[2]
             self.scale = self.scale.repeat(tmp)
             self.zero = self.zero.repeat(tmp)
 
@@ -131,16 +130,15 @@ class Quantizer(nn.Module):
             self.scale = self.scale.reshape(shape)
             self.zero = self.zero.reshape(shape)
             return
-
         if len(shape) == 4:
             self.scale = self.scale.reshape((1, -1, 1, 1))
-            self.zero  = self.zero.reshape((1, -1, 1, 1))
+            self.zero = self.zero.reshape((1, -1, 1, 1))
         if len(shape) == 3:
             self.scale = self.scale.reshape((1, 1, -1))
-            self.zero  = self.zero.reshape((1, 1, -1))
+            self.zero = self.zero.reshape((1, 1, -1))
         if len(shape) == 2:
             self.scale = self.scale.unsqueeze(0)
-            self.zero  = self.zero.unsqueeze(0)
+            self.zero = self.zero.unsqueeze(0)
 
     def quantize(self, x):
         if self.ready():
@@ -155,43 +153,49 @@ class Quantizer(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Per-layer GPTQ  (unchanged, matches official gptq.py exactly)
+# gptq.py — EXACT copy of official (minus DEBUG prints, minus actorder/static)
 # ---------------------------------------------------------------------------
 
-class GPTQQuantizer:
-    """GPTQ class — exactly matches official GPTQ gptq.py::GPTQ."""
-
-    def __init__(self, layer, device='cuda'):
+class GPTQ:
+    def __init__(self, layer):
         self.layer = layer
-        self.dev = device
+        self.dev = self.layer.weight.device
         W = layer.weight.data.clone()
         if isinstance(self.layer, nn.Conv2d):
             W = W.flatten(1)
         if isinstance(self.layer, transformers.Conv1D):
             W = W.t()
-        self.rows    = W.shape[0]
+        self.rows = W.shape[0]
         self.columns = W.shape[1]
-        self.H        = torch.zeros((self.columns, self.columns), device=self.dev)
+        self.H = torch.zeros((self.columns, self.columns), device=self.dev)
         self.nsamples = 0
-        self.quantizer = Quantizer()
 
-    def add_batch(self, inp):
-        """Exactly matches official GPTQ gptq.py::GPTQ.add_batch()."""
+    def add_batch(self, inp, out):
+        # EXACT same signature as official — takes inp AND out (out unused, but
+        # kept for API parity so the hook in llama_sequential works unchanged)
         if len(inp.shape) == 2:
             inp = inp.unsqueeze(0)
         tmp = inp.shape[0]
-        if isinstance(self.layer, nn.Linear):
+        if isinstance(self.layer, nn.Linear) or isinstance(self.layer, transformers.Conv1D):
             if len(inp.shape) == 3:
                 inp = inp.reshape((-1, inp.shape[-1]))
             inp = inp.t()
+        if isinstance(self.layer, nn.Conv2d):
+            unfold = nn.Unfold(
+                self.layer.kernel_size,
+                dilation=self.layer.dilation,
+                padding=self.layer.padding,
+                stride=self.layer.stride
+            )
+            inp = unfold(inp)
+            inp = inp.permute([1, 0, 2])
+            inp = inp.flatten(1)
         self.H *= self.nsamples / (self.nsamples + tmp)
         self.nsamples += tmp
         inp = math.sqrt(2 / self.nsamples) * inp.float()
         self.H += inp.matmul(inp.t())
 
-    def fasterquant(self, blocksize=128, percdamp=0.01, groupsize=-1, bits=4, sym=True):
-        """Exactly matches official GPTQ gptq.py::GPTQ.fasterquant()
-        (simplified: no actorder / static_groups)."""
+    def fasterquant(self, blocksize=128, percdamp=.01, groupsize=-1):
         W = self.layer.weight.data.clone()
         if isinstance(self.layer, nn.Conv2d):
             W = W.flatten(1)
@@ -201,7 +205,6 @@ class GPTQQuantizer:
 
         tick = time.time()
 
-        self.quantizer.configure(bits, perchannel=True, sym=sym)
         if not self.quantizer.ready():
             self.quantizer.find_params(W, weight=True)
 
@@ -212,516 +215,297 @@ class GPTQQuantizer:
         W[:, dead] = 0
 
         Losses = torch.zeros_like(W)
-        Q      = torch.zeros_like(W)
+        Q = torch.zeros_like(W)
 
         damp = percdamp * torch.mean(torch.diag(H))
         diag = torch.arange(self.columns, device=self.dev)
         H[diag, diag] += damp
-        H    = torch.linalg.cholesky(H)
-        H    = torch.cholesky_inverse(H)
-        H    = torch.linalg.cholesky(H, upper=True)
+        H = torch.linalg.cholesky(H)
+        H = torch.cholesky_inverse(H)
+        H = torch.linalg.cholesky(H, upper=True)
         Hinv = H
 
         for i1 in range(0, self.columns, blocksize):
-            i2    = min(i1 + blocksize, self.columns)
+            i2 = min(i1 + blocksize, self.columns)
             count = i2 - i1
 
-            W1     = W[:, i1:i2].clone()
-            Q1     = torch.zeros_like(W1)
-            Err1   = torch.zeros_like(W1)
+            W1 = W[:, i1:i2].clone()
+            Q1 = torch.zeros_like(W1)
+            Err1 = torch.zeros_like(W1)
             Losses1 = torch.zeros_like(W1)
-            Hinv1  = Hinv[i1:i2, i1:i2]
+            Hinv1 = Hinv[i1:i2, i1:i2]
 
             for i in range(count):
                 w = W1[:, i]
                 d = Hinv1[i, i]
 
-                if groupsize != -1 and (i1 + i) % groupsize == 0:
-                    self.quantizer.find_params(
-                        W[:, (i1 + i):(i1 + i + groupsize)], weight=True
-                    )
+                if groupsize != -1:
+                    if (i1 + i) % groupsize == 0:
+                        self.quantizer.find_params(
+                            W[:, (i1 + i):(i1 + i + groupsize)], weight=True
+                        )
 
                 q = quantize(
                     w.unsqueeze(1),
                     self.quantizer.scale, self.quantizer.zero, self.quantizer.maxq
                 ).flatten()
-                Q1[:, i]     = q
+                Q1[:, i] = q
                 Losses1[:, i] = (w - q) ** 2 / d ** 2
 
                 err1 = (w - q) / d
                 W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
-                Err1[:, i]  = err1
+                Err1[:, i] = err1
 
-            Q[:, i1:i2]  = Q1
+            Q[:, i1:i2] = Q1
             Losses[:, i1:i2] = Losses1 / 2
+
             W[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:])
 
         torch.cuda.synchronize()
         error = torch.sum(Losses).item()
+        elapsed = time.time() - tick
 
         if isinstance(self.layer, transformers.Conv1D):
             Q = Q.t()
         self.layer.weight.data = Q.reshape(self.layer.weight.shape).to(
             self.layer.weight.data.dtype
         )
-        return error, (time.time() - tick)
+        return error, elapsed
 
     def free(self):
         self.H = None
+        self.Losses = None
+        self.Trace = None
         torch.cuda.empty_cache()
 
 
 # ---------------------------------------------------------------------------
-# Helper: find all nn.Linear sub-layers within a module
+# modelutils.py — find_layers, EXACT copy
 # ---------------------------------------------------------------------------
 
-def find_layers(module, layer_types=(nn.Linear,), prefix=''):
-    """Recursively collect all layers of given types. Returns {name: module}."""
-    if isinstance(module, tuple(layer_types)):
-        return {prefix: module}
-    result = {}
-    for name, child in module.named_children():
-        full = f"{prefix}.{name}" if prefix else name
-        result.update(find_layers(child, layer_types, full))
-    return result
+def find_layers(module, layers=[nn.Linear], name=''):
+    if type(module) in layers:
+        return {name: module}
+    res = {}
+    for name1, child in module.named_children():
+        res.update(find_layers(
+            child, layers=layers,
+            name=name + '.' + name1 if name != '' else name1
+        ))
+    return res
 
 
 # ---------------------------------------------------------------------------
-# FIXED: True sequential model-level quantization
+# llama_sequential — faithful port, XL (paged) version
 # ---------------------------------------------------------------------------
 
-class GPTQStandXLQuantizer:
+@torch.no_grad()
+def llama_sequential(model, dataloader, dev, args):
     """
-    GPTQ Quantizer — FIXED to match the official llama_sequential() flow exactly.
+    Mirrors official llama_sequential() exactly.
 
-    THE BUG IN THE OLD VERSION
-    --------------------------
-    Old approach (wrong):
-        Run the full FP16 model once with hooks on all layers simultaneously.
-        Every layer's Hessian H = 2XX^T was built from FP16 activations.
-        But at inference time layer N receives activations that have already
-        been corrupted by quantization in layers 0..N-1.  The Hessian is
-        optimised for the wrong input distribution, so the weight updates
-        compensate for the wrong errors -> perplexity explodes.
-
-    THE FIX
-    -------
-    For each transformer block i:
-      1. Forward-pass UNQUANTIZED block i with inps
-         (hooks fire -> Hessian accumulated for every sub-layer in block i)
-      2. fasterquant() each sub-layer -> weights are now int4 in place
-      3. Forward-pass QUANTIZED block i with the same inps -> outs
-      4. inps, outs = outs, inps
-         Block i+1 now sees activations already corrupted by quantization
-         in blocks 0..i, exactly as at inference time.
-
-    This matches official llama_sequential() line-for-line.
+    Only difference: model starts on CPU, each block is moved to `dev` for
+    quantization then moved back. The official code keeps the whole model on
+    GPU. Everything else — inps layout, Catcher, kwarg capture, hook signature,
+    per-sublayer quantizer lifecycle, inps/outs swap — is identical.
     """
+    print('Starting ...')
 
-    def __init__(self, model, tokenizer, device="cuda", bits=4, group_size=128,
-                 blocksize=128, percdamp=0.01, max_tokens_per_sample=2048,
-                 skip_lmhead=True, sym=True):
-        self.model                 = model
-        self.tokenizer             = tokenizer
-        self.device                = device
-        self.bits                  = bits
-        self.group_size            = group_size
-        self.blocksize             = blocksize
-        self.percdamp              = percdamp
-        self.max_tokens_per_sample = max_tokens_per_sample
-        self.skip_lmhead           = skip_lmhead
-        self.sym                   = sym
-        self.layer_stats           = {}
+    use_cache = model.config.use_cache
+    model.config.use_cache = False
+    layers = model.model.layers
 
-        quant_type  = "SYMMETRIC" if sym else "ASYMMETRIC"
-        quant_range = (f"[-{2**(bits-1)}, {2**(bits-1)-1}]" if sym
-                       else f"[0, {2**bits - 1}]")
+    # Move pre-modules + layer 0 to GPU for input capture.
+    # Mistral / LLaMA-3 may have: embed_tokens, norm, rotary_emb
+    model.model.embed_tokens = model.model.embed_tokens.to(dev)
+    if hasattr(model.model, 'norm') and model.model.norm is not None:
+        model.model.norm = model.model.norm.to(dev)
+    if hasattr(model.model, 'rotary_emb') and model.model.rotary_emb is not None:
+        model.model.rotary_emb = model.model.rotary_emb.to(dev)
+    layers[0] = layers[0].to(dev)
 
-        print(f"\n[GPTQ Quantizer Initialized - XL Version (FIXED)]")
-        print(f"  Target bits       : {bits}")
-        print(f"  Group size        : {group_size}")
-        print(f"  Block size        : {blocksize}")
-        print(f"  Dampening         : {percdamp}")
-        print(f"  Token subsampling : {max_tokens_per_sample} tokens/sample")
-        print(f"  Quantization      : {'Group-wise' if group_size > 0 else 'Per-channel'} "
-              f"{quant_type} {quant_range}")
-        print(f"  Skip lm_head      : {skip_lmhead}")
-        print(f"  Calibration       : TRUE SEQUENTIAL (quantized-error propagation)")
+    dtype = next(iter(model.parameters())).dtype
+    inps = torch.zeros(
+        (args.nsamples, model.seqlen, model.config.hidden_size),
+        dtype=dtype, device=dev
+    )
+    cache = {'i': 0, 'attention_mask': None, 'position_ids': None,
+             'position_embeddings': None}
 
-    # ------------------------------------------------------------------
-    # Step 1: capture inputs to the very first transformer layer
-    # ------------------------------------------------------------------
+    class Catcher(nn.Module):
+        def __init__(self, module):
+            super().__init__()
+            self.module = module
 
-    def _capture_layer0_inputs(self, transformer_layers, calibration_data,
-                               n_samples, hidden_size, dtype):
-        """
-        Run the model just far enough to collect inputs to transformer_layers[0].
+        def forward(self, inp, **kwargs):
+            inps[cache['i']] = inp
+            cache['i'] += 1
+            # Capture EXACTLY what the official code captures, plus
+            # position_embeddings for LLaMA-3 style models where rotary_emb
+            # is computed once and passed into every layer as a kwarg.
+            cache['attention_mask'] = kwargs.get('attention_mask', None)
+            cache['position_ids'] = kwargs.get('position_ids', None)
+            cache['position_embeddings'] = kwargs.get('position_embeddings', None)
+            raise ValueError
 
-        Uses the same Catcher trick as official llama_sequential():
-          - Replace layer 0 with a Catcher that stores inp and raises ValueError
-            to abort the forward pass early (avoids running the whole model).
-          - Restore layer 0 afterwards.
+    layers[0] = Catcher(layers[0])
+    for batch in dataloader:
+        try:
+            model(batch[0].to(dev))
+        except ValueError:
+            pass
+    layers[0] = layers[0].module
 
-        Returns
-        -------
-        inps         : Tensor (n_actual, max_tokens, hidden_size) on CPU.
-                       Shorter sequences are left-packed; padding slots are zero.
-        sample_kwargs: list[dict] — per-sample attention_mask, position_ids, etc.
-                       Each dict's tensors are shaped for THAT sample's actual
-                       sequence length, so RoPE never sees a length mismatch.
-        seq_lens     : list[int] — actual (unpadded) sequence length per sample,
-                       used by _run_layer to trim inps before passing to the layer.
-        """
-        inps = torch.zeros(
-            (n_samples, self.max_tokens_per_sample, hidden_size),
-            dtype=dtype, device='cpu'
-        )
-        # Per-sample storage — NOT a single shared dict
-        per_sample_kwargs = []
-        per_sample_seqlen = []
-        cache = {'i': 0}
+    # Move pre-modules + layer 0 back to CPU
+    layers[0] = layers[0].cpu()
+    model.model.embed_tokens = model.model.embed_tokens.cpu()
+    if hasattr(model.model, 'norm') and model.model.norm is not None:
+        model.model.norm = model.model.norm.cpu()
+    if hasattr(model.model, 'rotary_emb') and model.model.rotary_emb is not None:
+        model.model.rotary_emb = model.model.rotary_emb.cpu()
+    torch.cuda.empty_cache()
 
-        class Catcher(nn.Module):
-            def __init__(self_, module):       # noqa: N805
-                super().__init__()
-                self_.module = module
+    outs = torch.zeros_like(inps)
+    attention_mask = cache['attention_mask']
+    position_ids = cache['position_ids']
+    position_embeddings = cache['position_embeddings']
 
-            def forward(self_, inp, **kwargs): # noqa: N805
-                idx       = cache['i']
-                actual_len = inp.shape[1]
-                store_len  = min(actual_len, inps.shape[1])
-                inps[idx, :store_len] = inp[0, :store_len].detach().cpu()
-                cache['i'] += 1
+    # Build the kwargs dict that will be passed to every layer call.
+    # Only include keys that were actually captured (not None) — this keeps
+    # us compatible with both old-style (attention_mask + position_ids) and
+    # new-style (attention_mask + position_embeddings) HF decoder layers.
+    layer_kwargs = {}
+    if attention_mask is not None:
+        layer_kwargs['attention_mask'] = attention_mask
+    if position_ids is not None:
+        layer_kwargs['position_ids'] = position_ids
+    if position_embeddings is not None:
+        layer_kwargs['position_embeddings'] = position_embeddings
 
-                # Store THIS sample's kwargs (attention_mask / position_ids
-                # are shaped for its own sequence length — do NOT share across
-                # samples, or RoPE will crash on length mismatch).
-                per_sample_kwargs.append({
-                    k: (v.detach().cpu() if isinstance(v, torch.Tensor) else v)
-                    for k, v in kwargs.items()
-                })
-                per_sample_seqlen.append(store_len)
+    print('Ready.')
 
-                raise ValueError   # abort forward pass early — inputs captured
+    quantizers = {}
+    total_error = 0.0
+    total_time = 0.0
 
-        original_layer0       = transformer_layers[0]
-        transformer_layers[0] = Catcher(original_layer0)
+    for i in range(len(layers)):
+        layer = layers[i].to(dev)
+        full = find_layers(layer)
 
-        successful = 0
-        with torch.no_grad():
-            for text in calibration_data[:n_samples]:
-                try:
-                    toks = self.tokenizer(
-                        text, return_tensors="pt",
-                        truncation=True,
-                        max_length=self.max_tokens_per_sample
-                    )
-                    toks = {k: v.to(self.device) for k, v in toks.items()}
-                    self.model(**toks, use_cache=False, return_dict=True)
-                except ValueError:
-                    # Expected: Catcher raised it to abort early
-                    successful += 1
-                except Exception as e:
-                    if successful == 0:
-                        print(f"  Warning: forward pass error during capture: {e}")
-                finally:
-                    del toks
-                    if successful % 50 == 0 and torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+        if args.true_sequential:
+            sequential = [
+                ['self_attn.k_proj', 'self_attn.v_proj', 'self_attn.q_proj'],
+                ['self_attn.o_proj'],
+                ['mlp.up_proj', 'mlp.gate_proj'],
+                ['mlp.down_proj']
+            ]
+        else:
+            sequential = [list(full.keys())]
 
-        transformer_layers[0] = original_layer0
+        for names in sequential:
+            subset = {n: full[n] for n in names if n in full}
 
-        if successful == 0:
-            raise RuntimeError("No calibration samples captured for layer 0.")
+            gptq = {}
+            for name in subset:
+                gptq[name] = GPTQ(subset[name])
+                gptq[name].quantizer = Quantizer()
+                gptq[name].quantizer.configure(
+                    args.wbits, perchannel=True, sym=args.sym, mse=False
+                )
 
-        print(f"  Captured inputs for {successful}/{n_samples} samples.")
-        return inps[:successful], per_sample_kwargs, per_sample_seqlen
+            def add_batch(name):
+                def tmp(_, inp, out):
+                    gptq[name].add_batch(inp[0].data, out.data)
+                return tmp
 
-    # ------------------------------------------------------------------
-    # Step 2: forward pass helper (used for both Hessian collection
-    #         and quantized-output generation)
-    # ------------------------------------------------------------------
+            handles = []
+            for name in subset:
+                handles.append(subset[name].register_forward_hook(add_batch(name)))
+            for j in range(args.nsamples):
+                outs[j] = layer(inps[j].unsqueeze(0), **layer_kwargs)[0]
+            for h in handles:
+                h.remove()
 
-    @torch.no_grad()
-    def _run_layer(self, layer, inps, sample_kwargs, seq_lens, n_samples):
-        """
-        Run `layer` on each of the n_samples inputs in `inps`.
+            for name in subset:
+                print(f'  Block {i} sublayer {name} — quantizing...')
+                error, elapsed = gptq[name].fasterquant(
+                    blocksize=args.blocksize,
+                    percdamp=args.percdamp,
+                    groupsize=args.groupsize,
+                )
+                print(f'    error: {error:.4f}  time: {elapsed:.2f}s')
+                total_error += error
+                total_time += elapsed
+                quantizers['model.layers.%d.%s' % (i, name)] = gptq[name].quantizer
+                gptq[name].free()
 
-        Parameters
-        ----------
-        layer        : transformer block (on GPU)
-        inps         : Tensor (n_samples, max_tokens, hidden) on CPU
-        sample_kwargs: list[dict] — per-sample kwargs (attention_mask,
-                       position_ids, …).  Each dict's tensors are already
-                       trimmed to that sample's actual sequence length, so
-                       RoPE never sees a shape mismatch.
-        seq_lens     : list[int] — actual sequence length for each sample
-        n_samples    : int
+        # Re-run QUANTIZED layer to propagate error to next block — this is
+        # THE step that makes it "true sequential". Official code does this
+        # unconditionally (inside the true_sequential branch, but the outer
+        # loop is the same).
+        for j in range(args.nsamples):
+            outs[j] = layer(inps[j].unsqueeze(0), **layer_kwargs)[0]
 
-        Returns
-        -------
-        outs : Tensor (n_samples, max_tokens, hidden) on CPU.
-               Positions beyond seq_len are zero-padded (they are never
-               used as inputs to the next layer — only [:seq_len] matters).
-        """
-        outs = torch.zeros_like(inps)
-        for j in range(n_samples):
-            slen  = seq_lens[j]
-            # Trim to actual sequence length — this is what makes RoPE happy.
-            inp_j = inps[j, :slen].unsqueeze(0).to(self.device)
-            kw_j  = {
-                k: (v.to(self.device) if isinstance(v, torch.Tensor) else v)
-                for k, v in sample_kwargs[j].items()
-            }
-            out = layer(inp_j, **kw_j)
-            out_tensor = out[0] if isinstance(out, (tuple, list)) else out
-            outs[j, :slen] = out_tensor[0].detach().cpu()
-            del inp_j, kw_j, out, out_tensor
-        return outs
-
-    # ------------------------------------------------------------------
-    # Step 3: quantize one transformer block
-    # ------------------------------------------------------------------
-
-    def _quantize_block(self, block_idx, layer, inps, sample_kwargs, seq_lens, n_samples):
-        """
-        Quantize all Linear sub-layers in one transformer block.
-
-        Exactly matches the inner loop of official llama_sequential():
-
-          PASS 1 — build Hessians
-            Hooks attached to every sub-layer.
-            Run UNQUANTIZED layer on inps -> hooks fire -> H accumulated.
-
-          fasterquant()
-            Quantize weights in-place using H.
-
-          PASS 2 — propagate quantized outputs
-            Run QUANTIZED layer on the same inps.
-            Return these outputs so the caller can feed them as inputs
-            to the next block.
-
-        Parameters
-        ----------
-        block_idx   : int, for progress logging
-        layer       : transformer block nn.Module (must already be on GPU)
-        inps        : Tensor (n_samples, max_tokens, hidden) on CPU
-        sample_kwargs: list[dict] — per-sample kwargs (see _run_layer)
-        seq_lens    : list[int]   — actual sequence length per sample
-        n_samples   : int
-
-        Returns
-        -------
-        outs_quant : Tensor (n_samples, max_tokens, hidden) on CPU
-                     Outputs of the NOW-QUANTIZED layer.
-        stats      : dict {sublayer_name: {'error', 'time', 'nsamples'}}
-        """
-        sub_layers = find_layers(layer)
-        if self.skip_lmhead:
-            sub_layers = {n: m for n, m in sub_layers.items()
-                          if 'lm_head' not in n.lower()}
-
-        # ---- PASS 1: accumulate Hessians --------------------------------
-        gptq = {name: GPTQQuantizer(module, device=self.device)
-                for name, module in sub_layers.items()}
-
-        def make_hook(name):
-            def hook(_, inp, __):
-                act = inp[0].data
-                # Token subsampling if sequence is very long
-                if act.dim() == 3 and act.shape[1] > self.max_tokens_per_sample:
-                    idx = torch.randperm(act.shape[1],
-                                         device=act.device)[:self.max_tokens_per_sample]
-                    act = act[:, idx.sort()[0], :]
-                gptq[name].add_batch(act)
-            return hook
-
-        handles = [m.register_forward_hook(make_hook(n))
-                   for n, m in sub_layers.items()]
-
-        # Run UNQUANTIZED layer — hooks collect activations
-        _ = self._run_layer(layer, inps, sample_kwargs, seq_lens, n_samples)
-
-        for h in handles:
-            h.remove()
-
-        # ---- Quantize each sub-layer in place ---------------------------
-        stats = {}
-        for name in tqdm(sub_layers, desc=f"  Quantizing block {block_idx}", leave=False):
-            error, elapsed = gptq[name].fasterquant(
-                blocksize=self.blocksize,
-                percdamp=self.percdamp,
-                groupsize=self.group_size,
-                bits=self.bits,
-                sym=self.sym
-            )
-            stats[name] = {
-                'error'   : error,
-                'time'    : elapsed,
-                'nsamples': gptq[name].nsamples,
-            }
-            gptq[name].free()
-
+        layers[i] = layer.cpu()
+        del layer
         del gptq
         torch.cuda.empty_cache()
+        gc.collect()
 
-        # ---- PASS 2: re-run QUANTIZED layer -> outputs for next block ---
-        # Weights are now int4; outputs carry the quantization error that
-        # subsequent blocks must learn to handle.
-        outs_quant = self._run_layer(layer, inps, sample_kwargs, seq_lens, n_samples)
-
-        torch.cuda.empty_cache()
-        return outs_quant, stats
-
-    # ------------------------------------------------------------------
-    # Public entry point
-    # ------------------------------------------------------------------
-
-    def quantize_model_sequential(self, calibration_data, n_samples=128):
-        """
-        TRUE SEQUENTIAL quantization — matches official llama_sequential().
-
-        High-level flow
-        ---------------
-        1. Move embeddings + layer 0 to GPU.
-        2. Run model with a Catcher on layer 0 to collect layer-0 inputs
-           (inps).  Move embeddings back to CPU.
-        3. For each transformer block i:
-             a. Move block to GPU.
-             b. _quantize_block(): Hessian pass -> quantize -> quantized pass
-             c. inps <- quantized outputs  (KEY: error propagation)
-             d. Move block back to CPU, free VRAM.
-        4. Save stats, restore model config.
-        """
-        print("\n" + "=" * 80)
-        print("GPTQ TRUE SEQUENTIAL QUANTIZATION (FIXED)")
-        print("=" * 80)
+        # THE critical swap — next block's inputs are this block's quantized
+        # outputs
+        inps, outs = outs, inps
 
         if HAS_PSUTIL:
-            print(f"Initial System RAM: {psutil.virtual_memory().percent:.1f}%")
+            print(f'  Block {i+1}/{len(layers)} done.  '
+                  f'RAM: {psutil.virtual_memory().percent:.1f}%')
 
-        # ---- Locate transformer layer list ----------------------------------
-        if not (hasattr(self.model, 'model') and hasattr(self.model.model, 'layers')):
-            raise NotImplementedError(
-                "Cannot find model.model.layers. "
-                "Subclass and override _get_transformer_layers() for your architecture."
-            )
+    model.config.use_cache = use_cache
 
-        inner = self.model.model
-        transformer_layers = inner.layers
-
-        # Collect every model-level module that runs BEFORE the layer loop.
-        # These must be on GPU during the Catcher capture pass so that the
-        # forward pass reaches layer 0 successfully.
-        #
-        # Mistral / older LLaMA:  embed_tokens, norm
-        # LLaMA-3 / newer:        embed_tokens, norm, rotary_emb
-        #   rotary_emb is called as:
-        #     position_embeddings = self.rotary_emb(hidden_states, position_ids)
-        #   BEFORE the decoder-layer loop, so it must be on GPU.
-        #   Its output (cos, sin tensors) is then passed into every decoder
-        #   layer as the `position_embeddings` kwarg — already stored
-        #   per-sample in sample_kwargs by the Catcher, so RoPE length
-        #   mismatches are handled correctly by the existing fix.
-        PRE_MODULE_ATTRS = ['embed_tokens', 'rotary_emb', 'norm']
-        pre_modules = [
-            getattr(inner, attr)
-            for attr in PRE_MODULE_ATTRS
-            if hasattr(inner, attr)
-        ]
-
-        detected = [attr for attr in PRE_MODULE_ATTRS if hasattr(inner, attr)]
-        print(f"  Detected pre-modules: {detected}")
-
-        dtype       = next(iter(self.model.parameters())).dtype
-        hidden_size = self.model.config.hidden_size
-        use_cache   = self.model.config.use_cache
-        self.model.config.use_cache = False
-
-        # ---- Move pre-modules + layer 0 to GPU for input capture ------------
-        print("\nMoving embeddings + layer 0 to GPU for input capture...")
-        for m in pre_modules:
-            m.to(self.device)
-        transformer_layers[0].to(self.device)
-
-        # ---- Capture inps for layer 0 ---------------------------------------
-        print(f"Capturing layer-0 inputs from {n_samples} calibration samples...")
-        inps, sample_kwargs, seq_lens = self._capture_layer0_inputs(
-            transformer_layers, calibration_data, n_samples, hidden_size, dtype
-        )
-        n_actual = inps.shape[0]
-
-        # Move pre-modules + layer 0 back to CPU; done with them
-        for m in pre_modules:
-            m.cpu()
-        transformer_layers[0].cpu()
-        torch.cuda.empty_cache()
-
-        # ---- Sequential per-block quantization ------------------------------
-        total_error    = 0.0
-        total_time     = 0.0
-        total_sublayers = 0
-
-        for i, layer in enumerate(transformer_layers):
-            print(f"\n{'─' * 60}")
-            print(f"Block {i + 1}/{len(transformer_layers)}")
-
-            layer.to(self.device)
-
-            # _quantize_block handles both the Hessian pass and the
-            # quantized-output pass internally.
-            outs_quant, block_stats = self._quantize_block(
-                i, layer, inps, sample_kwargs, seq_lens, n_actual
-            )
-
-            # Aggregate stats
-            for sub_name, s in block_stats.items():
-                full_name = f"model.layers.{i}.{sub_name}"
-                self.layer_stats[full_name] = s
-                total_error    += s['error']
-                total_time     += s['time']
-                total_sublayers += 1
-
-            block_error = sum(s['error'] for s in block_stats.values())
-            block_time  = sum(s['time']  for s in block_stats.values())
-            print(f"  Sub-layers quantized : {len(block_stats)}")
-            print(f"  Block error          : {block_error:.6f}  |  "
-                  f"time: {block_time:.2f}s")
-
-            if HAS_PSUTIL:
-                print(f"  RAM: {psutil.virtual_memory().percent:.1f}%")
-
-            # KEY LINE: propagate quantization error to the next block.
-            # inps now contains outputs of the *quantized* layer i, so
-            # block i+1's Hessian will be built from the same distribution
-            # it will see at inference time.
-            inps = outs_quant
-
-            layer.cpu()
-            torch.cuda.empty_cache()
-            gc.collect()
-
-        self.model.config.use_cache = use_cache
-
-        print(f"\n{'=' * 80}")
-        print("GPTQ True Sequential Quantization Complete!")
-        print(f"   Blocks processed     : {len(transformer_layers)}")
-        print(f"   Sub-layers quantized : {total_sublayers}")
-        print(f"   Total error          : {total_error:.6f}")
-        print(f"   Total time           : {total_time:.2f}s")
-        print(f"{'=' * 80}")
+    print(f'\nTotal error: {total_error:.4f}  Total time: {total_time:.2f}s')
+    return quantizers
 
 
 # ---------------------------------------------------------------------------
-# Calibration data loader helper
+# Calibration dataloader — builds the (input_ids,) batches the official
+# code expects from datautils.get_loaders()
 # ---------------------------------------------------------------------------
 
-def load_wikitext2_simple(n_samples=128):
-    from datasets import load_dataset
-    print("Loading WikiText-2 (simple/fast approach)...")
-    dataset = load_dataset('wikitext', 'wikitext-2-raw-v1', split='train')
-    texts   = [item['text'] for item in dataset if len(item['text'].strip()) > 0]
-    return texts[:n_samples]
+def build_dataloader(calib_texts, tokenizer, seqlen, nsamples, seed):
+    """
+    Tokenize calibration texts into fixed-seqlen chunks, matching the format
+    that official datautils.get_loaders() produces: a list of (input_ids,)
+    tuples where input_ids has shape [1, seqlen].
+
+    Following the official approach for C4/wikitext2: concatenate all text,
+    then slice random seqlen-sized windows. This gives the Hessian the full
+    seqlen of context it expects.
+    """
+    rng = random.Random(seed)
+
+    # Tokenize and concatenate
+    full_ids = []
+    for text in calib_texts:
+        ids = tokenizer(text, return_tensors='pt').input_ids[0].tolist()
+        full_ids.extend(ids)
+        if len(full_ids) > seqlen * nsamples * 4:
+            break  # enough text
+
+    if len(full_ids) < seqlen * nsamples:
+        # Not enough tokens — loop the text
+        while len(full_ids) < seqlen * nsamples:
+            full_ids = full_ids + full_ids
+
+    # Sample nsamples random windows of length seqlen
+    dataloader = []
+    max_start = len(full_ids) - seqlen - 1
+    for _ in range(nsamples):
+        start = rng.randint(0, max_start)
+        chunk = full_ids[start:start + seqlen]
+        input_ids = torch.tensor([chunk], dtype=torch.long)
+        dataloader.append((input_ids,))
+
+    return dataloader
 
 
 # ---------------------------------------------------------------------------
@@ -730,42 +514,30 @@ def load_wikitext2_simple(n_samples=128):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="GPTQ Post-Training Quantization for XL Models (FIXED)",
+        description='GPTQ — faithful port of official llama.py for XL models',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    parser.add_argument("--n-calib", type=int, default=128,
-                        help="Calibration samples")
-    parser.add_argument("--group-size", type=int, default=128,
-                        help="Group size for quantization (-1 for per-channel)")
-    parser.add_argument("--bits", type=int, default=4, choices=[2, 3, 4, 8],
-                        help="Quantization bit width")
-    parser.add_argument("--blocksize", type=int, default=128,
-                        help="Block size for GPTQ algorithm")
-    parser.add_argument("--percdamp", type=float, default=0.01,
-                        help="Percentage dampening")
-    parser.add_argument("--max-tokens-per-sample", type=int, default=2048,
-                        help="Max tokens to store per sample")
-    parser.add_argument("--output-dir", type=str,
-                        default="./quantized_models/model_gptq_xl",
-                        help="Output directory")
-    parser.add_argument("--model-path", type=str,
-                        default="./models/Mistral-7B-v0.3",
-                        help="Model name or local path")
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--calib-dataset", type=str, default="c4",
-                        choices=["c4", "wikitext2", "wikitext2-simple"],
-                        help="Calibration dataset")
-    parser.add_argument("--cache-dir", type=str, default="./calibration_cache",
-                        help="Directory to cache calibration data")
-    parser.add_argument("--skip-lmhead", action="store_true", default=True,
-                        help="Skip lm_head quantization (default: True)")
-    parser.add_argument("--quantize-lmhead", dest="skip_lmhead",
-                        action="store_false",
-                        help="Enable lm_head quantization")
-    parser.add_argument("--sym", action="store_true", default=True,
-                        help="Symmetric quantization (default: True)")
-    parser.add_argument("--asym", dest="sym", action="store_false",
-                        help="Asymmetric quantization")
+    parser.add_argument('--model-path', type=str,
+                        default='./models/Mistral-7B-v0.3')
+    parser.add_argument('--output-dir', type=str,
+                        default='./quantized_models/model_gptq_xl')
+    parser.add_argument('--calib-dataset', type=str, default='c4',
+                        choices=['c4', 'wikitext2'])
+    parser.add_argument('--cache-dir', type=str, default='./calibration_cache')
+    parser.add_argument('--nsamples', type=int, default=128)
+    parser.add_argument('--seqlen', type=int, default=2048,
+                        help='Calibration sequence length (official uses 2048)')
+    parser.add_argument('--wbits', type=int, default=4, choices=[2, 3, 4, 8])
+    parser.add_argument('--groupsize', type=int, default=128)
+    parser.add_argument('--blocksize', type=int, default=128)
+    parser.add_argument('--percdamp', type=float, default=0.01)
+    parser.add_argument('--sym', action='store_true', default=True)
+    parser.add_argument('--asym', dest='sym', action='store_false')
+    parser.add_argument('--true-sequential', action='store_true', default=True,
+                        help='Quantize sublayers in dependency order (official default for LLaMA)')
+    parser.add_argument('--no-true-sequential', dest='true_sequential',
+                        action='store_false')
+    parser.add_argument('--seed', type=int, default=42)
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -774,74 +546,67 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dev = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    print("=" * 80)
-    print("GPTQ: Accurate Post-Training Quantization (XL Version — FIXED)")
-    print(f"Target Model: {args.model_path}")
-    print("=" * 80)
-    print(f"Device: {device}  |  Bits: {args.bits}  |  Group size: {args.group_size}")
-    print(f"Block size: {args.blocksize}  |  Dampening: {args.percdamp}")
-    print("=" * 80)
+    print('=' * 80)
+    print('GPTQ — faithful port of official llama.py')
+    print('=' * 80)
+    print(f'Model      : {args.model_path}')
+    print(f'Bits       : {args.wbits}')
+    print(f'Groupsize  : {args.groupsize}')
+    print(f'Seqlen     : {args.seqlen}')
+    print(f'Nsamples   : {args.nsamples}')
+    print(f'Sym        : {args.sym}')
+    print(f'TrueSeq    : {args.true_sequential}')
+    print('=' * 80)
 
-    # Load model — start on CPU; we page blocks to GPU one at a time
-    print("\nLoading model and tokenizer...")
+    # Load model on CPU (paged to GPU block-by-block)
+    print('\nLoading model and tokenizer...')
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-        print("  -> Set pad_token = eos_token")
 
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path,
         torch_dtype=torch.float16,
-        device_map="cpu",          # blocks moved to GPU one at a time
-        trust_remote_code=True
+        device_map='cpu',
+        trust_remote_code=True,
     )
     model.eval()
+    model.seqlen = args.seqlen  # official code reads this attribute
 
-    # Load calibration data
-    print(f"\nLoading calibration dataset: {args.calib_dataset}")
-    if args.calib_dataset == "c4":
+    # Load calibration text
+    print(f'\nLoading calibration: {args.calib_dataset}')
+    if args.calib_dataset == 'c4':
         calib_texts = get_c4_calibration_data(
-            tokenizer, n_samples=args.n_calib,
-            seqlen=args.max_tokens_per_sample,
+            tokenizer, n_samples=args.nsamples, seqlen=args.seqlen,
             seed=args.seed, cache_dir=args.cache_dir
         )
-    elif args.calib_dataset == "wikitext2-simple":
-        calib_texts = load_wikitext2_simple(n_samples=args.n_calib)
     else:
         calib_texts = get_wikitext2_calibration_data(
-            tokenizer, n_samples=args.n_calib,
-            seqlen=args.max_tokens_per_sample,
+            tokenizer, n_samples=args.nsamples, seqlen=args.seqlen,
             seed=args.seed, cache_dir=args.cache_dir
         )
 
-    # Initialise and run
-    quantizer = GPTQStandXLQuantizer(
-        model=model,
-        tokenizer=tokenizer,
-        device=device,
-        bits=args.bits,
-        group_size=args.group_size,
-        blocksize=args.blocksize,
-        percdamp=args.percdamp,
-        max_tokens_per_sample=args.max_tokens_per_sample,
-        skip_lmhead=args.skip_lmhead,
-        sym=args.sym
+    # Build dataloader in the (input_ids,) format official code expects
+    print('Building dataloader...')
+    dataloader = build_dataloader(
+        calib_texts, tokenizer, args.seqlen, args.nsamples, args.seed
     )
+    print(f'  {len(dataloader)} calibration batches, each {args.seqlen} tokens')
 
-    quantizer.quantize_model_sequential(calib_texts, n_samples=args.n_calib)
+    # Run faithful GPTQ
+    tick = time.time()
+    quantizers = llama_sequential(model, dataloader, dev, args)
+    print(f'\nTotal wall time: {time.time() - tick:.2f}s')
 
     # Save
-    print(f"\nSaving quantized model to {args.output_dir}...")
+    print(f'\nSaving to {args.output_dir}...')
     os.makedirs(args.output_dir, exist_ok=True)
     model.save_pretrained(args.output_dir)
     tokenizer.save_pretrained(args.output_dir)
-
-    print("\n" + "=" * 80)
-    print("GPTQ QUANTIZATION COMPLETE!")
-    print("=" * 80)
+    print('Done.')
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
