@@ -44,12 +44,35 @@ except ImportError:
 from calibration_utils import get_c4_calibration_data, get_wikitext2_calibration_data
 
 
+def quantize(x, scale, zero, maxq):
+    """
+    Quantize and dequantize tensor x using scale and zero point.
+    This matches the official GPTQ quantize function exactly.
+
+    Args:
+        x: Tensor to quantize
+        scale: Quantization scale
+        zero: Zero point
+        maxq: Maximum quantized value
+
+    Returns:
+        Dequantized tensor
+    """
+    if maxq < 0:
+        # Ternary quantization
+        return (x > scale / 2).float() * scale + (x < zero / 2).float() * zero
+    q = torch.clamp(torch.round(x / scale) + zero, 0, maxq)
+    return scale * (q - zero)
+
+
 class GPTQQuantizer:
     """
     GPTQ Quantizer implementing the algorithm from the paper.
 
     This is the core quantization class that handles one linear layer at a time.
     Based on Algorithm 1 from the GPTQ paper (ICLR 2023).
+
+    This implementation exactly matches the official GPTQ code.
     """
 
     def __init__(self, layer, device='cuda'):
@@ -71,9 +94,9 @@ class GPTQQuantizer:
         self.H = torch.zeros((self.columns, self.columns), device=self.dev)
         self.nsamples = 0
 
-        # Quantization parameters (computed per-row, i.e., per output channel)
-        self.scale = None
-        self.zero = None
+        # Quantization parameters (will be set by configure/find_params)
+        self.scale = torch.zeros(self.rows, device=self.dev)
+        self.zero = torch.zeros(self.rows, device=self.dev)
         self.maxq = None
         self.sym = True  # Use symmetric quantization by default
 
@@ -105,6 +128,7 @@ class GPTQQuantizer:
     def find_params(self, W, bits=4, sym=True):
         """
         Find quantization parameters (scale and zero point) for weights.
+        This exactly matches the official GPTQ Quantizer.find_params() method.
 
         Args:
             W: Weight matrix [out_features, in_features] or group subset
@@ -132,15 +156,15 @@ class GPTQQuantizer:
         xmax[tmp] = +1
 
         # Compute scale and zero
-        self.scale = (xmax - xmin) / maxq
+        scale = (xmax - xmin) / maxq
         if sym:
-            self.zero = torch.full_like(self.scale, (maxq + 1) / 2)
+            zero = torch.full_like(scale, (maxq + 1) / 2)
         else:
-            self.zero = torch.round(-xmin / self.scale)
+            zero = torch.round(-xmin / scale)
 
-        # Reshape for broadcasting
-        self.scale = self.scale.unsqueeze(1)
-        self.zero = self.zero.unsqueeze(1)
+        # Reshape for broadcasting: [out_features] -> [out_features, 1]
+        self.scale = scale.unsqueeze(1)
+        self.zero = zero.unsqueeze(1)
 
     def quantize(self, bits=4, groupsize=-1, blocksize=128, percdamp=0.01, sym=True):
         """
@@ -213,12 +237,13 @@ class GPTQQuantizer:
                         group_end = min(group_start + groupsize, self.columns)
                         self.find_params(W[:, group_start:group_end], bits, self.sym)
 
-                # Quantize using current scale and zero
-                q = torch.clamp(
-                    torch.round(w.unsqueeze(1) / self.scale) + self.zero,
-                    0, maxq
+                # Quantize using the official quantize function
+                # w is [out_features], unsqueeze(1) makes it [out_features, 1]
+                # scale and zero are [out_features, 1]
+                # quantize returns dequantized values as [out_features, 1]
+                q = quantize(
+                    w.unsqueeze(1), self.scale, self.zero, self.maxq
                 ).flatten()
-                q = (self.scale * (q.unsqueeze(1) - self.zero)).flatten()
 
                 Q1[:, i] = q
                 Losses1[:, i] = (w - q) ** 2 / d ** 2
