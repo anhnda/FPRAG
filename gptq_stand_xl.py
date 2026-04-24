@@ -102,13 +102,12 @@ class GPTQQuantizer:
         inp = math.sqrt(2 / self.nsamples) * inp.float()
         self.H += inp.matmul(inp.t())
 
-    def find_params(self, W, groupsize=-1, bits=4, sym=True):
+    def find_params(self, W, bits=4, sym=True):
         """
         Find quantization parameters (scale and zero point) for weights.
 
         Args:
             W: Weight matrix [out_features, in_features] or group subset
-            groupsize: Group size for quantization
             bits: Number of bits
             sym: Use symmetric quantization (default: True, as in official GPTQ)
         """
@@ -164,7 +163,7 @@ class GPTQQuantizer:
 
         # Initialize quantization parameters if not using groupsize
         if groupsize == -1:
-            self.find_params(W, groupsize, bits, sym)
+            self.find_params(W, bits, sym)
             maxq = self.maxq
 
         # Handle dead neurons (zero diagonal in Hessian)
@@ -212,7 +211,7 @@ class GPTQQuantizer:
                     if (i1 + i) % groupsize == 0:
                         group_start = i1 + i
                         group_end = min(group_start + groupsize, self.columns)
-                        self.find_params(W[:, group_start:group_end], groupsize, bits, self.sym)
+                        self.find_params(W[:, group_start:group_end], bits, self.sym)
 
                 # Quantize using current scale and zero
                 q = torch.clamp(
