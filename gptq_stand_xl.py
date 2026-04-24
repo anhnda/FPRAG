@@ -21,6 +21,7 @@ Algorithm (from GPTQ paper):
 
 import torch
 import torch.nn as nn
+import transformers
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from tqdm import tqdm
 import os
@@ -47,7 +48,7 @@ from calibration_utils import get_c4_calibration_data, get_wikitext2_calibration
 def quantize(x, scale, zero, maxq):
     """
     Quantize and dequantize tensor x using scale and zero point.
-    This matches the official GPTQ quantize function exactly.
+    Exactly matches official GPTQ quant.py::quantize()
 
     Args:
         x: Tensor to quantize
@@ -59,161 +60,171 @@ def quantize(x, scale, zero, maxq):
         Dequantized tensor
     """
     if maxq < 0:
-        # Ternary quantization
         return (x > scale / 2).float() * scale + (x < zero / 2).float() * zero
     q = torch.clamp(torch.round(x / scale) + zero, 0, maxq)
     return scale * (q - zero)
 
 
-class GPTQQuantizer:
+class Quantizer(nn.Module):
     """
-    GPTQ Quantizer implementing the algorithm from the paper.
-
-    This is the core quantization class that handles one linear layer at a time.
-    Based on Algorithm 1 from the GPTQ paper (ICLR 2023).
-
-    This implementation exactly matches the official GPTQ code.
+    Quantizer class - exactly matches official GPTQ quant.py::Quantizer
     """
+    def __init__(self, shape=1):
+        super(Quantizer, self).__init__()
+        self.register_buffer('maxq', torch.tensor(0))
+        self.register_buffer('scale', torch.zeros(shape))
+        self.register_buffer('zero', torch.zeros(shape))
 
-    def __init__(self, layer, device='cuda'):
-        """
-        Initialize GPTQ quantizer for a single layer.
+    def configure(self, bits, perchannel=False, sym=True):
+        self.maxq = torch.tensor(2 ** bits - 1)
+        self.perchannel = perchannel
+        self.sym = sym
 
-        Args:
-            layer: nn.Linear layer to quantize
-            device: Device to use for computation
-        """
-        self.layer = layer
-        self.dev = device
+    def find_params(self, x, weight=False):
+        """Find quantization parameters for x"""
+        dev = x.device
+        self.maxq = self.maxq.to(dev)
 
-        W = layer.weight.data.clone()
-        self.rows = W.shape[0]  # out_features
-        self.columns = W.shape[1]  # in_features
+        shape = x.shape
+        if self.perchannel:
+            if weight:
+                x = x.flatten(1)
+            else:
+                if len(shape) == 4:
+                    x = x.permute([1, 0, 2, 3])
+                    x = x.flatten(1)
+                if len(shape) == 3:
+                    x = x.reshape((-1, shape[-1])).t()
+                if len(shape) == 2:
+                    x = x.t()
+        else:
+            x = x.flatten().unsqueeze(0)
 
-        # Hessian matrix H = 2XX^T
-        self.H = torch.zeros((self.columns, self.columns), device=self.dev)
-        self.nsamples = 0
+        tmp = torch.zeros(x.shape[0], device=dev)
+        xmin = torch.minimum(x.min(1)[0], tmp)
+        xmax = torch.maximum(x.max(1)[0], tmp)
 
-        # Quantization parameters (will be set by configure/find_params)
-        self.scale = torch.zeros(self.rows, device=self.dev)
-        self.zero = torch.zeros(self.rows, device=self.dev)
-        self.maxq = None
-        self.sym = True  # Use symmetric quantization by default
-
-    def add_batch(self, inp):
-        """
-        Accumulate Hessian from a batch of inputs.
-
-        Args:
-            inp: Input activations [batch_size, ..., in_features]
-        """
-        if len(inp.shape) == 2:
-            inp = inp.unsqueeze(0)
-
-        tmp = inp.shape[0]
-
-        # Reshape to [in_features, num_samples]
-        if len(inp.shape) == 3:
-            inp = inp.reshape((-1, inp.shape[-1]))
-        inp = inp.t()
-
-        # Update Hessian: H = 2XX^T
-        self.H *= self.nsamples / (self.nsamples + tmp)
-        self.nsamples += tmp
-
-        # Normalize for numerical stability
-        inp = math.sqrt(2 / self.nsamples) * inp.float()
-        self.H += inp.matmul(inp.t())
-
-    def find_params(self, W, bits=4, sym=True):
-        """
-        Find quantization parameters (scale and zero point) for weights.
-        This exactly matches the official GPTQ Quantizer.find_params() method.
-
-        Args:
-            W: Weight matrix [out_features, in_features] or group subset
-            bits: Number of bits
-            sym: Use symmetric quantization (default: True, as in official GPTQ)
-        """
-        maxq = 2 ** bits - 1
-        self.maxq = maxq
-
-        # Compute per-row (per output channel) min/max
-        tmp = torch.zeros(W.shape[0], device=W.device)
-        xmin = torch.minimum(W.min(1)[0], tmp)
-        xmax = torch.maximum(W.max(1)[0], tmp)
-
-        if sym:
-            # SYMMETRIC quantization (as in official GPTQ)
+        if self.sym:
             xmax = torch.maximum(torch.abs(xmin), xmax)
             tmp = xmin < 0
             if torch.any(tmp):
                 xmin[tmp] = -xmax[tmp]
-
-        # Avoid zero range
         tmp = (xmin == 0) & (xmax == 0)
         xmin[tmp] = -1
         xmax[tmp] = +1
 
-        # Compute scale and zero
-        scale = (xmax - xmin) / maxq
-        if sym:
-            zero = torch.full_like(scale, (maxq + 1) / 2)
+        self.scale = (xmax - xmin) / self.maxq
+        if self.sym:
+            self.zero = torch.full_like(self.scale, (self.maxq + 1) / 2)
         else:
-            zero = torch.round(-xmin / scale)
+            self.zero = torch.round(-xmin / self.scale)
 
-        # Reshape for broadcasting: [out_features] -> [out_features, 1]
-        self.scale = scale.unsqueeze(1)
-        self.zero = zero.unsqueeze(1)
+        if not self.perchannel:
+            if weight:
+                tmp = shape[0]
+            else:
+                tmp = shape[1] if len(shape) != 3 else shape[2]
+            self.scale = self.scale.repeat(tmp)
+            self.zero = self.zero.repeat(tmp)
 
-    def quantize(self, bits=4, groupsize=-1, blocksize=128, percdamp=0.01, sym=True):
+        if weight:
+            shape = [-1] + [1] * (len(shape) - 1)
+            self.scale = self.scale.reshape(shape)
+            self.zero = self.zero.reshape(shape)
+            return
+        if len(shape) == 4:
+            self.scale = self.scale.reshape((1, -1, 1, 1))
+            self.zero = self.zero.reshape((1, -1, 1, 1))
+        if len(shape) == 3:
+            self.scale = self.scale.reshape((1, 1, -1))
+            self.zero = self.zero.reshape((1, 1, -1))
+        if len(shape) == 2:
+            self.scale = self.scale.unsqueeze(0)
+            self.zero = self.zero.unsqueeze(0)
+
+    def quantize(self, x):
+        if self.ready():
+            return quantize(x, self.scale, self.zero, self.maxq)
+        return x
+
+    def enabled(self):
+        return self.maxq > 0
+
+    def ready(self):
+        return torch.all(self.scale != 0)
+
+
+class GPTQQuantizer:
+    """
+    GPTQ class - exactly matches official GPTQ gptq.py::GPTQ
+    """
+
+    def __init__(self, layer, device='cuda'):
+        self.layer = layer
+        self.dev = device
+        W = layer.weight.data.clone()
+        if isinstance(self.layer, nn.Conv2d):
+            W = W.flatten(1)
+        if isinstance(self.layer, transformers.Conv1D):
+            W = W.t()
+        self.rows = W.shape[0]
+        self.columns = W.shape[1]
+        self.H = torch.zeros((self.columns, self.columns), device=self.dev)
+        self.nsamples = 0
+        self.quantizer = Quantizer()
+
+    def add_batch(self, inp):
+        """Exactly matches official GPTQ gptq.py::GPTQ.add_batch()"""
+        if len(inp.shape) == 2:
+            inp = inp.unsqueeze(0)
+        tmp = inp.shape[0]
+        if isinstance(self.layer, nn.Linear):
+            if len(inp.shape) == 3:
+                inp = inp.reshape((-1, inp.shape[-1]))
+            inp = inp.t()
+        self.H *= self.nsamples / (self.nsamples + tmp)
+        self.nsamples += tmp
+        inp = math.sqrt(2 / self.nsamples) * inp.float()
+        self.H += inp.matmul(inp.t())
+
+    def fasterquant(self, blocksize=128, percdamp=0.01, groupsize=-1, bits=4, sym=True):
         """
-        Perform GPTQ quantization on the layer.
-
-        Args:
-            bits: Number of bits for quantization (default: 4)
-            groupsize: Group size for group-wise quantization (-1 = per-channel)
-            blocksize: Block size for batch processing (default: 128)
-            percdamp: Percentage dampening for numerical stability (default: 0.01)
-            sym: Use symmetric quantization (default: True)
-
-        Returns:
-            Quantization error (sum of squared errors)
+        Exactly matches official GPTQ gptq.py::GPTQ.fasterquant()
+        (simplified without actorder and static_groups)
         """
-        W = self.layer.weight.data.clone().float()
-        self.sym = sym
+        W = self.layer.weight.data.clone()
+        if isinstance(self.layer, nn.Conv2d):
+            W = W.flatten(1)
+        if isinstance(self.layer, transformers.Conv1D):
+            W = W.t()
+        W = W.float()
 
         tick = time.time()
 
-        # Initialize quantization parameters if not using groupsize
-        if groupsize == -1:
-            self.find_params(W, bits, sym)
-            maxq = self.maxq
+        # Configure quantizer
+        self.quantizer.configure(bits, perchannel=True, sym=sym)
 
-        # Handle dead neurons (zero diagonal in Hessian)
+        # Find params for full weight if not using groupsize
+        if not self.quantizer.ready():
+            self.quantizer.find_params(W, weight=True)
+
         H = self.H
+        del self.H
         dead = torch.diag(H) == 0
         H[dead, dead] = 1
         W[:, dead] = 0
 
-        # Dampening for numerical stability
+        Losses = torch.zeros_like(W)
+        Q = torch.zeros_like(W)
+
         damp = percdamp * torch.mean(torch.diag(H))
         diag = torch.arange(self.columns, device=self.dev)
         H[diag, diag] += damp
-
-        # Cholesky decomposition for numerical stability
-        # H^-1 = (L L^T)^-1 where L is lower triangular
         H = torch.linalg.cholesky(H)
         H = torch.cholesky_inverse(H)
         H = torch.linalg.cholesky(H, upper=True)
         Hinv = H
 
-        # Quantization
-        Q = torch.zeros_like(W)
-        Losses = torch.zeros_like(W)
-        maxq = 2 ** bits - 1
-
-        # Process in blocks of size `blocksize`
         for i1 in range(0, self.columns, blocksize):
             i2 = min(i1 + blocksize, self.columns)
             count = i2 - i1
@@ -224,31 +235,20 @@ class GPTQQuantizer:
             Losses1 = torch.zeros_like(W1)
             Hinv1 = Hinv[i1:i2, i1:i2]
 
-            # Process each column in the block
             for i in range(count):
                 w = W1[:, i]
                 d = Hinv1[i, i]
 
-                # Compute quantization parameters for this column/group
                 if groupsize != -1:
-                    # Group-wise quantization: recompute params every groupsize columns
                     if (i1 + i) % groupsize == 0:
-                        group_start = i1 + i
-                        group_end = min(group_start + groupsize, self.columns)
-                        self.find_params(W[:, group_start:group_end], bits, self.sym)
+                        self.quantizer.find_params(W[:, (i1 + i):(i1 + i + groupsize)], weight=True)
 
-                # Quantize using the official quantize function
-                # w is [out_features], unsqueeze(1) makes it [out_features, 1]
-                # scale and zero are [out_features, 1]
-                # quantize returns dequantized values as [out_features, 1]
                 q = quantize(
-                    w.unsqueeze(1), self.scale, self.zero, self.maxq
+                    w.unsqueeze(1), self.quantizer.scale, self.quantizer.zero, self.quantizer.maxq
                 ).flatten()
-
                 Q1[:, i] = q
                 Losses1[:, i] = (w - q) ** 2 / d ** 2
 
-                # Compute error and update remaining weights in block
                 err1 = (w - q) / d
                 W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
                 Err1[:, i] = err1
@@ -256,22 +256,19 @@ class GPTQQuantizer:
             Q[:, i1:i2] = Q1
             Losses[:, i1:i2] = Losses1 / 2
 
-            # Update all remaining weights outside the block
             W[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:])
 
         torch.cuda.synchronize()
-        elapsed = time.time() - tick
         error = torch.sum(Losses).item()
 
-        # Update layer weights
-        self.layer.weight.data = Q.reshape(self.layer.weight.shape).to(
-            self.layer.weight.data.dtype
-        )
+        if isinstance(self.layer, transformers.Conv1D):
+            Q = Q.t()
+        self.layer.weight.data = Q.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
 
-        return error, elapsed
+        return error, (time.time() - tick)
 
     def free(self):
-        """Free memory."""
+        """Free memory - exactly matches official GPTQ"""
         self.H = None
         torch.cuda.empty_cache()
 
@@ -423,11 +420,11 @@ class GPTQStandXLQuantizer:
             del act_batch
 
         # Perform quantization
-        error, elapsed = gptq.quantize(
-            bits=self.bits,
-            groupsize=self.group_size,
+        error, elapsed = gptq.fasterquant(
             blocksize=self.blocksize,
             percdamp=self.percdamp,
+            groupsize=self.group_size,
+            bits=self.bits,
             sym=self.sym
         )
 
