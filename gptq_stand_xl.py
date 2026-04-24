@@ -229,7 +229,7 @@ class GPTQStandXLQuantizer:
     """
 
     def __init__(self, model, tokenizer, device="cuda", bits=4, group_size=128,
-                 blocksize=128, percdamp=0.01, max_tokens_per_sample=2048):
+                 blocksize=128, percdamp=0.01, max_tokens_per_sample=2048, skip_lmhead=True):
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
@@ -238,6 +238,7 @@ class GPTQStandXLQuantizer:
         self.blocksize = blocksize
         self.percdamp = percdamp
         self.max_tokens_per_sample = max_tokens_per_sample
+        self.skip_lmhead = skip_lmhead
 
         # Storage for activations
         self.activation_data = {}
@@ -251,10 +252,15 @@ class GPTQStandXLQuantizer:
         print(f"  Dampening: {percdamp}")
         print(f"  Token subsampling: {max_tokens_per_sample} tokens/sample")
         print(f"  Quantization: {'Group-wise' if group_size > 0 else 'Per-channel'} ASYMMETRIC [0, {2**bits - 1}]")
+        print(f"  Skip lm_head: {skip_lmhead}")
 
     def get_hook(self, name):
         """Create a hook function for a specific layer."""
-        def hook(_module, input, _output):
+        def hook(module, input, output):
+            # Suppress unused parameter warnings - we need them for hook signature
+            _ = module
+            _ = output
+
             if name not in self.activation_data:
                 self.activation_data[name] = []
 
@@ -395,12 +401,27 @@ class GPTQStandXLQuantizer:
                 initial_ram = psutil.virtual_memory().percent
                 print(f"Initial System RAM: {initial_ram:.1f}%")
 
-            layer_names = [
+            # Get all linear layers
+            all_layers = [
                 (name, module) for name, module in self.model.named_modules()
                 if isinstance(module, nn.Linear)
             ]
 
-            print(f"\nFound {len(layer_names)} linear layers to quantize")
+            # Filter out lm_head if skip_lmhead is True
+            if self.skip_lmhead:
+                layer_names = [
+                    (name, module) for name, module in all_layers
+                    if 'lm_head' not in name.lower()
+                ]
+                skipped_layers = [name for name, _ in all_layers if 'lm_head' in name.lower()]
+                if skipped_layers:
+                    print(f"\n⚠️  Skipping lm_head quantization (--skip-lmhead enabled)")
+                    print(f"   Skipped layers: {', '.join(skipped_layers)}")
+            else:
+                layer_names = all_layers
+
+            print(f"\nFound {len(all_layers)} linear layers total")
+            print(f"Quantizing {len(layer_names)} layers (skipped {len(all_layers) - len(layer_names)})")
             print(f"Batch size: {layer_batch_size} layers per batch")
             num_batches = (len(layer_names) + layer_batch_size - 1) // layer_batch_size
             print(f"Total batches: {num_batches}")
@@ -541,6 +562,10 @@ def main():
                        help="Number of layers to calibrate simultaneously")
     parser.add_argument("--cache-dir", type=str, default="./calibration_cache",
                        help="Directory to cache calibration data")
+    parser.add_argument("--skip-lmhead", action="store_true", default=True,
+                       help="Skip lm_head quantization (default: True, hard to quantize)")
+    parser.add_argument("--quantize-lmhead", dest="skip_lmhead", action="store_false",
+                       help="Enable lm_head quantization (override --skip-lmhead)")
     args = parser.parse_args()
 
     # Set random seeds
@@ -603,7 +628,8 @@ def main():
         group_size=args.group_size,
         blocksize=args.blocksize,
         percdamp=args.percdamp,
-        max_tokens_per_sample=args.max_tokens_per_sample
+        max_tokens_per_sample=args.max_tokens_per_sample,
+        skip_lmhead=args.skip_lmhead
     )
 
     # Batched sequential quantization
