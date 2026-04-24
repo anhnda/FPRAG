@@ -667,10 +667,26 @@ class UnifiedEGBCQuantizer(JamesSteinHeuristicAWQQuantizerXL):
         Wq_out_2d = Wq_dequant_new.reshape(q_out, d) / sQ.unsqueeze(0)  # un-scaled
 
         n_flips = (flips_flat != 0).sum().item()
+
+        # --- QK error-reduction debug ---
+        applied_impact = (flips_flat * impact_flat).sum(dim=1)   # [M]
+        b_after        = b_flat - applied_impact
+        abs_before_qk  = b_flat.abs()
+        abs_after_qk   = b_after.abs()
+        mean_b_qk      = abs_before_qk.mean().item()
+        mean_a_qk      = abs_after_qk.mean().item()
+        pct_qk         = (1.0 - mean_a_qk / max(mean_b_qk, 1e-12)) * 100.0
+        heads_improved = (abs_after_qk < abs_before_qk).sum().item()
+
         print(f"    {q_name}: H_q={H_q}, H_k={H_k}, r={r}, h={h}  "
-              f"flips={n_flips} / {M * num_cand} "
-              f"(avg {n_flips / max(M, 1):.1f}/head, cap "
-              f"{int(self.qk_max_flip_pct * num_cand)})")
+              f"flips={n_flips}/{M * num_cand} "
+              f"(avg {n_flips / max(M, 1):.1f}/head, "
+              f"cap {int(self.qk_max_flip_pct * num_cand)})")
+        print(f"      [QK]  |b|: {mean_b_qk:.4e} → {mean_a_qk:.4e} "
+              f"({pct_qk:+.1f}%)  "
+              f"heads_improved={heads_improved}/{M}  "
+              f"max|b|: {abs_before_qk.max().item():.4e} → "
+              f"{abs_after_qk.max().item():.4e}")
 
         q_module.weight.data.copy_(Wq_out_2d.to(q_module.weight.dtype))
 
