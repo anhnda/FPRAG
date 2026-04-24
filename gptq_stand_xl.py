@@ -364,37 +364,48 @@ class GPTQStandXLQuantizer:
 
         Returns
         -------
-        inps        : Tensor (n_actual, max_tokens, hidden_size) on CPU
-        extra_kwargs: dict — attention_mask, position_ids, etc.
-                      captured from the first successful forward pass and
-                      reused for all subsequent per-layer runs.
+        inps         : Tensor (n_actual, max_tokens, hidden_size) on CPU.
+                       Shorter sequences are left-packed; padding slots are zero.
+        sample_kwargs: list[dict] — per-sample attention_mask, position_ids, etc.
+                       Each dict's tensors are shaped for THAT sample's actual
+                       sequence length, so RoPE never sees a length mismatch.
+        seq_lens     : list[int] — actual (unpadded) sequence length per sample,
+                       used by _run_layer to trim inps before passing to the layer.
         """
         inps = torch.zeros(
             (n_samples, self.max_tokens_per_sample, hidden_size),
             dtype=dtype, device='cpu'
         )
-        cache = {'i': 0, 'kwargs': None}
+        # Per-sample storage — NOT a single shared dict
+        per_sample_kwargs = []
+        per_sample_seqlen = []
+        cache = {'i': 0}
 
         class Catcher(nn.Module):
-            def __init__(self_, module):          # noqa: N805
+            def __init__(self_, module):       # noqa: N805
                 super().__init__()
                 self_.module = module
 
-            def forward(self_, inp, **kwargs):    # noqa: N805
-                idx        = cache['i']
-                store_len  = min(inp.shape[1], inps.shape[1])
+            def forward(self_, inp, **kwargs): # noqa: N805
+                idx       = cache['i']
+                actual_len = inp.shape[1]
+                store_len  = min(actual_len, inps.shape[1])
                 inps[idx, :store_len] = inp[0, :store_len].detach().cpu()
                 cache['i'] += 1
-                # Capture kwargs (attention_mask, position_ids, …) once
-                if cache['kwargs'] is None:
-                    cache['kwargs'] = {
-                        k: (v.detach().cpu() if isinstance(v, torch.Tensor) else v)
-                        for k, v in kwargs.items()
-                    }
-                raise ValueError   # stop forward pass early — we only need inputs
 
-        original_layer0         = transformer_layers[0]
-        transformer_layers[0]   = Catcher(original_layer0)
+                # Store THIS sample's kwargs (attention_mask / position_ids
+                # are shaped for its own sequence length — do NOT share across
+                # samples, or RoPE will crash on length mismatch).
+                per_sample_kwargs.append({
+                    k: (v.detach().cpu() if isinstance(v, torch.Tensor) else v)
+                    for k, v in kwargs.items()
+                })
+                per_sample_seqlen.append(store_len)
+
+                raise ValueError   # abort forward pass early — inputs captured
+
+        original_layer0       = transformer_layers[0]
+        transformer_layers[0] = Catcher(original_layer0)
 
         successful = 0
         with torch.no_grad():
@@ -424,7 +435,7 @@ class GPTQStandXLQuantizer:
             raise RuntimeError("No calibration samples captured for layer 0.")
 
         print(f"  Captured inputs for {successful}/{n_samples} samples.")
-        return inps[:successful], cache['kwargs'] or {}
+        return inps[:successful], per_sample_kwargs, per_sample_seqlen
 
     # ------------------------------------------------------------------
     # Step 2: forward pass helper (used for both Hessian collection
@@ -432,24 +443,39 @@ class GPTQStandXLQuantizer:
     # ------------------------------------------------------------------
 
     @torch.no_grad()
-    def _run_layer(self, layer, inps, extra_kwargs, n_samples):
+    def _run_layer(self, layer, inps, sample_kwargs, seq_lens, n_samples):
         """
         Run `layer` on each of the n_samples inputs in `inps`.
 
+        Parameters
+        ----------
+        layer        : transformer block (on GPU)
+        inps         : Tensor (n_samples, max_tokens, hidden) on CPU
+        sample_kwargs: list[dict] — per-sample kwargs (attention_mask,
+                       position_ids, …).  Each dict's tensors are already
+                       trimmed to that sample's actual sequence length, so
+                       RoPE never sees a shape mismatch.
+        seq_lens     : list[int] — actual sequence length for each sample
+        n_samples    : int
+
         Returns
         -------
-        outs : Tensor (n_samples, seqlen, hidden) on CPU
+        outs : Tensor (n_samples, max_tokens, hidden) on CPU.
+               Positions beyond seq_len are zero-padded (they are never
+               used as inputs to the next layer — only [:seq_len] matters).
         """
         outs = torch.zeros_like(inps)
         for j in range(n_samples):
-            inp_j = inps[j].unsqueeze(0).to(self.device)
+            slen  = seq_lens[j]
+            # Trim to actual sequence length — this is what makes RoPE happy.
+            inp_j = inps[j, :slen].unsqueeze(0).to(self.device)
             kw_j  = {
                 k: (v.to(self.device) if isinstance(v, torch.Tensor) else v)
-                for k, v in extra_kwargs.items()
+                for k, v in sample_kwargs[j].items()
             }
             out = layer(inp_j, **kw_j)
             out_tensor = out[0] if isinstance(out, (tuple, list)) else out
-            outs[j] = out_tensor[0].detach().cpu()
+            outs[j, :slen] = out_tensor[0].detach().cpu()
             del inp_j, kw_j, out, out_tensor
         return outs
 
@@ -457,7 +483,7 @@ class GPTQStandXLQuantizer:
     # Step 3: quantize one transformer block
     # ------------------------------------------------------------------
 
-    def _quantize_block(self, block_idx, layer, inps, extra_kwargs, n_samples):
+    def _quantize_block(self, block_idx, layer, inps, sample_kwargs, seq_lens, n_samples):
         """
         Quantize all Linear sub-layers in one transformer block.
 
@@ -479,13 +505,14 @@ class GPTQStandXLQuantizer:
         ----------
         block_idx   : int, for progress logging
         layer       : transformer block nn.Module (must already be on GPU)
-        inps        : Tensor (n_samples, seqlen, hidden) on CPU
-        extra_kwargs: dict (attention_mask, position_ids, …)
+        inps        : Tensor (n_samples, max_tokens, hidden) on CPU
+        sample_kwargs: list[dict] — per-sample kwargs (see _run_layer)
+        seq_lens    : list[int]   — actual sequence length per sample
         n_samples   : int
 
         Returns
         -------
-        outs_quant : Tensor (n_samples, seqlen, hidden) on CPU
+        outs_quant : Tensor (n_samples, max_tokens, hidden) on CPU
                      Outputs of the NOW-QUANTIZED layer.
         stats      : dict {sublayer_name: {'error', 'time', 'nsamples'}}
         """
@@ -513,7 +540,7 @@ class GPTQStandXLQuantizer:
                    for n, m in sub_layers.items()]
 
         # Run UNQUANTIZED layer — hooks collect activations
-        _ = self._run_layer(layer, inps, extra_kwargs, n_samples)
+        _ = self._run_layer(layer, inps, sample_kwargs, seq_lens, n_samples)
 
         for h in handles:
             h.remove()
@@ -539,9 +566,9 @@ class GPTQStandXLQuantizer:
         torch.cuda.empty_cache()
 
         # ---- PASS 2: re-run QUANTIZED layer -> outputs for next block ---
-        # This is the KEY step: weights are now int4, so the outputs carry
-        # the quantization error that subsequent blocks must learn to handle.
-        outs_quant = self._run_layer(layer, inps, extra_kwargs, n_samples)
+        # Weights are now int4; outputs carry the quantization error that
+        # subsequent blocks must learn to handle.
+        outs_quant = self._run_layer(layer, inps, sample_kwargs, seq_lens, n_samples)
 
         torch.cuda.empty_cache()
         return outs_quant, stats
@@ -600,7 +627,7 @@ class GPTQStandXLQuantizer:
 
         # ---- Capture inps for layer 0 ---------------------------------------
         print(f"Capturing layer-0 inputs from {n_samples} calibration samples...")
-        inps, extra_kwargs = self._capture_layer0_inputs(
+        inps, sample_kwargs, seq_lens = self._capture_layer0_inputs(
             transformer_layers, calibration_data, n_samples, hidden_size, dtype
         )
         n_actual = inps.shape[0]
@@ -625,7 +652,7 @@ class GPTQStandXLQuantizer:
             # _quantize_block handles both the Hessian pass and the
             # quantized-output pass internally.
             outs_quant, block_stats = self._quantize_block(
-                i, layer, inps, extra_kwargs, n_actual
+                i, layer, inps, sample_kwargs, seq_lens, n_actual
             )
 
             # Aggregate stats
