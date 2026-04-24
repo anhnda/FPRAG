@@ -71,6 +71,12 @@ class GPTQQuantizer:
         self.H = torch.zeros((self.columns, self.columns), device=self.dev)
         self.nsamples = 0
 
+        # Quantization parameters (computed per-row, i.e., per output channel)
+        self.scale = None
+        self.zero = None
+        self.maxq = None
+        self.sym = True  # Use symmetric quantization by default
+
     def add_batch(self, inp):
         """
         Accumulate Hessian from a batch of inputs.
@@ -96,7 +102,48 @@ class GPTQQuantizer:
         inp = math.sqrt(2 / self.nsamples) * inp.float()
         self.H += inp.matmul(inp.t())
 
-    def quantize(self, bits=4, groupsize=-1, blocksize=128, percdamp=0.01):
+    def find_params(self, W, groupsize=-1, bits=4, sym=True):
+        """
+        Find quantization parameters (scale and zero point) for weights.
+
+        Args:
+            W: Weight matrix [out_features, in_features] or group subset
+            groupsize: Group size for quantization
+            bits: Number of bits
+            sym: Use symmetric quantization (default: True, as in official GPTQ)
+        """
+        maxq = 2 ** bits - 1
+        self.maxq = maxq
+
+        # Compute per-row (per output channel) min/max
+        tmp = torch.zeros(W.shape[0], device=W.device)
+        xmin = torch.minimum(W.min(1)[0], tmp)
+        xmax = torch.maximum(W.max(1)[0], tmp)
+
+        if sym:
+            # SYMMETRIC quantization (as in official GPTQ)
+            xmax = torch.maximum(torch.abs(xmin), xmax)
+            tmp = xmin < 0
+            if torch.any(tmp):
+                xmin[tmp] = -xmax[tmp]
+
+        # Avoid zero range
+        tmp = (xmin == 0) & (xmax == 0)
+        xmin[tmp] = -1
+        xmax[tmp] = +1
+
+        # Compute scale and zero
+        self.scale = (xmax - xmin) / maxq
+        if sym:
+            self.zero = torch.full_like(self.scale, (maxq + 1) / 2)
+        else:
+            self.zero = torch.round(-xmin / self.scale)
+
+        # Reshape for broadcasting
+        self.scale = self.scale.unsqueeze(1)
+        self.zero = self.zero.unsqueeze(1)
+
+    def quantize(self, bits=4, groupsize=-1, blocksize=128, percdamp=0.01, sym=True):
         """
         Perform GPTQ quantization on the layer.
 
@@ -105,13 +152,20 @@ class GPTQQuantizer:
             groupsize: Group size for group-wise quantization (-1 = per-channel)
             blocksize: Block size for batch processing (default: 128)
             percdamp: Percentage dampening for numerical stability (default: 0.01)
+            sym: Use symmetric quantization (default: True)
 
         Returns:
             Quantization error (sum of squared errors)
         """
         W = self.layer.weight.data.clone().float()
+        self.sym = sym
 
         tick = time.time()
+
+        # Initialize quantization parameters if not using groupsize
+        if groupsize == -1:
+            self.find_params(W, groupsize, bits, sym)
+            maxq = self.maxq
 
         # Handle dead neurons (zero diagonal in Hessian)
         H = self.H
@@ -134,8 +188,6 @@ class GPTQQuantizer:
         # Quantization
         Q = torch.zeros_like(W)
         Losses = torch.zeros_like(W)
-
-        # Quantization parameters
         maxq = 2 ** bits - 1
 
         # Process in blocks of size `blocksize`
@@ -154,42 +206,20 @@ class GPTQQuantizer:
                 w = W1[:, i]
                 d = Hinv1[i, i]
 
-                # Compute quantization parameters for this column
+                # Compute quantization parameters for this column/group
                 if groupsize != -1:
-                    # Group-wise quantization
+                    # Group-wise quantization: recompute params every groupsize columns
                     if (i1 + i) % groupsize == 0:
-                        # Compute scale and zero point for this group
                         group_start = i1 + i
                         group_end = min(group_start + groupsize, self.columns)
-                        w_group = W[:, group_start:group_end]
+                        self.find_params(W[:, group_start:group_end], groupsize, bits, self.sym)
 
-                        # Asymmetric quantization
-                        w_min = w_group.min(dim=1, keepdim=True)[0]
-                        w_max = w_group.max(dim=1, keepdim=True)[0]
-                        scale = (w_max - w_min) / maxq
-                        scale = scale.clamp(min=1e-8)
-                        zero = torch.round(-w_min / scale).clamp(0, maxq)
-
-                        # Store for this group
-                        self.current_scale = scale[:, 0]
-                        self.current_zero = zero[:, 0]
-                else:
-                    # Per-channel quantization
-                    w_min = w.min()
-                    w_max = w.max()
-                    scale = (w_max - w_min) / maxq
-                    scale = max(scale, 1e-8)
-                    zero = torch.clamp(torch.round(-w_min / scale), 0, maxq)
-
-                    self.current_scale = torch.tensor([scale], device=w.device).expand(w.shape[0])
-                    self.current_zero = torch.tensor([zero], device=w.device).expand(w.shape[0])
-
-                # Quantize
+                # Quantize using current scale and zero
                 q = torch.clamp(
-                    torch.round(w / self.current_scale + self.current_zero),
+                    torch.round(w.unsqueeze(1) / self.scale) + self.zero,
                     0, maxq
-                )
-                q = self.current_scale * (q - self.current_zero)
+                ).flatten()
+                q = (self.scale * (q.unsqueeze(1) - self.zero)).flatten()
 
                 Q1[:, i] = q
                 Losses1[:, i] = (w - q) ** 2 / d ** 2
@@ -229,7 +259,8 @@ class GPTQStandXLQuantizer:
     """
 
     def __init__(self, model, tokenizer, device="cuda", bits=4, group_size=128,
-                 blocksize=128, percdamp=0.01, max_tokens_per_sample=2048, skip_lmhead=True):
+                 blocksize=128, percdamp=0.01, max_tokens_per_sample=2048,
+                 skip_lmhead=True, sym=True):
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
@@ -239,11 +270,15 @@ class GPTQStandXLQuantizer:
         self.percdamp = percdamp
         self.max_tokens_per_sample = max_tokens_per_sample
         self.skip_lmhead = skip_lmhead
+        self.sym = sym
 
         # Storage for activations
         self.activation_data = {}
         self.hooks = []
         self.layer_stats = {}
+
+        quant_type = "SYMMETRIC" if sym else "ASYMMETRIC"
+        quant_range = f"[-{2**(bits-1)}, {2**(bits-1)-1}]" if sym else f"[0, {2**bits - 1}]"
 
         print(f"\n[GPTQ Quantizer Initialized - XL Version]")
         print(f"  Target bits: {bits}")
@@ -251,7 +286,7 @@ class GPTQStandXLQuantizer:
         print(f"  Block size: {blocksize}")
         print(f"  Dampening: {percdamp}")
         print(f"  Token subsampling: {max_tokens_per_sample} tokens/sample")
-        print(f"  Quantization: {'Group-wise' if group_size > 0 else 'Per-channel'} ASYMMETRIC [0, {2**bits - 1}]")
+        print(f"  Quantization: {'Group-wise' if group_size > 0 else 'Per-channel'} {quant_type} {quant_range}")
         print(f"  Skip lm_head: {skip_lmhead}")
 
     def get_hook(self, name):
@@ -368,7 +403,8 @@ class GPTQStandXLQuantizer:
             bits=self.bits,
             groupsize=self.group_size,
             blocksize=self.blocksize,
-            percdamp=self.percdamp
+            percdamp=self.percdamp,
+            sym=self.sym
         )
 
         # Free memory
@@ -566,6 +602,10 @@ def main():
                        help="Skip lm_head quantization (default: True, hard to quantize)")
     parser.add_argument("--quantize-lmhead", dest="skip_lmhead", action="store_false",
                        help="Enable lm_head quantization (override --skip-lmhead)")
+    parser.add_argument("--sym", action="store_true", default=True,
+                       help="Use symmetric quantization (default: True, as in GPTQ paper)")
+    parser.add_argument("--asym", dest="sym", action="store_false",
+                       help="Use asymmetric quantization")
     args = parser.parse_args()
 
     # Set random seeds
@@ -629,7 +669,8 @@ def main():
         blocksize=args.blocksize,
         percdamp=args.percdamp,
         max_tokens_per_sample=args.max_tokens_per_sample,
-        skip_lmhead=args.skip_lmhead
+        skip_lmhead=args.skip_lmhead,
+        sym=args.sym
     )
 
     # Batched sequential quantization
