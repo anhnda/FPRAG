@@ -601,18 +601,37 @@ class GPTQStandXLQuantizer:
             print(f"Initial System RAM: {psutil.virtual_memory().percent:.1f}%")
 
         # ---- Locate transformer layer list ----------------------------------
-        if hasattr(self.model, 'model') and hasattr(self.model.model, 'layers'):
-            transformer_layers = self.model.model.layers
-            pre_modules = []
-            if hasattr(self.model.model, 'embed_tokens'):
-                pre_modules.append(self.model.model.embed_tokens)
-            if hasattr(self.model.model, 'norm'):
-                pre_modules.append(self.model.model.norm)
-        else:
+        if not (hasattr(self.model, 'model') and hasattr(self.model.model, 'layers')):
             raise NotImplementedError(
-                "Cannot find model.model.layers.  Subclass and override "
-                "_get_transformer_layers() for your architecture."
+                "Cannot find model.model.layers. "
+                "Subclass and override _get_transformer_layers() for your architecture."
             )
+
+        inner = self.model.model
+        transformer_layers = inner.layers
+
+        # Collect every model-level module that runs BEFORE the layer loop.
+        # These must be on GPU during the Catcher capture pass so that the
+        # forward pass reaches layer 0 successfully.
+        #
+        # Mistral / older LLaMA:  embed_tokens, norm
+        # LLaMA-3 / newer:        embed_tokens, norm, rotary_emb
+        #   rotary_emb is called as:
+        #     position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        #   BEFORE the decoder-layer loop, so it must be on GPU.
+        #   Its output (cos, sin tensors) is then passed into every decoder
+        #   layer as the `position_embeddings` kwarg — already stored
+        #   per-sample in sample_kwargs by the Catcher, so RoPE length
+        #   mismatches are handled correctly by the existing fix.
+        PRE_MODULE_ATTRS = ['embed_tokens', 'rotary_emb', 'norm']
+        pre_modules = [
+            getattr(inner, attr)
+            for attr in PRE_MODULE_ATTRS
+            if hasattr(inner, attr)
+        ]
+
+        detected = [attr for attr in PRE_MODULE_ATTRS if hasattr(inner, attr)]
+        print(f"  Detected pre-modules: {detected}")
 
         dtype       = next(iter(self.model.parameters())).dtype
         hidden_size = self.model.config.hidden_size
