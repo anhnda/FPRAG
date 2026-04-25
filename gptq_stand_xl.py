@@ -263,13 +263,6 @@ class GPTQ:
         H = torch.linalg.cholesky(H, upper=True)
         Hinv = H
 
-        # Pre-compute scale/zero for the whole layer when groupsize=-1
-        # (single quantizer, so they are constant across all columns).
-        if groupsize == -1:
-            scale_all = self.quantizer.scale.flatten().to(W.dtype)  # [rows] or [1]
-            zero_all  = self.quantizer.zero.flatten().to(W.dtype)
-            maxq_val  = int(self.quantizer.maxq.item())
-
         for i1 in range(0, self.columns, blocksize):
             i2 = min(i1 + blocksize, self.columns)
             count = i2 - i1
@@ -284,74 +277,11 @@ class GPTQ:
             Losses1 = torch.zeros_like(W1)
             Hinv1   = Hinv[i1:i2, i1:i2]
 
-            if groupsize == -1:
-                # -----------------------------------------------------------------
-                # VECTORIZED PATH — groupsize=-1 means scale/zero are constant.
-                #
-                # The column-by-column update:
-                #   w_i' = w_i - sum_{j<i} err_j * Hinv1[j, i]
-                #   err_i = (w_i' - q_i) / Hinv1[i, i]
-                #
-                # is equivalent to solving:
-                #   W1_corrected = W1 @ tril(Hinv1)^{-1} * diag(Hinv1)
-                # then quantizing W1_corrected column-wise, all at once.
-                #
-                # Specifically:
-                #   Err1 = (W1 - Q1) @ inv(Hinv1)^T  where Hinv1 is upper-tri
-                # which is a triangular solve:
-                #   Err1 @ Hinv1 = W1 - Q1
-                #
-                # We compute it as:
-                #   1. W1_adj = W1 @ inv(Hinv1)   [triangular solve, upper]
-                #   2. Q1     = quantize(W1_adj * diag + pre-accumulated error)
-                # But the cleanest equivalent is the Cholesky-factor form:
-                #   Err1 = (W1 - Q1) / Hinv1  solved via torch.linalg.solve_triangular
-                #
-                # Identical result to the scalar loop — verified by construction.
-                # -----------------------------------------------------------------
+            for i in range(count):
+                w = W1[:, i]
+                d = Hinv1[i, i]
 
-                # Step 1: pre-divide W1 columns by their diagonal Hinv entry
-                # This "undoes" the Hinv scaling so we can quantize in original space
-                diag_Hinv1 = torch.diag(Hinv1)                      # [count]
-
-                # Step 2: solve W1 = Err1 @ Hinv1  for Err1, i.e. find the
-                # residuals that the column loop would accumulate.
-                # Equivalent: W1_solved = W1 @ Hinv1^{-T} (upper-tri solve)
-                # torch.linalg.solve_triangular(A, B, upper) solves A @ X = B
-                # We want X = W1 @ Hinv1^{-1}, i.e. Hinv1^T @ X^T = W1^T
-                W1_solved = torch.linalg.solve_triangular(
-                    Hinv1.t(),          # lower triangular (transpose of upper)
-                    W1.t(),             # [count, rows]
-                    upper=False,
-                ).t()                  # back to [rows, count]
-
-                # Step 3: quantize the solved weights (identical to w after
-                # accumulated error correction in the scalar loop)
-                # scale/zero broadcast: [rows,1] or [1,1] against [rows,count]
-                scale_b = scale_all.unsqueeze(1) if scale_all.numel() > 1 else scale_all.view(1, 1)
-                zero_b  = zero_all.unsqueeze(1)  if zero_all.numel()  > 1 else zero_all.view(1, 1)
-
-                Qpre1 = W1_solved / scale_b + zero_b
-                Qint1 = torch.clamp(torch.round(Qpre1), 0, maxq_val)
-                Q1    = (Qint1 - zero_b) * scale_b
-
-                # Step 4: compute errors — [rows, count]
-                Err1    = (W1_solved - Q1) / diag_Hinv1.unsqueeze(0)
-                Losses1 = (W1_solved - Q1) ** 2 / diag_Hinv1.unsqueeze(0) ** 2
-
-                # Step 5: fill scale/zero artifact tensors (same value every col)
-                Qscale1 = scale_b.expand_as(Q1)
-                Qzero1  = zero_b.expand_as(Q1)
-
-            else:
-                # -----------------------------------------------------------------
-                # SCALAR PATH — groupsize != -1, quantizer changes mid-block,
-                # sequential dependency cannot be removed. Identical to original.
-                # -----------------------------------------------------------------
-                for i in range(count):
-                    w = W1[:, i]
-                    d = Hinv1[i, i]
-
+                if groupsize != -1:
                     if not static_groups:
                         if (i1 + i) % groupsize == 0:
                             self.quantizer.find_params(
@@ -363,27 +293,27 @@ class GPTQ:
                             idx = perm[idx]
                         self.quantizer = groups[idx // groupsize]
 
-                    scale_col = self.quantizer.scale.flatten().to(w.dtype)
-                    zero_col  = self.quantizer.zero.flatten().to(w.dtype)
-                    pre_col   = w / scale_col + zero_col
-                    int_col   = torch.clamp(torch.round(pre_col), 0,
-                                            int(self.quantizer.maxq.item()))
+                scale_col = self.quantizer.scale.flatten().to(w.dtype)
+                zero_col  = self.quantizer.zero.flatten().to(w.dtype)
+                pre_col   = w / scale_col + zero_col
+                int_col   = torch.clamp(torch.round(pre_col), 0,
+                                        int(self.quantizer.maxq.item()))
 
-                    q = quantize(
-                        w.unsqueeze(1),
-                        self.quantizer.scale, self.quantizer.zero, self.quantizer.maxq
-                    ).flatten()
+                q = quantize(
+                    w.unsqueeze(1),
+                    self.quantizer.scale, self.quantizer.zero, self.quantizer.maxq
+                ).flatten()
 
-                    Q1[:, i]      = q
-                    Qpre1[:, i]   = pre_col
-                    Qint1[:, i]   = int_col
-                    Qscale1[:, i] = scale_col
-                    Qzero1[:, i]  = zero_col
-                    Losses1[:, i] = (w - q) ** 2 / d ** 2
+                Q1[:, i]      = q
+                Qpre1[:, i]   = pre_col
+                Qint1[:, i]   = int_col
+                Qscale1[:, i] = scale_col
+                Qzero1[:, i]  = zero_col
+                Losses1[:, i] = (w - q) ** 2 / d ** 2
 
-                    err1 = (w - q) / d
-                    W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
-                    Err1[:, i] = err1
+                err1 = (w - q) / d
+                W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
+                Err1[:, i] = err1
 
             Q[:, i1:i2]       = Q1
             Q_pre[:, i1:i2]   = Qpre1
