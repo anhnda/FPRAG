@@ -116,10 +116,11 @@ class SmartFlipCorrection:
     """
 
     def __init__(self, knee_tolerance: float = 0.0, max_flip_percent: float = 0.05,
-                 use_james_stein: bool = True):
+                 use_james_stein: bool = True, both_reduce: bool = False):
         self.knee_tolerance   = knee_tolerance
         self.max_flip_percent = max_flip_percent
         self.use_james_stein  = use_james_stein
+        self.both_reduce      = both_reduce
 
     def prepare_activation_means(self, raw_means: torch.Tensor) -> torch.Tensor:
         if self.use_james_stein:
@@ -666,14 +667,24 @@ def llama_sequential(model, dataloader, dev, args, smart_flip=None):
                     mae_reduction = (1 - mae_after / (mae_before + 1e-12)) * 100
                     mse_reduction = (1 - mse_after / (mse_before + 1e-12)) * 100
 
-                    # Write corrected weights back to the layer
+                    # both_reduce guard: only apply if both MAE and MSE improve
+                    both_reduce_ok = (mae_after < mae_before) and (mse_after < mse_before)
+                    apply_correction = not smart_flip.both_reduce or both_reduce_ok
+
+                    if apply_correction:
+                        weights_to_write = Q_corrected
+                        status = 'applied'
+                    else:
+                        weights_to_write = Q  # revert to raw quantized
+                        status = 'skipped (both_reduce)'
+
                     if isinstance(subset[name], transformers.Conv1D):
-                        Q_corrected = Q_corrected.t()
-                    subset[name].weight.data = Q_corrected.reshape(
+                        weights_to_write = weights_to_write.t()
+                    subset[name].weight.data = weights_to_write.reshape(
                         subset[name].weight.shape
                     ).to(subset[name].weight.data.dtype)
 
-                    print(f'    smart_flip: {num_flips} flips  '
+                    print(f'    smart_flip [{status}]: {num_flips} flips  '
                           f'outlier={outlier_pct*100:.2f}%  '
                           f'MAE {mae_before:.4e}->{mae_after:.4e} '
                           f'({mae_reduction:+.1f}%)  '
@@ -768,6 +779,8 @@ def main():
                         help='Max fraction of weights to flip per output row')
     parser.add_argument('--no-james-stein', action='store_true', default=False,
                         help='Disable James-Stein shrinkage on activation means')
+    parser.add_argument('--both-reduce', action='store_true', default=False,
+                        help='Only apply SmartFlip if BOTH MAE and MSE reduce')
     parser.add_argument('--seed', type=int, default=42)
     args = parser.parse_args()
 
@@ -836,6 +849,7 @@ def main():
             knee_tolerance=args.knee_tolerance,
             max_flip_percent=args.max_flip_percent,
             use_james_stein=not args.no_james_stein,
+            both_reduce=args.both_reduce,
         )
 
     tick = time.time()
