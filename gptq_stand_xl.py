@@ -8,8 +8,10 @@ matter for correctness:
   * GPTQ.add_batch / fasterquant — identical to official gptq.py
   * llama_sequential            — identical control flow:
       - inps stored on GPU, same dtype as model
-      - single shared attention_mask / position_ids (captured once)
-      - Catcher stores inp directly (no subsampling, no per-sample kwargs)
+      - Catcher captures ALL kwargs generically (matches File 1 / GPTQQuantizer)
+        so position_embeddings, position_ids, attention_mask etc. are all
+        forwarded correctly regardless of model architecture (LLaMA-2, LLaMA-3,
+        Mistral, etc.) without needing to name them explicitly
       - per-sublayer quantizer configured BEFORE add_batch, not inside fasterquant
       - hook signature matches: (module, inp, out) -> add_batch(inp[0].data, out.data)
       - inps, outs = outs, inps AFTER the quantized re-run
@@ -19,9 +21,6 @@ Only concessions to "XL" (low-VRAM) operation:
   * Model loaded on CPU, each block paged to GPU for quantization then back
   * Option to skip lm_head (it's a top-level nn.Linear, not inside a layer, so
     it's naturally skipped by this script anyway — kept as a flag for clarity)
-
-Nothing else deviates from the reference. No token subsampling. No per-sample
-kwargs. No random permutations. If the official code works, this works.
 
 Added vs original:
   * actorder (activation ordering) — columns sorted by descending Hessian diagonal
@@ -420,8 +419,11 @@ def llama_sequential(model, dataloader, dev, args):
         (args.nsamples, model.seqlen, model.config.hidden_size),
         dtype=dtype, device=dev
     )
-    cache = {'i': 0, 'attention_mask': None, 'position_ids': None,
-             'position_embeddings': None}
+    # Matches File 1 (GPTQQuantizer): store ALL kwargs generically so that
+    # whatever the model passes — attention_mask, position_ids,
+    # position_embeddings (LLaMA-3), or anything else — is captured and
+    # forwarded correctly without needing to name each kwarg explicitly.
+    cache = {'i': 0, 'kwargs': {}}
 
     class Catcher(nn.Module):
         def __init__(self, module):
@@ -431,12 +433,7 @@ def llama_sequential(model, dataloader, dev, args):
         def forward(self, inp, **kwargs):
             inps[cache['i']] = inp
             cache['i'] += 1
-            # Capture EXACTLY what the official code captures, plus
-            # position_embeddings for LLaMA-3 style models where rotary_emb
-            # is computed once and passed into every layer as a kwarg.
-            cache['attention_mask']    = kwargs.get('attention_mask', None)
-            cache['position_ids']      = kwargs.get('position_ids', None)
-            cache['position_embeddings'] = kwargs.get('position_embeddings', None)
+            cache['kwargs'] = kwargs   # capture ALL kwargs in one shot
             raise ValueError
 
     layers[0] = Catcher(layers[0])
@@ -457,21 +454,13 @@ def llama_sequential(model, dataloader, dev, args):
     torch.cuda.empty_cache()
 
     outs = torch.zeros_like(inps)
-    attention_mask      = cache['attention_mask']
-    position_ids        = cache['position_ids']
-    position_embeddings = cache['position_embeddings']
 
-    # Build the kwargs dict that will be passed to every layer call.
-    # Only include keys that were actually captured (not None) — this keeps
-    # us compatible with both old-style (attention_mask + position_ids) and
-    # new-style (attention_mask + position_embeddings) HF decoder layers.
-    layer_kwargs = {}
-    if attention_mask is not None:
-        layer_kwargs['attention_mask'] = attention_mask
-    if position_ids is not None:
-        layer_kwargs['position_ids'] = position_ids
-    if position_embeddings is not None:
-        layer_kwargs['position_embeddings'] = position_embeddings
+    # Matches File 1's _prepare_layer_kwargs(): pass everything through except
+    # use_cache (which we have already disabled on the config).
+    layer_kwargs = {
+        k: v for k, v in cache['kwargs'].items()
+        if k != 'use_cache'
+    }
 
     print('Ready.')
 
