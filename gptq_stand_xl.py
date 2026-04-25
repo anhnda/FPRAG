@@ -42,8 +42,7 @@ import math
 import os
 import random
 import time
-from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict
 
 import numpy as np
 import torch
@@ -58,9 +57,6 @@ except ImportError:
     HAS_PSUTIL = False
 
 from calibration_utils import get_c4_calibration_data, get_wikitext2_calibration_data
-
-GPTQ_RAW_ARTIFACT_FILENAME = "gptq_raw_artifacts.pt"
-
 
 # ---------------------------------------------------------------------------
 # quant.py — EXACT copy of official
@@ -186,7 +182,6 @@ class GPTQ:
         self.columns = W.shape[1]
         self.H = torch.zeros((self.columns, self.columns), device=self.dev)
         self.nsamples = 0
-        self.raw_artifact: Optional[dict] = None
 
     def add_batch(self, inp, out):
         if len(inp.shape) == 2:
@@ -219,7 +214,6 @@ class GPTQ:
         if isinstance(self.layer, transformers.Conv1D):
             W = W.t()
         W = W.float()
-        W_orig = W.clone()
 
         tick = time.time()
 
@@ -231,7 +225,6 @@ class GPTQ:
         dead = torch.diag(H) == 0
         H[dead, dead] = 1
         W[:, dead] = 0
-        W_orig[:, dead] = 0
 
         if static_groups:
             groups = []
@@ -243,17 +236,12 @@ class GPTQ:
         if actorder:
             perm = torch.argsort(torch.diag(H), descending=True)
             W = W[:, perm]
-            W_orig = W_orig[:, perm]
             dead = dead[perm]
             H = H[perm][:, perm]
             invperm = torch.argsort(perm)
 
-        Losses  = torch.zeros_like(W)
-        Q       = torch.zeros_like(W)
-        Q_pre   = torch.zeros_like(W)
-        Q_int   = torch.zeros_like(W)
-        Q_scale = torch.zeros_like(W)
-        Q_zero  = torch.zeros_like(W)
+        Losses = torch.zeros_like(W)
+        Q      = torch.zeros_like(W)
 
         damp = percdamp * torch.mean(torch.diag(H))
         diag = torch.arange(self.columns, device=self.dev)
@@ -269,10 +257,6 @@ class GPTQ:
 
             W1      = W[:, i1:i2].clone()
             Q1      = torch.zeros_like(W1)
-            Qpre1   = torch.zeros_like(W1)
-            Qint1   = torch.zeros_like(W1)
-            Qscale1 = torch.zeros_like(W1)
-            Qzero1  = torch.zeros_like(W1)
             Err1    = torch.zeros_like(W1)
             Losses1 = torch.zeros_like(W1)
             Hinv1   = Hinv[i1:i2, i1:i2]
@@ -293,34 +277,20 @@ class GPTQ:
                             idx = perm[idx]
                         self.quantizer = groups[idx // groupsize]
 
-                scale_col = self.quantizer.scale.flatten().to(w.dtype)
-                zero_col  = self.quantizer.zero.flatten().to(w.dtype)
-                pre_col   = w / scale_col + zero_col
-                int_col   = torch.clamp(torch.round(pre_col), 0,
-                                        int(self.quantizer.maxq.item()))
-
                 q = quantize(
                     w.unsqueeze(1),
                     self.quantizer.scale, self.quantizer.zero, self.quantizer.maxq
                 ).flatten()
 
                 Q1[:, i]      = q
-                Qpre1[:, i]   = pre_col
-                Qint1[:, i]   = int_col
-                Qscale1[:, i] = scale_col
-                Qzero1[:, i]  = zero_col
                 Losses1[:, i] = (w - q) ** 2 / d ** 2
 
                 err1 = (w - q) / d
                 W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
                 Err1[:, i] = err1
 
-            Q[:, i1:i2]       = Q1
-            Q_pre[:, i1:i2]   = Qpre1
-            Q_int[:, i1:i2]   = Qint1
-            Q_scale[:, i1:i2] = Qscale1
-            Q_zero[:, i1:i2]  = Qzero1
-            Losses[:, i1:i2]  = Losses1 / 2
+            Q[:, i1:i2]      = Q1
+            Losses[:, i1:i2] = Losses1 / 2
             W[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:])
 
         torch.cuda.synchronize()
@@ -328,24 +298,7 @@ class GPTQ:
         elapsed = time.time() - tick
 
         if actorder:
-            Q       = Q[:, invperm]
-            Q_pre   = Q_pre[:, invperm]
-            Q_int   = Q_int[:, invperm]
-            Q_scale = Q_scale[:, invperm]
-            Q_zero  = Q_zero[:, invperm]
-            W_orig  = W_orig[:, invperm]
-            dead    = dead[invperm]
-
-        # Move to CPU immediately to free GPU memory
-        self.raw_artifact = {
-            "float_weights":   W_orig.detach().cpu(),
-            "pre_round":       Q_pre.detach().cpu(),
-            "integer_weights": Q_int.detach().cpu(),
-            "scale":           Q_scale.detach().cpu(),
-            "zero_point":      Q_zero.detach().cpu(),
-            "max_int":         int(self.quantizer.maxq.item()),
-            "dead":            dead.detach().cpu(),
-        }
+            Q = Q[:, invperm]
 
         if isinstance(self.layer, transformers.Conv1D):
             Q = Q.t()
@@ -453,13 +406,6 @@ def llama_sequential(model, dataloader, dev, args):
     total_error = 0.0
     total_time  = 0.0
 
-    # FIX 3: prepare artifact file on disk upfront so we can write per-sublayer
-    # and immediately free from RAM instead of accumulating all layers.
-    artifact_path = Path(args.output_dir) / GPTQ_RAW_ARTIFACT_FILENAME
-    if args.save_raw_artifacts:
-        os.makedirs(args.output_dir, exist_ok=True)
-        torch.save({}, artifact_path)  # empty dict as starting point
-
     for i in range(len(layers)):
         layer = layers[i].to(dev)
         full  = find_layers(layer)
@@ -513,16 +459,6 @@ def llama_sequential(model, dataloader, dev, args):
 
                 layer_key = 'model.layers.%d.%s' % (i, name)
                 quantizers[layer_key] = gptq[name].quantizer
-
-                # FIX 3: write this sublayer's artifact to disk immediately
-                # then drop the RAM reference — never hold all layers at once.
-                if args.save_raw_artifacts and gptq[name].raw_artifact is not None:
-                    existing = torch.load(artifact_path, map_location='cpu')
-                    existing[layer_key] = gptq[name].raw_artifact
-                    torch.save(existing, artifact_path)
-                    del existing
-
-                gptq[name].raw_artifact = None  # release RAM immediately
                 gptq[name].free()
 
         for j in range(args.nsamples):
@@ -544,15 +480,6 @@ def llama_sequential(model, dataloader, dev, args):
 
     print(f'\nTotal error: {total_error:.4f}  Total time: {total_time:.2f}s')
     return quantizers
-
-
-# ---------------------------------------------------------------------------
-# Raw artifact helpers
-# ---------------------------------------------------------------------------
-
-def load_raw_artifacts(raw_model_dir: str) -> dict:
-    artifact_path = Path(raw_model_dir) / GPTQ_RAW_ARTIFACT_FILENAME
-    return torch.load(artifact_path, map_location='cpu')
 
 
 # ---------------------------------------------------------------------------
@@ -609,7 +536,6 @@ def main():
     parser.add_argument('--no-true-sequential', dest='true_sequential', action='store_false')
     parser.add_argument('--act-order', action='store_true', default=False)
     parser.add_argument('--static-groups', action='store_true', default=False)
-    parser.add_argument('--save-raw-artifacts', action='store_true', default=False)
     parser.add_argument('--seed', type=int, default=42)
     args = parser.parse_args()
 
@@ -633,7 +559,6 @@ def main():
     print(f'TrueSeq      : {args.true_sequential}')
     print(f'ActOrder     : {args.act_order}')
     print(f'StaticGroups : {args.static_groups}')
-    print(f'SaveArtifacts: {args.save_raw_artifacts}')
     print('=' * 80)
 
     print('\nLoading model and tokenizer...')
