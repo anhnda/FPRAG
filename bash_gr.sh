@@ -37,7 +37,6 @@ for knee in "${KNEE_TOL_VALUES[@]}"; do
             --knee-tolerance "$knee" \
             --max-flip-percent "$flip" \
             --true-sequential \
-            --low-cpu-mem-usage # Added for stability, remove if not supported
             
         # 2. Run Comparison
         echo "Results for Knee $knee / Flip $flip:" >> "$LOG_FILE"
