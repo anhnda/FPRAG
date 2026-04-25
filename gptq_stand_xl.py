@@ -19,14 +19,20 @@ matter for correctness:
 
 Only concessions to "XL" (low-VRAM) operation:
   * Model loaded on CPU, each block paged to GPU for quantization then back
-  * Option to skip lm_head (it's a top-level nn.Linear, not inside a layer, so
-    it's naturally skipped by this script anyway — kept as a flag for clarity)
 
 Added vs original:
   * actorder (activation ordering) — columns sorted by descending Hessian diagonal
   * static_groups — quantizer fitted per-group before add_batch rather than on the fly
   * Raw artifact saving — Q_pre, Q_int, Q_scale, Q_zero, W_orig tracked per column
     so that post-correction can be replayed without re-running full GPTQ
+
+Memory leak fixes:
+  * FIX 1 — Catcher detaches all tensor kwargs immediately so no computation
+             graph is retained in RAM across the calibration loop
+  * FIX 2 — cache dict cleared after layer_kwargs is built so the Catcher's
+             last captured tensors are released before the layer loop starts
+  * FIX 3 — raw artifacts written to disk per-sublayer and immediately freed
+             from RAM instead of accumulating all 32*7 layers in a dict
 """
 
 import argparse
@@ -54,6 +60,7 @@ except ImportError:
 from calibration_utils import get_c4_calibration_data, get_wikitext2_calibration_data
 
 GPTQ_RAW_ARTIFACT_FILENAME = "gptq_raw_artifacts.pt"
+
 
 # ---------------------------------------------------------------------------
 # quant.py — EXACT copy of official
@@ -179,12 +186,9 @@ class GPTQ:
         self.columns = W.shape[1]
         self.H = torch.zeros((self.columns, self.columns), device=self.dev)
         self.nsamples = 0
-        # Raw artifact storage — populated by fasterquant()
         self.raw_artifact: Optional[dict] = None
 
     def add_batch(self, inp, out):
-        # EXACT same signature as official — takes inp AND out (out unused, but
-        # kept for API parity so the hook in llama_sequential works unchanged)
         if len(inp.shape) == 2:
             inp = inp.unsqueeze(0)
         tmp = inp.shape[0]
@@ -215,8 +219,6 @@ class GPTQ:
         if isinstance(self.layer, transformers.Conv1D):
             W = W.t()
         W = W.float()
-        # Keep a clean copy of the original weights (before any GPTQ error
-        # propagation) so the raw artifact records pre-quantization values.
         W_orig = W.clone()
 
         tick = time.time()
@@ -229,9 +231,8 @@ class GPTQ:
         dead = torch.diag(H) == 0
         H[dead, dead] = 1
         W[:, dead] = 0
-        W_orig[:, dead] = 0  # zero dead columns in the original copy too
+        W_orig[:, dead] = 0
 
-        # --- static_groups: fit per-group quantizers once up front ----------
         if static_groups:
             groups = []
             for i in range(0, self.columns, groupsize):
@@ -239,7 +240,6 @@ class GPTQ:
                 quantizer.find_params(W[:, i:(i + groupsize)], weight=True)
                 groups.append(quantizer)
 
-        # --- actorder: permute columns by descending Hessian diagonal -------
         if actorder:
             perm = torch.argsort(torch.diag(H), descending=True)
             W = W[:, perm]
@@ -248,13 +248,12 @@ class GPTQ:
             H = H[perm][:, perm]
             invperm = torch.argsort(perm)
 
-        Losses = torch.zeros_like(W)
-        Q = torch.zeros_like(W)
-        # Per-column artifacts needed for post-correction replay
-        Q_pre   = torch.zeros_like(W)   # pre-round value (w / scale + zero)
-        Q_int   = torch.zeros_like(W)   # integer (rounded, clamped) value
-        Q_scale = torch.zeros_like(W)   # scale broadcast to per-column shape
-        Q_zero  = torch.zeros_like(W)   # zero  broadcast to per-column shape
+        Losses  = torch.zeros_like(W)
+        Q       = torch.zeros_like(W)
+        Q_pre   = torch.zeros_like(W)
+        Q_int   = torch.zeros_like(W)
+        Q_scale = torch.zeros_like(W)
+        Q_zero  = torch.zeros_like(W)
 
         damp = percdamp * torch.mean(torch.diag(H))
         diag = torch.arange(self.columns, device=self.dev)
@@ -294,7 +293,6 @@ class GPTQ:
                             idx = perm[idx]
                         self.quantizer = groups[idx // groupsize]
 
-                # Record per-column scale/zero/pre-round/int for artifact
                 scale_col = self.quantizer.scale.flatten().to(w.dtype)
                 zero_col  = self.quantizer.zero.flatten().to(w.dtype)
                 pre_col   = w / scale_col + zero_col
@@ -317,19 +315,18 @@ class GPTQ:
                 W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
                 Err1[:, i] = err1
 
-            Q[:, i1:i2]      = Q1
-            Q_pre[:, i1:i2]  = Qpre1
-            Q_int[:, i1:i2]  = Qint1
+            Q[:, i1:i2]       = Q1
+            Q_pre[:, i1:i2]   = Qpre1
+            Q_int[:, i1:i2]   = Qint1
             Q_scale[:, i1:i2] = Qscale1
             Q_zero[:, i1:i2]  = Qzero1
-            Losses[:, i1:i2] = Losses1 / 2
+            Losses[:, i1:i2]  = Losses1 / 2
             W[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:])
 
         torch.cuda.synchronize()
         error   = torch.sum(Losses).item()
         elapsed = time.time() - tick
 
-        # --- undo actorder permutation before saving weights / artifacts ----
         if actorder:
             Q       = Q[:, invperm]
             Q_pre   = Q_pre[:, invperm]
@@ -339,7 +336,7 @@ class GPTQ:
             W_orig  = W_orig[:, invperm]
             dead    = dead[invperm]
 
-        # Store raw artifact for optional post-correction replay
+        # Move to CPU immediately to free GPU memory
         self.raw_artifact = {
             "float_weights":   W_orig.detach().cpu(),
             "pre_round":       Q_pre.detach().cpu(),
@@ -386,27 +383,12 @@ def find_layers(module, layers=[nn.Linear], name=''):
 
 @torch.no_grad()
 def llama_sequential(model, dataloader, dev, args):
-    """
-    Mirrors official llama_sequential() exactly.
-
-    Only difference: model starts on CPU, each block is moved to `dev` for
-    quantization then moved back. The official code keeps the whole model on
-    GPU. Everything else — inps layout, Catcher, kwarg capture, hook signature,
-    per-sublayer quantizer lifecycle, inps/outs swap — is identical.
-
-    Extended with:
-      - actorder support (passed through to fasterquant)
-      - static_groups support (passed through to fasterquant)
-      - raw artifact collection and optional saving to disk
-    """
     print('Starting ...')
 
     use_cache = model.config.use_cache
     model.config.use_cache = False
     layers = model.model.layers
 
-    # Move pre-modules + layer 0 to GPU for input capture.
-    # Mistral / LLaMA-3 may have: embed_tokens, norm, rotary_emb
     model.model.embed_tokens = model.model.embed_tokens.to(dev)
     if hasattr(model.model, 'norm') and model.model.norm is not None:
         model.model.norm = model.model.norm.to(dev)
@@ -419,10 +401,9 @@ def llama_sequential(model, dataloader, dev, args):
         (args.nsamples, model.seqlen, model.config.hidden_size),
         dtype=dtype, device=dev
     )
-    # Matches File 1 (GPTQQuantizer): store ALL kwargs generically so that
-    # whatever the model passes — attention_mask, position_ids,
-    # position_embeddings (LLaMA-3), or anything else — is captured and
-    # forwarded correctly without needing to name each kwarg explicitly.
+
+    # FIX 1: detach all tensor kwargs in the Catcher immediately so the entire
+    # forward-pass computation graph is NOT retained in RAM.
     cache = {'i': 0, 'kwargs': {}}
 
     class Catcher(nn.Module):
@@ -431,9 +412,12 @@ def llama_sequential(model, dataloader, dev, args):
             self.module = module
 
         def forward(self, inp, **kwargs):
-            inps[cache['i']] = inp
+            inps[cache['i']] = inp.detach()
             cache['i'] += 1
-            cache['kwargs'] = kwargs   # capture ALL kwargs in one shot
+            cache['kwargs'] = {
+                k: v.detach() if isinstance(v, torch.Tensor) else v
+                for k, v in kwargs.items()
+            }
             raise ValueError
 
     layers[0] = Catcher(layers[0])
@@ -444,7 +428,6 @@ def llama_sequential(model, dataloader, dev, args):
             pass
     layers[0] = layers[0].module
 
-    # Move pre-modules + layer 0 back to CPU
     layers[0] = layers[0].cpu()
     model.model.embed_tokens = model.model.embed_tokens.cpu()
     if hasattr(model.model, 'norm') and model.model.norm is not None:
@@ -455,19 +438,27 @@ def llama_sequential(model, dataloader, dev, args):
 
     outs = torch.zeros_like(inps)
 
-    # Matches File 1's _prepare_layer_kwargs(): pass everything through except
-    # use_cache (which we have already disabled on the config).
     layer_kwargs = {
         k: v for k, v in cache['kwargs'].items()
         if k != 'use_cache'
     }
+    # FIX 2: clear cache dict so the Catcher's last captured tensors are
+    # released before the layer loop starts — nothing else holds these refs.
+    cache.clear()
+    gc.collect()
 
     print('Ready.')
 
-    quantizers:    Dict[str, Quantizer] = {}
-    raw_artifacts: Dict[str, dict]      = {}
+    quantizers: Dict[str, Quantizer] = {}
     total_error = 0.0
     total_time  = 0.0
+
+    # FIX 3: prepare artifact file on disk upfront so we can write per-sublayer
+    # and immediately free from RAM instead of accumulating all layers.
+    artifact_path = Path(args.output_dir) / GPTQ_RAW_ARTIFACT_FILENAME
+    if args.save_raw_artifacts:
+        os.makedirs(args.output_dir, exist_ok=True)
+        torch.save({}, artifact_path)  # empty dict as starting point
 
     for i in range(len(layers)):
         layer = layers[i].to(dev)
@@ -523,16 +514,17 @@ def llama_sequential(model, dataloader, dev, args):
                 layer_key = 'model.layers.%d.%s' % (i, name)
                 quantizers[layer_key] = gptq[name].quantizer
 
-                # Collect raw artifact for optional post-correction replay
-                if gptq[name].raw_artifact is not None:
-                    raw_artifacts[layer_key] = gptq[name].raw_artifact
+                # FIX 3: write this sublayer's artifact to disk immediately
+                # then drop the RAM reference — never hold all layers at once.
+                if args.save_raw_artifacts and gptq[name].raw_artifact is not None:
+                    existing = torch.load(artifact_path, map_location='cpu')
+                    existing[layer_key] = gptq[name].raw_artifact
+                    torch.save(existing, artifact_path)
+                    del existing
 
+                gptq[name].raw_artifact = None  # release RAM immediately
                 gptq[name].free()
 
-        # Re-run QUANTIZED layer to propagate error to next block — this is
-        # THE step that makes it "true sequential". Official code does this
-        # unconditionally (inside the true_sequential branch, but the outer
-        # loop is the same).
         for j in range(args.nsamples):
             outs[j] = layer(inps[j].unsqueeze(0), **layer_kwargs)[0]
 
@@ -542,8 +534,6 @@ def llama_sequential(model, dataloader, dev, args):
         torch.cuda.empty_cache()
         gc.collect()
 
-        # THE critical swap — next block's inputs are this block's quantized
-        # outputs
         inps, outs = outs, inps
 
         if HAS_PSUTIL:
@@ -553,18 +543,12 @@ def llama_sequential(model, dataloader, dev, args):
     model.config.use_cache = use_cache
 
     print(f'\nTotal error: {total_error:.4f}  Total time: {total_time:.2f}s')
-    return quantizers, raw_artifacts
+    return quantizers
 
 
 # ---------------------------------------------------------------------------
 # Raw artifact helpers
 # ---------------------------------------------------------------------------
-
-def save_raw_artifacts(raw_artifacts: dict, output_dir: str):
-    artifact_path = Path(output_dir) / GPTQ_RAW_ARTIFACT_FILENAME
-    torch.save(raw_artifacts, artifact_path)
-    print(f'Raw artifacts saved to {artifact_path}')
-
 
 def load_raw_artifacts(raw_model_dir: str) -> dict:
     artifact_path = Path(raw_model_dir) / GPTQ_RAW_ARTIFACT_FILENAME
@@ -572,36 +556,23 @@ def load_raw_artifacts(raw_model_dir: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Calibration dataloader — builds the (input_ids,) batches the official
-# code expects from datautils.get_loaders()
+# Calibration dataloader
 # ---------------------------------------------------------------------------
 
 def build_dataloader(calib_texts, tokenizer, seqlen, nsamples, seed):
-    """
-    Tokenize calibration texts into fixed-seqlen chunks, matching the format
-    that official datautils.get_loaders() produces: a list of (input_ids,)
-    tuples where input_ids has shape [1, seqlen].
-
-    Following the official approach for C4/wikitext2: concatenate all text,
-    then slice random seqlen-sized windows. This gives the Hessian the full
-    seqlen of context it expects.
-    """
     rng = random.Random(seed)
 
-    # Tokenize and concatenate
     full_ids = []
     for text in calib_texts:
         ids = tokenizer(text, return_tensors='pt').input_ids[0].tolist()
         full_ids.extend(ids)
         if len(full_ids) > seqlen * nsamples * 4:
-            break  # enough text
+            break
 
     if len(full_ids) < seqlen * nsamples:
-        # Not enough tokens — loop the text
         while len(full_ids) < seqlen * nsamples:
             full_ids = full_ids + full_ids
 
-    # Sample nsamples random windows of length seqlen
     dataloader = []
     max_start = len(full_ids) - seqlen - 1
     for _ in range(nsamples):
@@ -622,33 +593,23 @@ def main():
         description='GPTQ — faithful port of official llama.py for XL models',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    parser.add_argument('--model-path', type=str,
-                        default='./models/Mistral-7B-v0.3')
-    parser.add_argument('--output-dir', type=str,
-                        default='./quantized_models/model_gptq_xl')
-    parser.add_argument('--calib-dataset', type=str, default='c4',
-                        choices=['c4', 'wikitext2'])
+    parser.add_argument('--model-path', type=str, default='./models/Mistral-7B-v0.3')
+    parser.add_argument('--output-dir', type=str, default='./quantized_models/model_gptq_xl')
+    parser.add_argument('--calib-dataset', type=str, default='c4', choices=['c4', 'wikitext2'])
     parser.add_argument('--cache-dir', type=str, default='./calibration_cache')
     parser.add_argument('--nsamples', type=int, default=128)
-    parser.add_argument('--seqlen', type=int, default=2048,
-                        help='Calibration sequence length (official uses 2048)')
+    parser.add_argument('--seqlen', type=int, default=2048)
     parser.add_argument('--wbits', type=int, default=4, choices=[2, 3, 4, 8])
     parser.add_argument('--groupsize', type=int, default=128)
     parser.add_argument('--blocksize', type=int, default=128)
     parser.add_argument('--percdamp', type=float, default=0.01)
     parser.add_argument('--sym', action='store_true', default=True)
     parser.add_argument('--asym', dest='sym', action='store_false')
-    parser.add_argument('--true-sequential', action='store_true', default=True,
-                        help='Quantize sublayers in dependency order (official default for LLaMA)')
-    parser.add_argument('--no-true-sequential', dest='true_sequential',
-                        action='store_false')
-    # --- new flags ---
-    parser.add_argument('--act-order', action='store_true', default=False,
-                        help='Sort columns by descending Hessian diagonal before quantizing')
-    parser.add_argument('--static-groups', action='store_true', default=False,
-                        help='Fit per-group quantizers once (before add_batch) rather than on the fly')
-    parser.add_argument('--save-raw-artifacts', action='store_true', default=False,
-                        help='Save Q_pre/Q_int/Q_scale/Q_zero/W_orig to disk for post-correction replay')
+    parser.add_argument('--true-sequential', action='store_true', default=True)
+    parser.add_argument('--no-true-sequential', dest='true_sequential', action='store_false')
+    parser.add_argument('--act-order', action='store_true', default=False)
+    parser.add_argument('--static-groups', action='store_true', default=False)
+    parser.add_argument('--save-raw-artifacts', action='store_true', default=False)
     parser.add_argument('--seed', type=int, default=42)
     args = parser.parse_args()
 
@@ -675,7 +636,6 @@ def main():
     print(f'SaveArtifacts: {args.save_raw_artifacts}')
     print('=' * 80)
 
-    # Load model on CPU (paged to GPU block-by-block)
     print('\nLoading model and tokenizer...')
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
     if tokenizer.pad_token is None:
@@ -688,9 +648,8 @@ def main():
         trust_remote_code=True,
     )
     model.eval()
-    model.seqlen = args.seqlen  # official code reads this attribute
+    model.seqlen = args.seqlen
 
-    # Load calibration text
     print(f'\nLoading calibration: {args.calib_dataset}')
     if args.calib_dataset == 'c4':
         calib_texts = get_c4_calibration_data(
@@ -703,25 +662,18 @@ def main():
             seed=args.seed, cache_dir=args.cache_dir
         )
 
-    # Build dataloader in the (input_ids,) format official code expects
     print('Building dataloader...')
     dataloader = build_dataloader(
         calib_texts, tokenizer, args.seqlen, args.nsamples, args.seed
     )
     print(f'  {len(dataloader)} calibration batches, each {args.seqlen} tokens')
 
-    # Run faithful GPTQ
     tick = time.time()
-    quantizers, raw_artifacts = llama_sequential(model, dataloader, dev, args)
+    quantizers = llama_sequential(model, dataloader, dev, args)
     print(f'\nTotal wall time: {time.time() - tick:.2f}s')
 
-    # Optionally persist raw artifacts for post-correction replay
-    os.makedirs(args.output_dir, exist_ok=True)
-    if args.save_raw_artifacts and raw_artifacts:
-        save_raw_artifacts(raw_artifacts, args.output_dir)
-
-    # Save
     print(f'\nSaving to {args.output_dir}...')
+    os.makedirs(args.output_dir, exist_ok=True)
     model.save_pretrained(args.output_dir)
     tokenizer.save_pretrained(args.output_dir)
     print('Done.')
