@@ -646,17 +646,39 @@ def llama_sequential(model, dataloader, dev, args, smart_flip=None):
                                 gptq[name].activation_count).to(
                                     device=dev, dtype=Q_scale.dtype)
                     act_mean = smart_flip.prepare_activation_means(act_mean)
+
+                    # Error BEFORE correction: E[X](W_orig - Q)
+                    w_diff_before = W_orig - Q
+                    err_before = (w_diff_before * act_mean.unsqueeze(0)).sum(dim=1)
+                    mae_before = err_before.abs().mean().item()
+                    mse_before = (err_before ** 2).mean().item()
+
                     Q_corrected, outlier_pct, num_flips = smart_flip.apply(
                         W_orig, Q, Q_pre, Q_int, Q_scale, Q_zero, maxq, act_mean
                     )
+
+                    # Error AFTER correction: E[X](W_orig - Q_corrected)
+                    w_diff_after = W_orig - Q_corrected
+                    err_after = (w_diff_after * act_mean.unsqueeze(0)).sum(dim=1)
+                    mae_after = err_after.abs().mean().item()
+                    mse_after = (err_after ** 2).mean().item()
+
+                    mae_reduction = (1 - mae_after / (mae_before + 1e-12)) * 100
+                    mse_reduction = (1 - mse_after / (mse_before + 1e-12)) * 100
+
                     # Write corrected weights back to the layer
                     if isinstance(subset[name], transformers.Conv1D):
                         Q_corrected = Q_corrected.t()
                     subset[name].weight.data = Q_corrected.reshape(
                         subset[name].weight.shape
                     ).to(subset[name].weight.data.dtype)
-                    print(f'    smart_flip: {num_flips} flips, '
-                          f'outlier_pct={outlier_pct*100:.2f}%')
+
+                    print(f'    smart_flip: {num_flips} flips  '
+                          f'outlier={outlier_pct*100:.2f}%  '
+                          f'MAE {mae_before:.4e}->{mae_after:.4e} '
+                          f'({mae_reduction:+.1f}%)  '
+                          f'MSE {mse_before:.4e}->{mse_after:.4e} '
+                          f'({mse_reduction:+.1f}%)')
 
                 layer_key = 'model.layers.%d.%s' % (i, name)
                 quantizers[layer_key] = gptq[name].quantizer
