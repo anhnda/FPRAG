@@ -136,7 +136,6 @@ class AWQSlidingWindowValidator:
         model.eval()
         nlls = []
         total_tokens = 0
-        print(f"BOS={tokenizer.bos_token_id}  EOS={tokenizer.eos_token_id}  same={tokenizer.bos_token_id == tokenizer.eos_token_id}")
 
         for text in texts:
             # Tokenize WITHOUT adding special tokens automatically
@@ -254,7 +253,9 @@ class AWQSlidingWindowValidator:
                 device_map=self.device,
                 trust_remote_code=True,
             )
-
+            print(f"model.dtype={model.dtype}")
+            print(f"max_length={self.max_length}  stride={self.stride}")
+            print(f"BOS={tokenizer.bos_token_id}  EOS={tokenizer.eos_token_id}")
             results = self.evaluate_sliding_window(model, tokenizer, texts)
 
             if results:
