@@ -364,6 +364,14 @@ def llama_sequential(model, dataloader, dev, args):
             super().__init__()
             self.module = module
 
+        def __getattr__(self, name):
+            # Forward any attribute lookup that isn't found on Catcher itself
+            # to the wrapped module — fixes Qwen2's decoder_layer.attention_type
+            try:
+                return super().__getattr__(name)
+            except AttributeError:
+                return getattr(self.module, name)
+
         def forward(self, inp, **kwargs):
             inps[cache['i']] = inp.detach()
             cache['i'] += 1
@@ -372,7 +380,6 @@ def llama_sequential(model, dataloader, dev, args):
                 for k, v in kwargs.items()
             }
             raise ValueError
-
     layers[0] = Catcher(layers[0])
     for batch in dataloader:
         try:
