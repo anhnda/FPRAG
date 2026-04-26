@@ -148,6 +148,9 @@ class SmartFlipCorrection:
         """
         device = Q_int.device
         in_features = Q_int.shape[1]
+        recon_diff = ((Q_int - Q_zero) * Q_scale - Q).abs().max()
+        if recon_diff > 1e-4:
+            print(f"WARNING: Q_int/scale/zero inconsistent with Q: max_diff={recon_diff:.4e}")
 
         w_quant       = (Q_int - Q_zero) * Q_scale
         w_diff        = W_orig - w_quant
