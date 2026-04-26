@@ -443,10 +443,11 @@ class GPTQ:
 
                 scale_col = self.quantizer.scale.flatten().to(w.dtype)
                 zero_col  = self.quantizer.zero.flatten().to(w.dtype)
-                pre_col   = w / scale_col + zero_col
-                int_col   = torch.clamp(torch.round(pre_col), 0,
-                                        int(self.quantizer.maxq.item()))
-
+                pre_col   = w / scale_col + zero_col                          # for SmartFlip's flip_dir signal
+                int_col   = torch.clamp(
+                    torch.round(w / scale_col) + zero_col,                    # match quantize() exactly
+                    0, int(self.quantizer.maxq.item())
+                )
                 q = quantize(
                     w.unsqueeze(1),
                     self.quantizer.scale, self.quantizer.zero, self.quantizer.maxq
