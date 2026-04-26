@@ -11,6 +11,8 @@ Metric: loglikelihood_rolling (Standard lm-evaluation-harness methodology)
 Stride: 512 tokens
 """
 
+from html import parser
+
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
@@ -447,10 +449,17 @@ def main():
                         help="Number of samples per dataset")
     parser.add_argument("--cache-dir", type=str, default="./dataset_cache",
                         help="Directory to cache downloaded datasets")
+    parser.add_argument("--max-length", type=int, default=2048,
+                    help="Max sequence length per window")
+    parser.add_argument("--stride", type=int, default=512,
+                    help="Stride between windows")
     args = parser.parse_args()
 
-    validator = AWQSlidingWindowValidator(cache_dir=args.cache_dir)
-
+    validator = AWQSlidingWindowValidator(
+        cache_dir=args.cache_dir,
+        max_length=args.max_length,
+        stride=args.stride,
+    )
     validator.run_validation(
         args.heuristic_path,
         args.standard_path if args.standard_path else None,
