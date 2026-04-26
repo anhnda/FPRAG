@@ -136,6 +136,7 @@ class AWQSlidingWindowValidator:
         model.eval()
         nlls = []
         total_tokens = 0
+        print(f"BOS={tokenizer.bos_token_id}  EOS={tokenizer.eos_token_id}  same={tokenizer.bos_token_id == tokenizer.eos_token_id}")
 
         for text in texts:
             # Tokenize WITHOUT adding special tokens automatically
