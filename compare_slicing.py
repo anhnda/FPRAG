@@ -163,8 +163,11 @@ class AWQSlidingWindowValidator:
             num_windows = len(window_range)
             print(f"  Processing {seq_len:,} tokens in {num_windows} windows...")
 
-            prev_end_loc = 0
+            
             pbar = tqdm(window_range, desc="  Windows", unit="win", leave=False)
+
+            prev_end_loc = 0
+            evaluated_tokens = 0  # ← ADD THIS
 
             for begin_loc in pbar:
                 end_loc = min(begin_loc + self.max_length, seq_len)
@@ -173,7 +176,6 @@ class AWQSlidingWindowValidator:
                 input_chunk = input_ids[:, begin_loc:end_loc]
                 target_chunk = input_chunk.clone()
 
-                # Mask context tokens so loss is only computed over new stride tokens
                 if begin_loc > 0:
                     target_chunk[:, :-trg_len] = -100
 
@@ -182,22 +184,22 @@ class AWQSlidingWindowValidator:
 
                 with torch.no_grad():
                     outputs = model(input_chunk, labels=target_chunk)
-                    # outputs.loss is mean NLL; convert back to sum for aggregation
                     neg_log_likelihood = outputs.loss * trg_len
 
                 nlls.append(neg_log_likelihood)
                 prev_end_loc = end_loc
+                evaluated_tokens += trg_len  # ← ADD THIS
 
-                # Live PPL in progress bar
+                # Fix 2 — live PPL: replace (total_tokens + prev_end_loc) 
                 if nlls:
                     current_nll = torch.stack(nlls).sum()
-                    current_ppl = torch.exp(current_nll / (total_tokens + prev_end_loc)).item()
-                    pbar.set_postfix({"PPL": f"{current_ppl:.4f}", "tokens": f"{total_tokens + prev_end_loc:,}"})
+                    current_ppl = torch.exp(current_nll / (total_tokens + evaluated_tokens)).item()  # ← CHANGE THIS
+                    pbar.set_postfix({"PPL": f"{current_ppl:.4f}", "tokens": f"{total_tokens + evaluated_tokens:,}"})  # ← AND THIS
 
                 if end_loc == seq_len:
                     break
 
-            total_tokens += seq_len
+            total_tokens += evaluated_tokens  # ← CHANGE FROM seq_len TO evaluated_tokens
 
         if not nlls:
             return None
