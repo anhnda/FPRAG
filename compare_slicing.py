@@ -144,11 +144,12 @@ class AWQSlidingWindowValidator:
             input_ids = encodings.input_ids
 
             # Manual BOS injection — Llama 3 requires ID 128000 at position 0
-            if tokenizer.bos_token_id is not None:
+            # Manual BOS injection — Llama 3 requires ID 128000 at position 0
+            # Skip for Qwen2.5/GPT-2-style where bos==eos (endoftext), injecting it hurts stream PPL
+            if tokenizer.bos_token_id is not None and tokenizer.bos_token_id != tokenizer.eos_token_id:
                 if input_ids.shape[1] == 0 or input_ids[0, 0].item() != tokenizer.bos_token_id:
                     bos_tensor = torch.tensor([[tokenizer.bos_token_id]], device=input_ids.device)
                     input_ids = torch.cat([bos_tensor, input_ids], dim=1)
-
             # Safety cap: max_length * 200 tokens (~280k for WikiText-2 full test set)
             if input_ids.size(1) > self.max_length * 200:
                 input_ids = input_ids[:, : self.max_length * 200]
