@@ -144,6 +144,8 @@ class AWQSlidingWindowValidator:
             # This prevents the [BOS][BOS] double-injection issue
             encodings = tokenizer(text, return_tensors="pt", add_special_tokens=False)
             input_ids = encodings.input_ids
+            print(f"  First 10 token IDs: {input_ids[0, :10].tolist()}")
+            print(f"  tokenizer class: {type(tokenizer).__name__}")
 
             # Manual BOS injection — Llama 3 requires ID 128000 at position 0
             # Manual BOS injection — Llama 3 requires ID 128000 at position 0
