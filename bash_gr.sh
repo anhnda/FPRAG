@@ -2,11 +2,11 @@
 
 # Global Config
 BASE_OUT="./quantized_models"
-LOG_FILE="./quantization_grid_search.log"
+LOG_FILE="./quantization_grid_search2.log"
 
 # Grid Search Parameters
-KNEE_TOL_VALUES=(-0.02 -0.01 0.0 0.005 0.01)
-MAX_FLIP_VALUES=(0.001 0.005 0.01)
+KNEE_TOL_VALUES=(0.00 0.005)
+MAX_FLIP_VALUES=(0.010 0.020 0.040)
 
 # Mistral Hardcoded Baselines (Standard AWQ)
 MISTRAL_WIKI_PPL=4.9373
