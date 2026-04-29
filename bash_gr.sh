@@ -77,7 +77,8 @@ run_full_grid_search() {
 # --- EXECUTION LIST ---
 
 # 1. Mistral-7B (Will skip standard baseline run)
-run_full_grid_search "Mistral-7B-v0.3" "/models/Mistral-7B-v0.3"
+# run_full_grid_search "Mistral-7B-v0.3" "/models/Mistral-7B-v0.3"
+run_full_grid_search "Mistral-7B-v0.3" "/home/DATA/prometheus/anh/FPRAG/.cache/huggingface/hub/models--mistralai--Mistral-7B-v0.3/snapshots/caa1feb0e54d415e2df31207e5f4e273e33509b1"
 
 # 2. Qwen2.5-7B (Will generate new standard baseline)
 #run_full_grid_search "Qwen2.5-7B" "/models/Qwen2.5-7B"
