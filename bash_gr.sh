@@ -63,9 +63,7 @@ run_full_grid_search() {
             # If Mistral, we pass the baseline values as arguments or handle inside the script
             # Adjust flags for compare_slicing.py based on your specific implementation
             python compare_slicing.py \
-                --heuristic-path "$JS_OUT" \
-                --baseline-path "$STD_OUT" \
-                --model-name "$M_NAME" >> "$LOG_FILE" 2>&1
+                --heuristic-path "$JS_OUT" >> "$LOG_FILE" 2>&1
             
             echo "---------------------------------------" >> "$LOG_FILE"
         done
