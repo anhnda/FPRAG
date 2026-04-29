@@ -5,8 +5,8 @@ BASE_OUT="./quantized_models"
 LOG_FILE="./quantization_grid_search.log"
 
 # Grid Search Parameters
-KNEE_TOL_VALUES=(0.0 0.01 0.02 0.03 0.04 0.05)
-MAX_FLIP_VALUES=(0.001 0.005 0.01 0.02 0.03 0.04 0.05)
+KNEE_TOL_VALUES=(-0.01 -0.005 0.0 0.005 0.01)
+MAX_FLIP_VALUES=(0.001 0.005 0.01)
 
 # Initialize log
 echo "Comprehensive Grid Search Log - $(date)" > "$LOG_FILE"
@@ -68,10 +68,10 @@ run_full_grid_search() {
 run_full_grid_search "Mistral-7B-v0.3" "/models/Mistral-7B-v0.3"
 
 # 2. Qwen2.5-7B
-run_full_grid_search "Qwen2.5-7B" "/models/Qwen2.5-7B"
+#run_full_grid_search "Qwen2.5-7B" "/models/Qwen2.5-7B"
 
 # 3. Llama-3-8B
-run_full_grid_search "Llama-3-8B" "/models/Llama-3-8B"
+#run_full_grid_search "Llama-3-8B" "/models/Llama-3-8B"
 
 echo "================================================="
 echo "ALL MODELS COMPLETE. Final results in: $LOG_FILE"
