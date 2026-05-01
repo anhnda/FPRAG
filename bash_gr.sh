@@ -2,11 +2,11 @@
 
 # Global Config
 BASE_OUT="./quantized_models"
-LOG_FILE="./quantization_grid_search2.log"
+LOG_FILE="./quantization_grid_search3.log"
 
 # Grid Search Parameters
 KNEE_TOL_VALUES=(0.00 0.005)
-MAX_FLIP_VALUES=(0.010 0.020 0.040)
+MAX_FLIP_VALUES=(0.005 0.010 0.020)
 
 # Mistral Hardcoded Baselines (Standard AWQ)
 MISTRAL_WIKI_PPL=4.9373
@@ -77,11 +77,10 @@ run_full_grid_search() {
 # --- EXECUTION LIST ---
 
 # 1. Mistral-7B (Will skip standard baseline run)
-# run_full_grid_search "Mistral-7B-v0.3" "/models/Mistral-7B-v0.3"
-run_full_grid_search "Mistral-7B-v0.3" "/home/DATA/prometheus/anh/.cache/huggingface/hub/models--mistralai--Mistral-7B-v0.3/snapshots/caa1feb0e54d415e2df31207e5f4e273e33509b1"
+# run_full_grid_search "Mistral-7B-v0.3" "/home/DATA/prometheus/anh/.cache/huggingface/hub/models--mistralai--Mistral-7B-v0.3/snapshots/caa1feb0e54d415e2df31207e5f4e273e33509b1"
 
 # 2. Qwen2.5-7B (Will generate new standard baseline)
-#run_full_grid_search "Qwen2.5-7B" "/models/Qwen2.5-7B"
+run_full_grid_search "Qwen2.5-7B" "/models/Qwen2.5-7B"
 
 # 3. Llama-3-8B
 #run_full_grid_search "Llama-3-8B" "/models/Llama-3-8B"
