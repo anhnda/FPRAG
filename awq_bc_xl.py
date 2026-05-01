@@ -507,10 +507,10 @@ class BiasCorrectionAWQQuantizerXL:
         # Apply bias correction
         if module.bias is None:
             # Create bias term initialized to correction
-            module.bias = nn.Parameter(-bias_correction)
+            module.bias = nn.Parameter(bias_correction)
         else:
             # Add correction to existing bias
-            module.bias.data = module.bias.data - bias_correction
+            module.bias.data = module.bias.data + bias_correction
 
         self.layer_scales[name] = {
             'scales': best_scales.cpu(),
