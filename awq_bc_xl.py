@@ -459,7 +459,7 @@ class BiasCorrectionAWQQuantizerXL:
             module.bias = nn.Parameter(torch.zeros(out_features, device=self.device, dtype=original_dtype))
 
         # Add correction: bias = bias - error (so that output + bias ≈ original output)
-        module.bias.data = module.bias.data - full_bias_correction
+        module.bias.data = module.bias.data + full_bias_correction
 
         # Store average statistics
         avg_alpha = np.mean([s['alpha'] for s in chunk_stats])
