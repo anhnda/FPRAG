@@ -11,6 +11,8 @@ Metric: loglikelihood_rolling (Standard lm-evaluation-harness methodology)
 Stride: 512 tokens
 """
 
+from html import parser
+
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
@@ -142,13 +144,16 @@ class AWQSlidingWindowValidator:
             # This prevents the [BOS][BOS] double-injection issue
             encodings = tokenizer(text, return_tensors="pt", add_special_tokens=False)
             input_ids = encodings.input_ids
+            print(f"  First 10 token IDs: {input_ids[0, :10].tolist()}")
+            print(f"  tokenizer class: {type(tokenizer).__name__}")
 
             # Manual BOS injection — Llama 3 requires ID 128000 at position 0
-            if tokenizer.bos_token_id is not None:
+            # Manual BOS injection — Llama 3 requires ID 128000 at position 0
+            # Skip for Qwen2.5/GPT-2-style where bos==eos (endoftext), injecting it hurts stream PPL
+            if tokenizer.bos_token_id is not None and tokenizer.bos_token_id != tokenizer.eos_token_id:
                 if input_ids.shape[1] == 0 or input_ids[0, 0].item() != tokenizer.bos_token_id:
                     bos_tensor = torch.tensor([[tokenizer.bos_token_id]], device=input_ids.device)
                     input_ids = torch.cat([bos_tensor, input_ids], dim=1)
-
             # Safety cap: max_length * 200 tokens (~280k for WikiText-2 full test set)
             if input_ids.size(1) > self.max_length * 200:
                 input_ids = input_ids[:, : self.max_length * 200]
@@ -163,8 +168,11 @@ class AWQSlidingWindowValidator:
             num_windows = len(window_range)
             print(f"  Processing {seq_len:,} tokens in {num_windows} windows...")
 
-            prev_end_loc = 0
+            
             pbar = tqdm(window_range, desc="  Windows", unit="win", leave=False)
+
+            prev_end_loc = 0
+            evaluated_tokens = 0  # ← ADD THIS
 
             for begin_loc in pbar:
                 end_loc = min(begin_loc + self.max_length, seq_len)
@@ -173,7 +181,6 @@ class AWQSlidingWindowValidator:
                 input_chunk = input_ids[:, begin_loc:end_loc]
                 target_chunk = input_chunk.clone()
 
-                # Mask context tokens so loss is only computed over new stride tokens
                 if begin_loc > 0:
                     target_chunk[:, :-trg_len] = -100
 
@@ -182,22 +189,22 @@ class AWQSlidingWindowValidator:
 
                 with torch.no_grad():
                     outputs = model(input_chunk, labels=target_chunk)
-                    # outputs.loss is mean NLL; convert back to sum for aggregation
                     neg_log_likelihood = outputs.loss * trg_len
 
                 nlls.append(neg_log_likelihood)
                 prev_end_loc = end_loc
+                evaluated_tokens += trg_len  # ← ADD THIS
 
-                # Live PPL in progress bar
+                # Fix 2 — live PPL: replace (total_tokens + prev_end_loc) 
                 if nlls:
                     current_nll = torch.stack(nlls).sum()
-                    current_ppl = torch.exp(current_nll / (total_tokens + prev_end_loc)).item()
-                    pbar.set_postfix({"PPL": f"{current_ppl:.4f}", "tokens": f"{total_tokens + prev_end_loc:,}"})
+                    current_ppl = torch.exp(current_nll / (total_tokens + evaluated_tokens)).item()  # ← CHANGE THIS
+                    pbar.set_postfix({"PPL": f"{current_ppl:.4f}", "tokens": f"{total_tokens + evaluated_tokens:,}"})  # ← AND THIS
 
                 if end_loc == seq_len:
                     break
 
-            total_tokens += seq_len
+            total_tokens += evaluated_tokens  # ← CHANGE FROM seq_len TO evaluated_tokens
 
         if not nlls:
             return None
@@ -250,7 +257,9 @@ class AWQSlidingWindowValidator:
                 device_map=self.device,
                 trust_remote_code=True,
             )
-
+            print(f"model.dtype={model.dtype}")
+            print(f"max_length={self.max_length}  stride={self.stride}")
+            print(f"BOS={tokenizer.bos_token_id}  EOS={tokenizer.eos_token_id}")
             results = self.evaluate_sliding_window(model, tokenizer, texts)
 
             if results:
@@ -442,10 +451,17 @@ def main():
                         help="Number of samples per dataset")
     parser.add_argument("--cache-dir", type=str, default="./dataset_cache",
                         help="Directory to cache downloaded datasets")
+    parser.add_argument("--max-length", type=int, default=2048,
+                    help="Max sequence length per window")
+    parser.add_argument("--stride", type=int, default=512,
+                    help="Stride between windows")
     args = parser.parse_args()
 
-    validator = AWQSlidingWindowValidator(cache_dir=args.cache_dir)
-
+    validator = AWQSlidingWindowValidator(
+        cache_dir=args.cache_dir,
+        max_length=args.max_length,
+        stride=args.stride,
+    )
     validator.run_validation(
         args.heuristic_path,
         args.standard_path if args.standard_path else None,
