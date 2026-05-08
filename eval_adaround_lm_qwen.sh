@@ -5,6 +5,7 @@ set -euo pipefail
 TASKS="arc_challenge,arc_easy,boolq,hellaswag,lambada_openai,openbookqa,piqa,rte,winogrande"
 BASE_OUT="./eval_quantized_models"
 RESULTS_DIR="./eval_results_qwen25"
+LOG_FILE="./eval_qwen25.log"
 
 mkdir -p "$BASE_OUT"
 mkdir -p "$RESULTS_DIR"
@@ -19,6 +20,13 @@ LAYER_BATCH_SIZE=16
 BEST_KNEE="0.01"
 BEST_FLIP="0.05"
 
+# Initialize log
+echo "AdaRound Baseline + Flip Eval Run - $(date)" > "$LOG_FILE"
+echo "n_calib=$N_CALIB, adaround_iters=$ADAROUND_ITERS, lr=$ADAROUND_LR, layer_batch=$LAYER_BATCH_SIZE" >> "$LOG_FILE"
+echo "best_knee=$BEST_KNEE, best_flip=$BEST_FLIP" >> "$LOG_FILE"
+echo "tasks=$TASKS" >> "$LOG_FILE"
+echo "" >> "$LOG_FILE"
+
 # =============================================================
 # HELPER: evaluate one model
 # Args: MODEL_NAME MODEL_PATH
@@ -29,38 +37,47 @@ eval_model() {
     local BASELINE_OUT="${BASE_OUT}/${MODEL_NAME}_ar_baseline"
     local FLIP_OUT="${BASE_OUT}/${MODEL_NAME}_arf_best"
 
-    echo "================================================="
-    echo "MODEL: $MODEL_NAME"
-    echo "================================================="
+    echo "=================================================" | tee -a "$LOG_FILE"
+    echo "MODEL: $MODEL_NAME" | tee -a "$LOG_FILE"
+    echo "Path:  $MODEL_PATH" | tee -a "$LOG_FILE"
+    echo "=================================================" | tee -a "$LOG_FILE"
 
     # ----------------------------------------------------------
     # 1. AdaRound Baseline (no flipping)
     # ----------------------------------------------------------
-    echo "==> STEP 1: AdaRound baseline for $MODEL_NAME"
-    mkdir -p "$BASELINE_OUT"
+    echo "==> STEP 1: AdaRound baseline for $MODEL_NAME" | tee -a "$LOG_FILE"
+    rm -rf "$BASELINE_OUT" && mkdir -p "$BASELINE_OUT"
     python adaround_xl.py \
         --model-path "$MODEL_PATH" \
         --output-dir "$BASELINE_OUT" \
         --n-calib "$N_CALIB" \
         --adaround-iters "$ADAROUND_ITERS" \
         --adaround-lr "$ADAROUND_LR" \
-        --layer-batch-size "$LAYER_BATCH_SIZE"
+        --layer-batch-size "$LAYER_BATCH_SIZE" 2>&1 | tee -a "$LOG_FILE"
 
-    echo "==> STEP 1b: Evaluating AdaRound baseline for $MODEL_NAME"
+    # 1a. PPL evaluation for baseline
+    echo "==> STEP 1a: PPL evaluation for $MODEL_NAME (AdaRound baseline)" | tee -a "$LOG_FILE"
+    python compare_slicing.py \
+        --heuristic-path "$BASELINE_OUT" 2>&1 | tee -a "$LOG_FILE"
+    echo "---------------------------------------" >> "$LOG_FILE"
+
+    # 1b. lm_eval for baseline
+    echo "==> STEP 1b: lm_eval for $MODEL_NAME (AdaRound baseline)" | tee -a "$LOG_FILE"
     python -m lm_eval --model hf \
         --model_args pretrained="$BASELINE_OUT" \
         --tasks "$TASKS" \
         --device cuda:0 \
         --batch_size auto \
-        --output_path "${RESULTS_DIR}/${MODEL_NAME}_adaround_baseline.json"
+        --output_path "${RESULTS_DIR}/${MODEL_NAME}_adaround_baseline.json" 2>&1 | tee -a "$LOG_FILE"
+    echo "---------------------------------------" >> "$LOG_FILE"
 
     rm -rf "$BASELINE_OUT"
 
     # ----------------------------------------------------------
     # 2. AdaRound + Flipping — best config (knee=0.01, flip=0.05)
     # ----------------------------------------------------------
-    echo "==> STEP 2: AdaRound+Flip (knee=${BEST_KNEE}, flip=${BEST_FLIP}) for $MODEL_NAME"
-    mkdir -p "$FLIP_OUT"
+    echo "==> STEP 2: AdaRound+Flip (knee=${BEST_KNEE}, flip=${BEST_FLIP}) for $MODEL_NAME" | tee -a "$LOG_FILE"
+    rm -rf "$FLIP_OUT" && mkdir -p "$FLIP_OUT"
     python adaround_flip_xl.py \
         --model-path "$MODEL_PATH" \
         --output-dir "$FLIP_OUT" \
@@ -69,20 +86,28 @@ eval_model() {
         --adaround-lr "$ADAROUND_LR" \
         --layer-batch-size "$LAYER_BATCH_SIZE" \
         --knee-tolerance "$BEST_KNEE" \
-        --max-flip-percent "$BEST_FLIP"
+        --max-flip-percent "$BEST_FLIP" 2>&1 | tee -a "$LOG_FILE"
 
-    echo "==> STEP 2b: Evaluating AdaRound+Flip for $MODEL_NAME"
+    # 2a. PPL evaluation for flip
+    echo "==> STEP 2a: PPL evaluation for $MODEL_NAME (AdaRound+Flip)" | tee -a "$LOG_FILE"
+    python compare_slicing.py \
+        --heuristic-path "$FLIP_OUT" 2>&1 | tee -a "$LOG_FILE"
+    echo "---------------------------------------" >> "$LOG_FILE"
+
+    # 2b. lm_eval for flip
+    echo "==> STEP 2b: lm_eval for $MODEL_NAME (AdaRound+Flip)" | tee -a "$LOG_FILE"
     python -m lm_eval --model hf \
         --model_args pretrained="$FLIP_OUT" \
         --tasks "$TASKS" \
         --device cuda:0 \
         --batch_size auto \
-        --output_path "${RESULTS_DIR}/${MODEL_NAME}_adaround_flip_k${BEST_KNEE}_f${BEST_FLIP}.json"
+        --output_path "${RESULTS_DIR}/${MODEL_NAME}_adaround_flip_k${BEST_KNEE}_f${BEST_FLIP}.json" 2>&1 | tee -a "$LOG_FILE"
+    echo "---------------------------------------" >> "$LOG_FILE"
 
     rm -rf "$FLIP_OUT"
 
-    echo "==> DONE: $MODEL_NAME"
-    echo ""
+    echo "==> DONE: $MODEL_NAME" | tee -a "$LOG_FILE"
+    echo "" | tee -a "$LOG_FILE"
 }
 
 # =============================================================
@@ -93,8 +118,12 @@ eval_model() {
 
 #eval_model "Mistral-7B-v0.3" \
 #    "/home/DATA/prometheus/anh/.cache/huggingface/hub/models--mistralai--Mistral-7B-v0.3/snapshots/caa1feb0e54d415e2df31207e5f4e273e33509b1"
-eval_model"Qwen2.5-7B" \
+
+eval_model "Qwen2.5-7B" \
     "/home/DATA/prometheus/anh/.cache/huggingface/hub/models--Qwen--Qwen2.5-7B/snapshots/d149729398750b98c0af14eb82c78cfe92750796"
 
 echo "================================================="
-echo "ALL EVALUATIONS COMPLETE. Results in: $RESULTS_DIR"
+echo "ALL EVALUATIONS COMPLETE."
+echo "Log:     $LOG_FILE"
+echo "Results: $RESULTS_DIR"
+echo "================================================="
