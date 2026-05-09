@@ -7,8 +7,8 @@ set -euo pipefail
 # --- Configuration ---
 TASKS="arc_challenge,arc_easy,boolq,hellaswag,lambada_openai,openbookqa,piqa,rte,winogrande"
 BASE_OUT="./quantized_models"
-RESULTS_DIR="./eval_results"
-LOG_FILE="./adaround_bc.log"
+RESULTS_DIR="./eval_results_qw"
+LOG_FILE="./adaround_bc_qw.log"
 
 mkdir -p "$BASE_OUT"
 mkdir -p "$RESULTS_DIR"
