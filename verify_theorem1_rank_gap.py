@@ -2,29 +2,29 @@
 E1 + E2: Verify Theorem 1 (Structural Rank Gap)
 ================================================
 
+PATCHED: streams XtX and x_sum per layer instead of holding raw activations.
+Memory per layer is d^2 * 4 bytes (fp32). For Llama-3-8B (d=4096, ~225 linears):
+~64 MB * 225 ≈ 14 GB total. Fits in normal RAM.
+
 Two tests in one script:
 
 E1. POPULATION OPTIMA COMPARISON.
     Compute the population-optimal BC and the population-optimal Flip
-    (both using HUGE calibration so sampling noise is negligible).
-    Predict: Flip optimum strictly < BC optimum, with the gap = projection
-    of E onto eigendirections of Sigma_xx that BC's rank-1 set cannot reach.
+    using calibration-derived Sigma_xx.
 
 E2. RANK-OF-CORRECTION ANALYSIS.
-    For each layer, decompose BC's correction and Flip's correction in
-    the eigenbasis of Sigma_xx. Show:
-      - BC's correction has ALL its mass on the constant direction 1/sqrt(d).
-      - Flip's correction spreads across many top eigendirections.
-    This is the geometric content of Theorem 1.
+    Decompose BC's correction and Flip's correction in the eigenbasis of
+    Sigma_xx. BC's mass is rank-1 on direction 1/sqrt(d); Flip's spans many
+    eigendirections.
 
 USAGE
 -----
 python verify_theorem1_rank_gap.py \\
-    --fp-model      ./models/Mistral-7B-v0.3 \\
+    --fp-model      ./models/Llama-3-8B \\
     --base-q-model  ./quantized_models/awq_base \\
     --sfa-q-model   ./quantized_models/awq_sfa \\
     --output        theorem1_results.csv \\
-    --n-calib       1024              # large, to make this a population-level test
+    --n-calib       512
 """
 
 import os, gc, argparse, random, csv
@@ -37,7 +37,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
 
 
-# ---------- Reused calibration utilities (same as v2/v3 scripts) ----------
+# ---------- Calibration text loader ----------
 def load_calibration_texts(tokenizer, n_samples=1024, seed=42):
     ds = load_dataset('wikitext', 'wikitext-2-raw-v1', split='train')
     texts = [item['text'] for item in ds if len(item['text'].strip()) > 100]
@@ -45,21 +45,43 @@ def load_calibration_texts(tokenizer, n_samples=1024, seed=42):
     return texts[:n_samples]
 
 
-class ActivationCollector:
+# ---------- Streaming sufficient-statistics collector ----------
+class StreamingStatsCollector:
+    """
+    Accumulates per-layer sufficient statistics:
+        XtX[name]      : [d, d] running sum of x x^T   (fp32, on CPU)
+        x_sum[name]    : [d]    running sum of x       (fp32, on CPU)
+        n_tokens[name] : int
+    """
     def __init__(self, model, max_tokens_per_sample=512):
         self.model = model
         self.max_tokens_per_sample = max_tokens_per_sample
-        self.activations = {}
+        self.XtX = {}
+        self.x_sum = {}
+        self.n_tokens = {}
         self.handles = []
 
     def _hook(self, name):
         def fn(_m, input, _out):
             inp = input[0] if isinstance(input, tuple) else input
             if inp.dim() == 3 and inp.shape[1] > self.max_tokens_per_sample:
-                idx = torch.randperm(inp.shape[1])[:self.max_tokens_per_sample].sort()[0]
+                idx = torch.randperm(inp.shape[1], device=inp.device)[
+                    :self.max_tokens_per_sample
+                ].sort()[0]
                 inp = inp[:, idx, :]
-            self.activations.setdefault(name, []).append(
-                inp.detach().reshape(-1, inp.shape[-1]).cpu().float())
+            x = inp.detach().reshape(-1, inp.shape[-1]).float()
+            xtx_chunk = (x.t() @ x).cpu()
+            xs_chunk  = x.sum(dim=0).cpu()
+            n_chunk   = x.shape[0]
+
+            if name in self.XtX:
+                self.XtX[name].add_(xtx_chunk)
+                self.x_sum[name].add_(xs_chunk)
+                self.n_tokens[name] += n_chunk
+            else:
+                self.XtX[name]   = xtx_chunk
+                self.x_sum[name] = xs_chunk
+                self.n_tokens[name] = n_chunk
         return fn
 
     def register(self):
@@ -71,11 +93,25 @@ class ActivationCollector:
         for h in self.handles: h.remove()
         self.handles = []
 
-    def get(self, name):
-        if name not in self.activations or len(self.activations[name]) == 0: return None
-        return torch.cat(self.activations[name], dim=0)
+    def get_stats(self, name):
+        """Returns (Sigma, mu, N) where Sigma = E[xx^T]."""
+        if name not in self.XtX: return None
+        N = self.n_tokens[name]
+        if N < 1: return None
+        Sigma = self.XtX[name] / N
+        mu    = self.x_sum[name] / N
+        return Sigma, mu, N
 
-    def clear(self): self.activations = {}
+    def free(self, name):
+        self.XtX.pop(name, None)
+        self.x_sum.pop(name, None)
+        self.n_tokens.pop(name, None)
+
+    def names(self):
+        return list(self.XtX.keys())
+
+    def clear(self):
+        self.XtX.clear(); self.x_sum.clear(); self.n_tokens.clear()
 
 
 def run_calibration(model, tokenizer, collector, texts, device, max_length=512):
@@ -104,115 +140,93 @@ def get_weights(model):
 
 # ---------- Core measurement: population-level rank-gap test ----------
 @torch.no_grad()
-def measure_rank_gap(X, W_fp, W_base, W_sfa, top_k_eig=64):
+def measure_rank_gap(Sigma, W_fp, W_base, W_sfa, top_k_eig=64):
     """
-    Returns a dict with:
-      - R_base       : tr(E^T Sigma_xx E)               (no correction)
-      - R_bc_opt     : population-OPTIMAL BC residual
-      - R_flip_opt   : SFA-realized residual (operates as our 'Flip')
-      - rank1_bc     : fraction of |BC correction|^2 mass on dir 1/sqrt(d)
-      - rank_flip    : effective rank of Flip's correction in Sigma_xx eigenbasis
-      - spectrum_E   : E^T E top-k singular values (for context)
+    Sigma : [d, d] empirical E[xx^T] from calibration
+    W_*   : [out, d]
     """
     use_gpu = torch.cuda.is_available()
     if use_gpu:
-        bytes_needed = (X.shape[0] * X.shape[1] + 3 * W_fp.numel()) * 4
+        bytes_needed = (Sigma.numel() + 3 * W_fp.numel()) * 4
         if bytes_needed < 6 * (1024**3):
-            X = X.cuda(); W_fp = W_fp.cuda(); W_base = W_base.cuda(); W_sfa = W_sfa.cuda()
+            Sigma  = Sigma.cuda()
+            W_fp   = W_fp.cuda()
+            W_base = W_base.cuda()
+            W_sfa  = W_sfa.cuda()
         else:
             use_gpu = False
 
-    N, d = X.shape
-    out = W_fp.shape[0]
+    d = Sigma.shape[0]
 
     E_base = W_base - W_fp
-    E_flip = W_sfa  - W_fp        # this is E + DeltaW for Flip
-    DeltaW_flip = W_sfa - W_base   # Flip's correction operator
+    E_flip = W_sfa  - W_fp
+    DeltaW_flip = W_sfa - W_base
 
-    # --- Sigma_xx eigen-decomp ---
-    # Note: we use the EMPIRICAL test-side covariance (X here was collected
-    # on the same activations the methods saw at calibration, so this is
-    # the BEST CASE for sampling - results should be a LOWER BOUND on the gap).
-    mu = X.mean(dim=0, keepdim=True)
-    Xc = X - mu
-    Sigma = (Xc.t() @ Xc) / N + mu.t() @ mu          # E[xx^T] = Cov + mu mu^T
-
-    # Eigendecomp (top_k_eig)
+    # --- Eigendecomp of Sigma ---
     try:
         eigvals, eigvecs = torch.linalg.eigh(Sigma.float())
-        # eigh returns ascending; reverse
         eigvals = eigvals.flip(0); eigvecs = eigvecs.flip(1)
     except Exception:
-        # fallback to SVD on X
-        U, S, Vh = torch.linalg.svd(Xc, full_matrices=False)
-        eigvals = (S * S) / N
-        eigvecs = Vh.t()
+        eigvals_c, eigvecs_c = torch.linalg.eig(Sigma.float())
+        eigvals = eigvals_c.real; eigvecs = eigvecs_c.real
+        order = torch.argsort(eigvals, descending=True)
+        eigvals = eigvals[order]; eigvecs = eigvecs[:, order]
 
-    top_eigvals = eigvals[:top_k_eig]
     top_eigvecs = eigvecs[:, :top_k_eig]
 
     # --- E1: residuals R(DeltaW) = tr(E_eff^T Sigma E_eff) ---
-    # Use the full-rank trace formula; on GPU memory budget is fine.
     def trace_quad(Eeff):
-        # tr(Eeff^T Sigma Eeff) = sum_{j,i} (Sigma @ Eeff^T)_{i, j} Eeff_{j, i}
-        # Cheaper: trace = sum over j of e_j^T Sigma e_j
         return (Eeff @ Sigma * Eeff).sum().item()
 
-    R_base    = trace_quad(E_base)
-    R_flip    = trace_quad(E_flip)
+    R_base = trace_quad(E_base)
+    R_flip = trace_quad(E_flip)
 
-    # Population-optimal BC: c_j minimizes (e_j + c_j * 1/d)^T Sigma (e_j + c_j * 1/d)
-    # d/dc_j = 0 ->  c_j = - d * (e_j^T Sigma 1) / (1^T Sigma 1)
+    # Population-optimal BC: c_j = -d * (e_j^T Sigma 1) / (1^T Sigma 1)
     ones = torch.ones(d, device=Sigma.device, dtype=Sigma.dtype)
-    s11 = ones @ Sigma @ ones                        # scalar
-    s_e1 = E_base @ Sigma @ ones                     # [out]
-    c_opt = -d * s_e1 / s11                          # [out]
-    DeltaW_bc_opt = (c_opt / d).unsqueeze(1) * ones.unsqueeze(0)   # [out, d]
+    s11  = ones @ Sigma @ ones
+    s_e1 = E_base @ Sigma @ ones
+    c_opt = -d * s_e1 / s11
+    DeltaW_bc_opt = (c_opt / d).unsqueeze(1) * ones.unsqueeze(0)
     E_bc_opt = E_base + DeltaW_bc_opt
     R_bc_opt = trace_quad(E_bc_opt)
 
-    # --- E2: rank analysis of corrections ---
-    # BC: by construction rank-1 (all rows are scaled copies of ones / d)
-    # Flip: project DeltaW_flip onto eigenbasis of Sigma
-    # For each row: ||DeltaW_j||^2 = sum_k <DeltaW_j, v_k>^2  (full basis)
-    # We measure energy in top-k_eig basis.
-    DeltaW_flip_in_eig = DeltaW_flip @ top_eigvecs    # [out, top_k_eig]
-    energy_per_eig = DeltaW_flip_in_eig.pow(2).sum(dim=0)   # [top_k_eig]
-    total_energy = DeltaW_flip.pow(2).sum().item()
-    if total_energy > 1e-12:
-        energy_per_eig = energy_per_eig / total_energy
-    energy_top1 = energy_per_eig[0].item()
-    energy_top10 = energy_per_eig[:10].sum().item()
-    energy_top64 = energy_per_eig.sum().item()
-    # Effective rank: exp(-sum p log p) where p = normalized energy
-    p = energy_per_eig / energy_per_eig.sum().clamp(min=1e-12)
-    eff_rank = torch.exp(-(p * (p + 1e-12).log()).sum()).item()
+    # --- E2: rank-of-correction in Sigma's eigenbasis ---
+    # Flip
+    DeltaW_flip_in_eig = DeltaW_flip @ top_eigvecs
+    energy_flip = DeltaW_flip_in_eig.pow(2).sum(dim=0)
+    total_flip = DeltaW_flip.pow(2).sum().item()
+    if total_flip > 1e-12:
+        energy_flip = energy_flip / total_flip
+    energy_flip_top1  = energy_flip[0].item()
+    energy_flip_top10 = energy_flip[:10].sum().item()
+    energy_flip_top64 = energy_flip.sum().item()
+    p_flip = energy_flip / energy_flip.sum().clamp(min=1e-12)
+    eff_rank_flip = torch.exp(-(p_flip * (p_flip + 1e-12).log()).sum()).item()
 
-    # BC rank check: project DeltaW_bc_opt onto eigenbasis
+    # BC
     DeltaW_bc_in_eig = DeltaW_bc_opt @ top_eigvecs
-    energy_bc_per_eig = DeltaW_bc_in_eig.pow(2).sum(dim=0)
+    energy_bc = DeltaW_bc_in_eig.pow(2).sum(dim=0)
     total_bc = DeltaW_bc_opt.pow(2).sum().item()
     if total_bc > 1e-12:
-        energy_bc_per_eig = energy_bc_per_eig / total_bc
-    p_bc = energy_bc_per_eig / energy_bc_per_eig.sum().clamp(min=1e-12)
+        energy_bc = energy_bc / total_bc
+    p_bc = energy_bc / energy_bc.sum().clamp(min=1e-12)
     eff_rank_bc = torch.exp(-(p_bc * (p_bc + 1e-12).log()).sum()).item()
 
     if use_gpu:
-        del X, W_fp, W_base, W_sfa, Sigma, eigvecs
+        del Sigma, W_fp, W_base, W_sfa, eigvecs, top_eigvecs
         torch.cuda.empty_cache()
 
     return {
-        'R_base':      R_base,
-        'R_flip':      R_flip,
-        'R_bc_opt':    R_bc_opt,
-        # The structural-gap claim: R_bc_opt > R_flip_opt should hold population-wise
-        'gap_flip_vs_bc':  R_bc_opt - R_flip,
-        'gap_pct': (R_bc_opt - R_flip) / max(R_bc_opt, 1e-12) * 100,
-        'flip_top1_energy':  energy_top1,
-        'flip_top10_energy': energy_top10,
-        'flip_top64_energy': energy_top64,
-        'flip_effective_rank':  eff_rank,
-        'bc_effective_rank':    eff_rank_bc,   # should be ~1
+        'R_base':             R_base,
+        'R_flip':             R_flip,
+        'R_bc_opt':           R_bc_opt,
+        'gap_flip_vs_bc':     R_bc_opt - R_flip,
+        'gap_pct':            (R_bc_opt - R_flip) / max(R_bc_opt, 1e-12) * 100,
+        'flip_top1_energy':   energy_flip_top1,
+        'flip_top10_energy':  energy_flip_top10,
+        'flip_top64_energy':  energy_flip_top64,
+        'flip_effective_rank': eff_rank_flip,
+        'bc_effective_rank':   eff_rank_bc,
     }
 
 
@@ -220,11 +234,11 @@ def measure_rank_gap(X, W_fp, W_base, W_sfa, top_k_eig=64):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--fp-model",      required=True)
-    ap.add_argument("--base-q-model",  required=True)
+    ap.add_argument("--base-q-model",  required=True,
+                    help="Vanilla AWQ (no BC). Provides E_base for analytical BC-opt.")
     ap.add_argument("--sfa-q-model",   required=True)
     ap.add_argument("--output",        default="theorem1_results.csv")
-    ap.add_argument("--n-calib",       type=int, default=1024,
-                    help="Large by default — we want population-scale stats.")
+    ap.add_argument("--n-calib",       type=int, default=512)
     ap.add_argument("--max-tokens",    type=int, default=512)
     ap.add_argument("--max-length",    type=int, default=512)
     ap.add_argument("--top-k-eig",     type=int, default=64)
@@ -246,13 +260,11 @@ def main():
         device_map="auto", trust_remote_code=True,
     ).eval()
 
-    print("\n[2/4] Collecting LARGE-SCALE activations...")
+    print("\n[2/4] Streaming activation statistics (XtX, x_sum per layer)...")
     texts = load_calibration_texts(tokenizer, n_samples=args.n_calib, seed=args.seed)
-    collector = ActivationCollector(fp_model, max_tokens_per_sample=args.max_tokens)
+    collector = StreamingStatsCollector(fp_model, max_tokens_per_sample=args.max_tokens)
     run_calibration(fp_model, tokenizer, collector, texts, args.device, args.max_length)
-    activations = {n: collector.get(n) for n in collector.activations}
-    collector.clear()
-    print(f"  Collected for {len(activations)} layers")
+    print(f"  Collected stats for {len(collector.names())} layers")
 
     print("\n[3/4] Loading FP / base-Q / Flip-Q weights...")
     W_fp_dict   = get_weights(fp_model)
@@ -262,6 +274,7 @@ def main():
         args.base_q_model, torch_dtype=torch.bfloat16, device_map="cpu",
         trust_remote_code=True).eval()
     W_base_dict = get_weights(base_q); del base_q; gc.collect()
+
     sfa_q = AutoModelForCausalLM.from_pretrained(
         args.sfa_q_model, torch_dtype=torch.bfloat16, device_map="cpu",
         trust_remote_code=True).eval()
@@ -269,26 +282,35 @@ def main():
     torch.cuda.empty_cache()
 
     print("\n[4/4] Per-layer rank-gap measurement...")
+    stat_names = set(collector.names())
     common = [n for n in W_fp_dict if n in W_base_dict and n in W_sfa_dict
-              and activations.get(n) is not None]
+              and n in stat_names]
     print(f"  Layers: {len(common)}")
 
     rows = []
     for name in tqdm(common, desc="  Layers"):
-        X = activations[name]
-        if X.shape[0] < 16: continue
+        stats_tuple = collector.get_stats(name)
+        if stats_tuple is None: continue
+        Sigma, mu, N = stats_tuple
+        if N < 16:
+            collector.free(name); continue
         try:
-            stats = measure_rank_gap(X, W_fp_dict[name], W_base_dict[name],
+            stats = measure_rank_gap(Sigma, W_fp_dict[name], W_base_dict[name],
                                      W_sfa_dict[name], top_k_eig=args.top_k_eig)
         except Exception as exc:
             print(f"\n  ⚠️  {name}: {exc}")
-            continue
+            collector.free(name); continue
         rows.append({'layer': name,
-                     'd': W_fp_dict[name].shape[1],
+                     'd':   W_fp_dict[name].shape[1],
                      'out': W_fp_dict[name].shape[0],
-                     'N': X.shape[0],
+                     'N':   N,
                      **stats})
-        activations[name] = None
+        # free this layer's stats and weight copies
+        collector.free(name)
+        W_fp_dict[name]   = None
+        W_base_dict[name] = None
+        W_sfa_dict[name]  = None
+        del Sigma, mu
         gc.collect()
 
     if not rows: print("\n❌ No rows."); return
@@ -309,11 +331,12 @@ def main():
     R_flip   = np.array([r['R_flip']   for r in rows])
 
     print(f"\n[Total test-time output error, summed across layers]")
-    print(f"  No correction   : {R_base.sum():.4e}")
+    print(f"  No correction      : {R_base.sum():.4e}")
     print(f"  BC (population-opt): {R_bc_opt.sum():.4e}   "
           f"({(R_bc_opt.sum() - R_base.sum())/R_base.sum()*100:+.3f}% vs base)")
-    print(f"  Flip (realized) : {R_flip.sum():.4e}   "
+    print(f"  Flip (realized)    : {R_flip.sum():.4e}   "
           f"({(R_flip.sum() - R_base.sum())/R_base.sum()*100:+.3f}% vs base)")
+
     print(f"\n[Theorem 1 prediction: Flip < BC at population]")
     gaps_pct = np.array([r['gap_pct'] for r in rows])
     print(f"  Gap (BC_opt - Flip) / BC_opt :  median={np.median(gaps_pct):.3f}%, "
