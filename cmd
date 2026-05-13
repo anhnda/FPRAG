@@ -48,7 +48,8 @@ C4              7.8180          7.8069               +0.142%  Tie
   python adaround_flip_xl.py \
     --model-path /home/DATA/prometheus/anh/.cache/huggingface/hub/models--mistralai--Mistral-7B-v0.3/snapshots/caa1feb0e54d415e2df31207e5f4e273e33509b1 \
     --output-dir ./quantized_models/Mistral-7B_arf \
-    --n-calib 128 \
+    --n-calib 128 \/home/DATA/prometheus/anh/.cache/huggingface/hub/models--meta-llama--Meta-Llama-3-8B/snapshots/8cde5ca8380496c9a6cc7ef3a8b46a0372a1d920 \
+ 
     --adaround-iters 10000 \
     --adaround-lr 1e-3 \
     --layer-batch-size 16 --skip-lmhead
@@ -60,8 +61,7 @@ C4              7.8180          7.8069               +0.142%  Tie
     --standard-path ./quantized_models/Mistral-7B_arf 
 
   python adaround_xl.py \
-    --model-path /home/DATA/prometheus/anh/.cache/huggingface/hub/models--meta-llama--Meta-Llama-3-8B/snapshots/8cde5ca8380496c9a6cc7ef3a8b46a0372a1d920 \
-    --output-dir ./quantized_models/Llama-3-8B_ar \
+    --model-path    --output-dir ./quantized_models/Llama-3-8B_ar \
     --n-calib 128 \
     --adaround-iters 10000 \
     --adaround-lr 1e-3 \
