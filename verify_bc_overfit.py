@@ -148,11 +148,12 @@ def run_forward_for_batch(model, tokenizer, texts, collector, device, max_length
 # ----------------------------------------------------------------------------
 # Module lookup helpers
 # ----------------------------------------------------------------------------
-def list_common_linear_names(fp_model, q_model):
+def list_common_linear_names(fp_model, q_model, exclude=('lm_head', 'embed_tokens')):
     fp_names = {n for n, m in fp_model.named_modules() if isinstance(m, nn.Linear)}
     q_names = {n for n, m in q_model.named_modules() if isinstance(m, nn.Linear)}
-    return sorted(fp_names & q_names)
-
+    common = fp_names & q_names
+    common = {n for n in common if not any(tok in n for tok in exclude)}
+    return sorted(common)
 
 # ----------------------------------------------------------------------------
 # Flip on already-quantized weights
