@@ -163,32 +163,67 @@ class ActivationRecorder:
         record_full_cov: bool = True,
         max_tokens_per_module: int = 100_000,
         dtype: torch.dtype = torch.float32,
+        flush_every_tokens: int = 16_384,
+        cov_device: Optional[torch.device] = None,
     ):
+        """
+        record_full_cov: if True, accumulate full d×d second moment for T5.
+        flush_every_tokens: how often to flush the GPU accumulator to CPU fp64.
+            Smaller values are safer (lower peak GPU memory) but slower.
+        cov_device: where to keep the running second-moment matrix during a
+            forward pass. Default: same GPU as the activations. The final
+            fp64 accumulator always lives on CPU.
+        """
         self.module_names = module_names
         self.record_full_cov = record_full_cov
         self.max_tokens_per_module = max_tokens_per_module
         self.dtype = dtype
+        self.flush_every_tokens = flush_every_tokens
+        self.cov_device = cov_device
         self.stats: Dict[str, Dict] = {}
         self._handles = []
 
     def _ensure_init(self, name: str, d: int, device: torch.device):
         if name in self.stats:
             return
+        # Final accumulators on CPU in fp64 (numerically stable, no GPU pressure).
         entry = {
             "n": 0,
-            "sum_x": torch.zeros(d, dtype=torch.float64, device="cpu"),
-            "sum_xx_diag": torch.zeros(d, dtype=torch.float64, device="cpu"),
+            "sum_x_cpu": torch.zeros(d, dtype=torch.float64, device="cpu"),
+            "sum_xx_diag_cpu": torch.zeros(d, dtype=torch.float64, device="cpu"),
             "d": d,
         }
+        cov_dev = self.cov_device if self.cov_device is not None else device
+        # Working buffers on GPU in fp32 (fast).
+        entry["buf_sum_x"] = torch.zeros(d, dtype=torch.float32, device=cov_dev)
+        entry["buf_sum_xx_diag"] = torch.zeros(d, dtype=torch.float32, device=cov_dev)
+        entry["buf_n"] = 0
+        entry["cov_device"] = cov_dev
         if self.record_full_cov:
-            entry["sum_xxT"] = torch.zeros(d, d, dtype=torch.float64, device="cpu")
+            entry["sum_xxT_cpu"] = torch.zeros(d, d, dtype=torch.float64, device="cpu")
+            entry["buf_sum_xxT"] = torch.zeros(d, d, dtype=torch.float32, device=cov_dev)
         self.stats[name] = entry
+
+    def _flush(self, entry: Dict):
+        """Move GPU fp32 buffers into CPU fp64 totals and zero the buffers."""
+        if entry["buf_n"] == 0:
+            return
+        entry["sum_x_cpu"] += entry["buf_sum_x"].double().cpu()
+        entry["sum_xx_diag_cpu"] += entry["buf_sum_xx_diag"].double().cpu()
+        entry["buf_sum_x"].zero_()
+        entry["buf_sum_xx_diag"].zero_()
+        if self.record_full_cov:
+            entry["sum_xxT_cpu"] += entry["buf_sum_xxT"].double().cpu()
+            entry["buf_sum_xxT"].zero_()
+        entry["n"] += entry["buf_n"]
+        entry["buf_n"] = 0
 
     def _hook(self, name: str):
         def hook(_module, inputs, _output):
             x = inputs[0] if isinstance(inputs, tuple) else inputs
             if x.dim() == 3:
                 x = x.reshape(-1, x.shape[-1])
+            # Keep on GPU; only convert dtype.
             x = x.detach().to(self.dtype)
 
             entry = self.stats.get(name)
@@ -196,20 +231,29 @@ class ActivationRecorder:
                 self._ensure_init(name, x.shape[-1], x.device)
                 entry = self.stats[name]
 
-            # Subsample tokens if too many already captured
-            remaining = self.max_tokens_per_module - entry["n"]
+            # Stop accumulating once we've already captured enough tokens.
+            already = entry["n"] + entry["buf_n"]
+            remaining = self.max_tokens_per_module - already
             if remaining <= 0:
                 return
             if x.shape[0] > remaining:
                 idx = torch.randperm(x.shape[0], device=x.device)[:remaining]
                 x = x[idx]
 
-            x64 = x.double().cpu()
-            entry["n"] += x64.shape[0]
-            entry["sum_x"] += x64.sum(dim=0)
-            entry["sum_xx_diag"] += (x64 * x64).sum(dim=0)
+            # Move x to the covariance device if needed (usually same GPU).
+            if x.device != entry["cov_device"]:
+                x = x.to(entry["cov_device"])
+
+            entry["buf_n"] += x.shape[0]
+            entry["buf_sum_x"] += x.sum(dim=0)
+            entry["buf_sum_xx_diag"] += (x * x).sum(dim=0)
             if self.record_full_cov:
-                entry["sum_xxT"] += x64.T @ x64
+                # GPU fp32 GEMM — this is the expensive op, but it's fast on GPU.
+                entry["buf_sum_xxT"].addmm_(x.t(), x)
+
+            # Periodic flush to keep GPU buffers bounded.
+            if entry["buf_n"] >= self.flush_every_tokens:
+                self._flush(entry)
         return hook
 
     def attach(self, model: nn.Module):
@@ -228,28 +272,78 @@ class ActivationRecorder:
         """Returns per-module dict with keys: mu (d,), Exx_diag (d,), Sigma (d,d) or None, n."""
         out = {}
         for name, e in self.stats.items():
+            self._flush(e)  # drain any GPU residue
             n = max(e["n"], 1)
-            mu = (e["sum_x"] / n).float()
-            Exx_diag = (e["sum_xx_diag"] / n).float()
+            mu = (e["sum_x_cpu"] / n).float()
+            Exx_diag = (e["sum_xx_diag_cpu"] / n).float()
             sigma = None
-            if self.record_full_cov and "sum_xxT" in e:
-                ExxT = (e["sum_xxT"] / n)
+            if self.record_full_cov and "sum_xxT_cpu" in e:
+                ExxT = (e["sum_xxT_cpu"] / n)
                 sigma = (ExxT - torch.outer(mu.double(), mu.double())).float()
             out[name] = {
                 "mu": mu, "Exx_diag": Exx_diag, "Sigma": sigma, "n": n, "d": e["d"]
             }
+            # Free GPU working buffers — they're large.
+            for k in ("buf_sum_x", "buf_sum_xx_diag", "buf_sum_xxT"):
+                if k in e:
+                    del e[k]
+        torch.cuda.empty_cache()
         return out
 
 
 # ----------------------------------------------------------------------------- 
 # Module selection
 # -----------------------------------------------------------------------------
-def select_modules(model: nn.Module, patterns: List[str], max_layers: int) -> List[str]:
+# Module names that should never be analyzed by this script, regardless of
+# the user-supplied pattern:
+#   - lm_head (and equivalents): huge [vocab, hidden] Linear. Memory blowup
+#     in analyze_layer's intermediates; needs the chunked treatment from
+#     awq_*_xl.quantize_lmhead_half_by_half, which we don't reimplement here.
+#   - embed_tokens: nn.Embedding, not nn.Linear in HF, but some custom models
+#     wrap it as Linear. The theory's notion of "output channel j" is ill-
+#     defined for a vocabulary table.
+DEFAULT_EXCLUDE_PATTERNS = (
+    "lm_head",
+    "*.lm_head",
+    "embed_tokens",
+    "*.embed_tokens",
+    "embed_out",
+    "*.embed_out",
+)
+
+
+def select_modules(model: nn.Module, patterns: List[str], max_layers: int,
+                    extra_exclude: List[str] = None) -> List[str]:
+    """
+    Pick nn.Linear modules whose names match any pattern in `patterns`, then
+    drop anything matched by DEFAULT_EXCLUDE_PATTERNS or `extra_exclude`.
+
+    The exclusion is unconditional: even if the user passes a pattern that
+    matches lm_head, we refuse to analyze it (see DEFAULT_EXCLUDE_PATTERNS
+    comment for why). A warning is printed in that case.
+    """
     all_linear = [n for n, m in model.named_modules() if isinstance(m, nn.Linear)]
+    exclude = list(DEFAULT_EXCLUDE_PATTERNS) + (extra_exclude or [])
+
     selected = []
+    rejected_by_user_pattern = []
     for n in all_linear:
-        if any(fnmatch.fnmatch(n, p) for p in patterns):
-            selected.append(n)
+        if not any(fnmatch.fnmatch(n, p) for p in patterns):
+            continue
+        if any(fnmatch.fnmatch(n, p) for p in exclude):
+            rejected_by_user_pattern.append(n)
+            continue
+        selected.append(n)
+
+    if rejected_by_user_pattern:
+        print(f"  [warn] {len(rejected_by_user_pattern)} module(s) matched the "
+              f"include pattern but were force-excluded "
+              f"(lm_head/embed_tokens etc.):")
+        for n in rejected_by_user_pattern:
+            print(f"          {n}")
+        print(f"          (analyze_layer's intermediates would OOM on these. "
+              f"To override, edit DEFAULT_EXCLUDE_PATTERNS in the source.)")
+
     if max_layers > 0 and len(selected) > max_layers:
         # Spread the picks across depth instead of taking only the first N.
         idx = np.linspace(0, len(selected) - 1, max_layers).round().astype(int)
@@ -816,7 +910,11 @@ def main():
     parser.add_argument("--max-layers", type=int, default=8,
                         help="Cap the number of layers we analyze (spread across depth). 0 = no cap.")
     parser.add_argument("--no-full-cov", action="store_true",
-                        help="Skip d×d covariance storage; use diagonal approximation for T5.")
+                        help="Skip d×d covariance storage; use diagonal approximation for T5. "
+                             "Recommended on Llama-3-8B / d>=4096 if GPU is <= 40GB.")
+    parser.add_argument("--flush-every-tokens", type=int, default=16_384,
+                        help="How often to flush GPU fp32 covariance buffers to CPU fp64. "
+                             "Smaller = less GPU peak, more CPU<->GPU copies.")
     parser.add_argument("--out-dir", type=str, default="./flip_vs_bc_results")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
@@ -881,7 +979,8 @@ def main():
     print(f"\n[3/5] Capturing CALIBRATION activations from: {args.cal_dataset}")
     cal_texts = load_text_samples(args.cal_dataset, args.n_cal, args.seed)
     cal_recorder = ActivationRecorder(module_names, record_full_cov=False,
-                                      max_tokens_per_module=args.max_cal_tokens_per_layer)
+                                      max_tokens_per_module=args.max_cal_tokens_per_layer,
+                                      flush_every_tokens=args.flush_every_tokens)
     run_calibration(model, tokenizer, cal_texts, cal_recorder, device, args.max_length)
     cal_stats = cal_recorder.finalize()
 
@@ -892,7 +991,8 @@ def main():
         print(f"  -- {eval_name} --")
         eval_texts = load_text_samples(eval_name, args.n_eval, args.seed + 1)
         rec = ActivationRecorder(module_names, record_full_cov=record_full_cov,
-                                 max_tokens_per_module=args.max_eval_tokens_per_layer)
+                                 max_tokens_per_module=args.max_eval_tokens_per_layer,
+                                 flush_every_tokens=args.flush_every_tokens)
         run_calibration(model, tokenizer, eval_texts, rec, device, args.max_length)
         finalized = rec.finalize()
         for n in module_names:
