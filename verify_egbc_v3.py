@@ -491,7 +491,7 @@ CHECKS performed:
               f"({100*(s['sum_T_before']-s['sum_T_after'])/max(s['sum_T_before'],1e-30):+.3f}%)")
         print(f"")
         print(f"    Algorithmic invariant (sign(Δ) = -sign(e) on support):")
-        print(f"        max sign violation per layer = {max(r['sign_violation_on_support'] for r in [x for x in summary.values()][0:1]):.2e}  (should be 0)")
+        print(f"        max sign violation across layers = {s['sign_violation_max']:.2e}  (should be 0)")
 
     # ----- Verdict -----
     print()
