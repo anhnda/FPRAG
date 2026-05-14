@@ -1,34 +1,42 @@
 """
 Paper-ready EGBC verification.
 
-This script produces the LAYER-LEVEL empirical evidence backing the paper's two
-theorems and the universality claim. Output is structured so each headline
-number maps directly to a sentence in the paper.
+This script produces the LAYER-LEVEL empirical evidence backing the paper's
+single main theorem and its supporting lemmas + assumption.
 
 ═══════════════════════════════════════════════════════════════════════════════
 What the paper claims (and what this script verifies, layer-wise):
 ═══════════════════════════════════════════════════════════════════════════════
 
-THEOREM 1 (Controlled bias–variance trade-off).  For every linear layer:
-  (i)  Bias term descends:                B(W_q')   ≤   B(W_q)
-  (ii) Variance term is budget-controlled: |V(W_q') − V(W_q)|  ≤  RHS_T1
+THEOREM 1 (EGBC reduces expected output error in expectation across layers).
+For any lattice-valued base quantizer Q, the expected layer output error
+strictly decreases on average across the layers of a model.
 
-  Where, summed over output channels:
-     B(W_q)   :=  Σ_j (μ^⊤ e_j)²                       — bias term
-     V(W_q)   :=  Σ_j  e_j^⊤ Σ e_j                     — variance term
-     RHS_T1   :=  Σ_j  [ 2 B_j s_max ‖Σe_j‖∞ + B_j² s_max² ‖Σ‖∞ ]
-     e_j      :=  (W_q − W)[:, j]  (per-channel rounding error)
+The theorem is supported by three lemmas and one assumption:
 
-EMPIRICAL OBSERVATION (Net descent + favorable variance).  In practice:
-  (iii) Total layer L2 loss descends:     B(W_q') + V(W_q')  <  B(W_q) + V(W_q)
-  (iv)  Variance does not increase on average:    V(W_q')  ≤  V(W_q)
+  LEMMA 1 (Bias descent, per layer).
+      B(W_q')  ≤  B(W_q)            where B(W_q) := Σ_j (μ^⊤ e_j)²
+      [algorithmic guarantee — should be 100% on every layer]
 
-These are not provable in worst-case (the bound in (ii) is symmetric in sign
-and loose), but the paper claims them as a directly observed empirical fact
-that bridges per-layer structure to end-to-end PPL improvement.
+  LEMMA 2 (Variance perturbation bound, per layer).
+      |V(W_q') − V(W_q)|  ≤  2 B_j s_max ‖Σe_j‖∞ + B_j² s_max² ‖Σ‖∞
+      where V(W_q) := Σ_j e_j^⊤ Σ e_j
+      [algorithmic guarantee — should be 100% on every layer]
 
-THEOREM 2 (Universal post-correction).  Facts (i)(ii)(iii)(iv) hold for ANY
-lattice-valued base quantizer Q.  We verify across Q ∈ {NTR, AWQ}.
+  LEMMA 3 (Lattice closure & universal composability).
+      W_q' ∈ L^{d×C}, the same lattice as W_q.
+      Lemmas 1 & 2 hold for any base Q ∈ {NTR, AWQ, GPTQ, AdaRound, FlatQuant}.
+      [structural — 100% by construction]
+
+  ASSUMPTION A (Decorrelation of flip direction and variance direction).
+      Define  α_ℓ := ⟨Δ_ℓ, Σ_ℓ E_ℓ⟩_F / (‖Δ_ℓ‖_F · ‖Σ_ℓ E_ℓ‖_F)  ∈ [-1, 1].
+      Assume  E_ℓ[α_ℓ]  ≤  0  across the layers ℓ of the model.
+      [must be empirically verified; this script measures α_ℓ per layer]
+
+  CONCLUSION (Theorem 1):
+      E_ℓ[R(W_q'^(ℓ))]  ≤  E_ℓ[R(W_q^(ℓ))]   where R := B + V,
+      with strict inequality under the dominance condition
+      E_ℓ[|ΔB_ℓ|] > E_ℓ[‖Δ_ℓ‖_F² · ‖Σ_ℓ‖_2].
 
 ═══════════════════════════════════════════════════════════════════════════════
 Output structure:
@@ -36,24 +44,25 @@ Output structure:
 
 For each (base, mode) ∈ {NTR, AWQ} × {insample, crossval}:
 
-  Fact (i):    # layers with B(W_q') ≤ B(W_q)       / total      [Theorem 1(i)]
-  Fact (ii):   # layers with |ΔV| ≤ RHS_T1          / total      [Theorem 1(ii)]
-  Fact (iii):  # layers with total L2 strict ↓       / total      [Empirical]
-  Fact (iv):   # layers with V(W_q') ≤ V(W_q)        / total      [Empirical]
+  Per-layer table: tick for L1, L2, L3, and the alignment α_ℓ.
+  Headline block:
+     – Lemma 1 frac of layers
+     – Lemma 2 frac of layers
+     – Lemma 3 frac of layers
+     – Assumption A statistics: mean(α), std(α), frac. of layers with α ≤ 0
+     – Dominance condition: ratio E[|ΔB|] / E[‖Δ‖² ‖Σ‖]
+     – Theorem 1 conclusion (empirical): frac layers with total-L2 ↓ and avg ΔT/T
+     – Aggregate totals across layers (B, V, T)
 
-  Magnitudes (averaged over layers):
-     ΔB / B(W_q)  — relative bias reduction
-     ΔV / V(W_q)  — relative variance change (signed)
-     ΔT / T(W_q)  — relative total-loss reduction
-
-Theorem 2 verdict:  PASS iff Facts (i),(ii),(iii),(iv) ≥ 95% on insample
-                    rows for EVERY base in --base-quantizers.
+Verdict PASSES iff, on insample mode and for every base, all five gating
+checks (Lemmas 1/2/3, Assumption A, and the Theorem 1 conclusion) clear
+the threshold (default 95%).
 
 Cross-eval (crossval mode) is reported as ROBUSTNESS, not the theorem.
 
 ═══════════════════════════════════════════════════════════════════════════════
 Usage:
-  python verify_egbc_paper.py \\
+  python verify_egbc_final.py \\
       --model-path ./models/Mistral-7B-v0.3 \\
       --cal-dataset c4 --eval-datasets c4-val wikitext2 \\
       --n-cal 128 --n-eval 128 --max-length 1024 \\
@@ -187,7 +196,22 @@ def measure_layer(
     T_before = B_before + V_before
     T_after = B_after + V_after
 
-    # ----- Variance bound RHS (per-channel summed) -------------------------
+    # ----- Lemma 3 (lattice closure) check --------------------------------
+    # Reconstruct W_q' integer codes and confirm they are integers in [0, max_int].
+    # If lattice closure holds, |Δ / scale| is integer-valued (entry-wise).
+    max_int = 2 ** bits - 1
+    if base == "awq":
+        # Δ in original space; the integer step is Δ * s_vec / scale_flat
+        delta_int_pred = (Delta * s_vec.unsqueeze(0).double() / scale_flat.double())
+    else:
+        delta_int_pred = (Delta / scale_flat.double())
+    is_integer = (delta_int_pred - delta_int_pred.round()).abs().max().item() < 1e-6
+    # Check codes stay in range (verify on rows with at least one flip)
+    W_int_post = W_int.double() + delta_int_pred
+    code_in_range = bool(((W_int_post >= 0) & (W_int_post <= max_int)).all().item())
+    lemma3_pass = bool(is_integer and code_in_range)
+
+    # ----- Variance bound RHS (per-channel summed) — Lemma 2 -------------
     if base == "awq":
         step_orig = scale_flat.to(torch.float64) / s_vec.unsqueeze(0).to(torch.float64)
     else:
@@ -203,13 +227,29 @@ def measure_layer(
     dV = V_after - V_before
     dV_abs = dV.abs()
 
+    # ----- ASSUMPTION A measurement ----------------------------------------
+    # α_ℓ = ⟨Δ, Σ E⟩_F  /  ( ‖Δ‖_F · ‖Σ E‖_F )    ∈ [-1, 1]
+    # The cross-term of Δ V is 2 * ⟨Δ, Σ E⟩_F (Δ here = e' - e, E here = e).
+    cross_inner   = (Delta * Se).sum()                      # ⟨Δ, Σ E⟩_F   (here E = e)
+    Delta_F_norm  = (Delta ** 2).sum().sqrt()
+    SE_F_norm     = (Se ** 2).sum().sqrt()
+    if float(Delta_F_norm.item()) < 1e-30 or float(SE_F_norm.item()) < 1e-30:
+        alpha = 0.0
+    else:
+        alpha = float((cross_inner / (Delta_F_norm * SE_F_norm)).item())
+
+    # Also compute the quadratic budget magnitude: ‖Δ‖_F² · ‖Σ‖_2 (Theorem 1 dominance RHS).
+    # Use ‖Σ‖_∞ as a fast proxy for ‖Σ‖_2 (we already computed Σ_inf above).
+    quadratic_budget = float((Delta_F_norm ** 2).item()) * Sigma_inf
+    bias_gain_abs = float((B_before - B_after).clamp(min=0).item())
+
     # ----- Numerical tolerance --------------------------------------------
     eps = 1e-10
 
     # ----- The four FACTS (per-layer, boolean) ----------------------------
-    fact_i   = bool(B_after <= B_before + eps * (1.0 + B_before.abs()))                # Thm 1(i)
-    fact_ii  = bool(dV_abs   <= RHS_T1   + eps * (1.0 + V_before.abs()))                # Thm 1(ii)
-    fact_iii = bool(T_after  <  T_before - eps * (1.0 + T_before.abs()))                # Empirical net descent
+    fact_i   = bool(B_after <= B_before + eps * (1.0 + B_before.abs()))                # Lemma 1
+    fact_ii  = bool(dV_abs   <= RHS_T1   + eps * (1.0 + V_before.abs()))                # Lemma 2
+    fact_iii = bool(T_after  <  T_before - eps * (1.0 + T_before.abs()))                # Theorem 1 conclusion (per-layer)
     fact_iv  = bool(V_after  <= V_before + eps * (1.0 + V_before.abs()))                # Empirical V no-worsening
 
     # ----- Relative magnitudes for reporting ------------------------------
@@ -242,6 +282,15 @@ def measure_layer(
         "fact_ii":  fact_ii,
         "fact_iii": fact_iii,
         "fact_iv":  fact_iv,
+        # Lemma 3
+        "lemma3_pass": lemma3_pass,
+        # Assumption A — the critical new quantity
+        "alpha":            alpha,            # ⟨Δ, ΣE⟩_F / (‖Δ‖_F ‖ΣE‖_F) ∈ [-1, 1]
+        "Delta_F_norm":     float(Delta_F_norm.item()),
+        "SE_F_norm":        float(SE_F_norm.item()),
+        "cross_term":       float(cross_inner.item()),     # signed
+        "quadratic_budget": quadratic_budget,              # ‖Δ‖² · ‖Σ‖_∞
+        "bias_gain_abs":    bias_gain_abs,                 # |ΔB| per layer
         # Budget actually consumed
         "B_mean_per_row": float(B_per_row.mean().item()),
         "n_flipped_rows": int((B_per_row > 0).sum().item()),
@@ -263,6 +312,24 @@ def aggregate(results: List[Dict]) -> Dict[str, Dict]:
         frac = lambda k: sum(int(r[k]) for r in rs) / max(n, 1)
         avg = lambda k: float(np.mean([r[k] for r in rs]))
 
+        # Assumption A — α statistics across layers
+        alphas = [r["alpha"] for r in rs]
+        alpha_mean = float(np.mean(alphas))
+        alpha_std = float(np.std(alphas))
+        alpha_min = float(np.min(alphas))
+        alpha_max = float(np.max(alphas))
+        alpha_frac_le_zero = float(np.mean([a <= 0 for a in alphas]))
+
+        # Dominance condition (Theorem 1, Eq. eq:dominance):
+        #   E_ℓ[|ΔB_ℓ|] > E_ℓ[‖Δ_ℓ‖_F² ‖Σ_ℓ‖_2]
+        # We check whether the *expected* bias gain dominates the *expected* quadratic budget term.
+        avg_bias_gain   = float(np.mean([r["bias_gain_abs"]    for r in rs]))
+        avg_quad_budget = float(np.mean([r["quadratic_budget"] for r in rs]))
+        dominance_holds = avg_bias_gain > avg_quad_budget
+
+        # Lemma 3 (lattice closure) — must be 100%
+        lemma3_frac = frac("lemma3_pass")
+
         summary[f"{base}::{mode}"] = {
             "base": base, "mode": mode, "n_layers": n,
             # The four headline facts
@@ -270,10 +337,22 @@ def aggregate(results: List[Dict]) -> Dict[str, Dict]:
             "fact_ii_frac":  frac("fact_ii"),
             "fact_iii_frac": frac("fact_iii"),
             "fact_iv_frac":  frac("fact_iv"),
+            "lemma3_frac":   lemma3_frac,
             # Magnitudes averaged across layers
             "avg_dB_rel": avg("dB_rel"),
             "avg_dV_rel": avg("dV_rel"),
             "avg_dT_rel": avg("dT_rel"),
+            # ASSUMPTION A statistics
+            "alpha_mean":         alpha_mean,
+            "alpha_std":          alpha_std,
+            "alpha_min":          alpha_min,
+            "alpha_max":          alpha_max,
+            "alpha_frac_le_zero": alpha_frac_le_zero,
+            # Dominance condition for Theorem 1
+            "avg_bias_gain":    avg_bias_gain,
+            "avg_quad_budget":  avg_quad_budget,
+            "dominance_holds":  dominance_holds,
+            "dominance_ratio":  avg_bias_gain / max(avg_quad_budget, 1e-30),
             # Aggregated absolute totals (sum across layers — useful for the table)
             "sum_B_before": sum(r["B_before"] for r in rs),
             "sum_B_after":  sum(r["B_after"]  for r in rs),
@@ -286,63 +365,71 @@ def aggregate(results: List[Dict]) -> Dict[str, Dict]:
 
 
 def theorem2_verdict(summary: Dict[str, Dict], threshold: float = 0.95) -> Dict:
-    """Theorem 2: load-bearing claims (i), (ii), (iii) ≥ threshold on insample, across all bases.
+    """Verdict on the FULL Theorem 1 chain (under Lemma 3 universality):
 
-    Fact (iv) "variance does not worsen on every layer" is reported but NOT gating —
-    it is a strict per-layer check; the corresponding aggregate claim ("variance does
-    not worsen on average") is captured by the avg ΔV/V magnitude, not by Fact (iv)'s
-    boolean per-layer count.
+      Lemma 1 (bias descent)            ≥ threshold of layers
+      Lemma 2 (variance budget)         ≥ threshold of layers
+      Lemma 3 (lattice closure)         ≥ threshold of layers
+      Assumption A (E[α] ≤ 0)           directly verified on the run
+      Theorem 1 conclusion (T(W_q') < T(W_q))  ≥ threshold of layers
+
+    All five conditions must hold on insample mode for EVERY base quantizer.
     """
     insample = [s for s in summary.values() if s["mode"] == "insample"]
     if not insample:
         return {"pass": False, "reason": "no insample results"}
     failures = []
-    # Gating facts: Theorem 1(i), Theorem 1(ii), and the empirical total-L2 descent claim.
-    gating = (("fact_i_frac",   "Theorem 1(i) bias descent"),
-              ("fact_ii_frac",  "Theorem 1(ii) variance budget"),
-              ("fact_iii_frac", "Empirical total L2 descent"))
     for s in insample:
-        for k, label in gating:
-            if s[k] < threshold:
-                failures.append(f"{s['base']}: {label} ({s[k]*100:.1f}% < {threshold*100:.0f}%)")
-    # Fact (iv) gets reported alongside (not gating).
-    fact_iv_status = {s["base"]: {
-        "per_layer_strict_frac": s["fact_iv_frac"],
-        "avg_dV_rel": s["avg_dV_rel"],
-        "interpretation": (
-            "variance term decreases on average"
-            if s["avg_dV_rel"] < 0 else
-            "variance term grows on average by less than 1%"
-            if s["avg_dV_rel"] < 0.01 else
-            "variance term grows on average"
-        ),
-    } for s in insample}
+        if s["fact_i_frac"] < threshold:
+            failures.append(f"{s['base']}: Lemma 1 (bias descent) "
+                            f"{s['fact_i_frac']*100:.1f}% < {threshold*100:.0f}%")
+        if s["fact_ii_frac"] < threshold:
+            failures.append(f"{s['base']}: Lemma 2 (variance budget) "
+                            f"{s['fact_ii_frac']*100:.1f}% < {threshold*100:.0f}%")
+        if s["lemma3_frac"] < threshold:
+            failures.append(f"{s['base']}: Lemma 3 (lattice closure) "
+                            f"{s['lemma3_frac']*100:.1f}% < {threshold*100:.0f}%")
+        if s["alpha_mean"] > 0:
+            failures.append(f"{s['base']}: Assumption A violated, "
+                            f"E[α] = {s['alpha_mean']:+.5f} > 0")
+        if s["fact_iii_frac"] < threshold:
+            failures.append(f"{s['base']}: Theorem 1 conclusion "
+                            f"{s['fact_iii_frac']*100:.1f}% < {threshold*100:.0f}%")
     return {
         "pass": len(failures) == 0,
         "threshold_pct": threshold * 100,
         "bases_tested": sorted({s["base"] for s in insample}),
         "failures": failures,
-        "fact_iv_observed": fact_iv_status,
+        # For appendix-friendly reporting
+        "assumption_A_by_base": {s["base"]: {
+            "alpha_mean": s["alpha_mean"], "alpha_std": s["alpha_std"],
+            "frac_le_zero": s["alpha_frac_le_zero"],
+        } for s in insample},
+        "dominance_by_base": {s["base"]: {
+            "ratio": s["dominance_ratio"], "holds": s["dominance_holds"],
+        } for s in insample},
     }
 
 
 # --------------------------------------------------------------------------- #
 # Reporting
 # --------------------------------------------------------------------------- #
-def print_report(results: List[Dict], summary: Dict[str, Dict], t2: Dict):
+def print_report(results, summary, t2):
     print()
     print("═" * 96)
     print("EGBC EMPIRICAL VERIFICATION — paper-ready evidence")
     print("═" * 96)
     print("""\
-What each Fact corresponds to in the paper:
+Mapping from measurement to paper claim:
 
-  Fact (i)   →  Theorem 1(i)   :  bias term descends                B(W_q') ≤ B(W_q)
-  Fact (ii)  →  Theorem 1(ii)  :  variance term within budget       |ΔV| ≤ RHS_T1
-  Fact (iii) →  EMPIRICAL claim:  total layer L2 loss descends      T(W_q') < T(W_q)
-  Fact (iv)  →  EMPIRICAL claim:  variance does NOT worsen          V(W_q') ≤ V(W_q)
+  Lemma 1   →  bias descends, B(W_q') ≤ B(W_q)              (per layer; algorithmic guarantee)
+  Lemma 2   →  variance perturbation within budget          (per layer; algorithmic guarantee)
+  Lemma 3   →  lattice closure: W_q' ∈ L                    (per layer; structural)
+  Asm. A    →  E_ℓ[α_ℓ] ≤ 0    where  α_ℓ = ⟨Δ,ΣE⟩_F / (‖Δ‖_F ‖ΣE‖_F)
+  Theorem 1 →  E_ℓ[R(W_q'^(ℓ))] ≤ E_ℓ[R(W_q^(ℓ))]           (corollary of L1+L2+L3+Asm.A)
 
-  Theorem 2 (universality):  Facts (i)-(iv) hold for every base quantizer Q.
+Universality (Lemma 3): the chain above holds for any lattice-valued base
+quantizer Q (NTR, AWQ, GPTQ, AdaRound, SmoothQuant, FlatQuant).
 """)
 
     # ----- Per-layer table -------------------------------------------------
@@ -350,70 +437,79 @@ What each Fact corresponds to in the paper:
     print("PER-LAYER EVIDENCE")
     print("─" * 96)
     header = (f"{'layer@eval':<55s} {'base':<5s} {'mode':<9s} "
-              f"{'F(i)':>5s} {'F(ii)':>6s} {'F(iii)':>7s} {'F(iv)':>6s} "
+              f"{'L1':>4s} {'L2':>4s} {'L3':>4s} {'α':>9s} "
               f"{'ΔB/B':>8s} {'ΔV/V':>8s} {'ΔT/T':>8s}")
     print(header)
     print("─" * 96)
     for r in sorted(results, key=lambda x: (x["base"], x["mode"], x["name"])):
         tick = lambda b: "✓" if b else "✗"
         print(f"{r['name']:<55s} {r['base']:<5s} {r['mode']:<9s} "
-              f"{tick(r['fact_i']):>5s} {tick(r['fact_ii']):>6s} "
-              f"{tick(r['fact_iii']):>7s} {tick(r['fact_iv']):>6s} "
+              f"{tick(r['fact_i']):>4s} {tick(r['fact_ii']):>4s} {tick(r['lemma3_pass']):>4s} "
+              f"{r['alpha']:+9.5f} "
               f"{r['dB_rel']*100:+7.3f}% {r['dV_rel']*100:+7.3f}% {r['dT_rel']*100:+7.3f}%")
 
     # ----- Headline by (base, mode) ---------------------------------------
     print()
     print("═" * 96)
-    print("HEADLINE: per-base × per-mode aggregation")
+    print("HEADLINE: per-base × per-mode evidence")
     print("═" * 96)
     keys_ordered = sorted(summary.keys(), key=lambda k: (k.split("::")[1] != "insample", k))
     for key in keys_ordered:
         s = summary[key]
         is_theorem = (s["mode"] == "insample")
         tag = "[THEOREM]   " if is_theorem else "[robustness]"
-        print(f"\n  {tag}  base = {s['base']:<5s}  mode = {s['mode']:<9s}  ({s['n_layers']} layers)")
-        print(f"    Fact (i)   bias-descent             : {int(s['fact_i_frac']*s['n_layers']):>3d}/{s['n_layers']:<3d} layers "
-              f"({s['fact_i_frac']*100:6.2f}%)")
-        print(f"    Fact (ii)  variance within budget   : {int(s['fact_ii_frac']*s['n_layers']):>3d}/{s['n_layers']:<3d} layers "
-              f"({s['fact_ii_frac']*100:6.2f}%)                       [LOAD-BEARING — Theorem 1(ii)]")
-        print(f"    Fact (iii) total L2 loss descends   : {int(s['fact_iii_frac']*s['n_layers']):>3d}/{s['n_layers']:<3d} layers "
-              f"({s['fact_iii_frac']*100:6.2f}%)                       [LOAD-BEARING — Empirical claim]")
-        print(f"    Fact (iv)  V does not worsen on every layer:  {int(s['fact_iv_frac']*s['n_layers']):>3d}/{s['n_layers']:<3d} "
-              f"({s['fact_iv_frac']*100:6.2f}%)   [reported, not gating]")
-        print(f"    Average ΔB/B (bias  reduced by):     {s['avg_dB_rel']*100:+7.3f}%")
-        print(f"    Average ΔV/V (variance change):      {s['avg_dV_rel']*100:+7.3f}%  "
-              f"(positive = V grew; negative = V shrank)")
-        print(f"    Average ΔT/T (total reduced by):     {s['avg_dT_rel']*100:+7.3f}%")
-        print(f"    Aggregate totals  B: {s['sum_B_before']:.4e} → {s['sum_B_after']:.4e}")
-        print(f"                      V: {s['sum_V_before']:.4e} → {s['sum_V_after']:.4e}")
-        print(f"                      T: {s['sum_T_before']:.4e} → {s['sum_T_after']:.4e}")
+        n = s["n_layers"]
+        print(f"\n  {tag}  base = {s['base']:<5s}  mode = {s['mode']:<9s}  ({n} layers)")
+        print(f"    Lemma 1  bias descent           : {int(s['fact_i_frac']*n):>3d}/{n:<3d} layers ({s['fact_i_frac']*100:6.2f}%)")
+        print(f"    Lemma 2  variance within budget : {int(s['fact_ii_frac']*n):>3d}/{n:<3d} layers ({s['fact_ii_frac']*100:6.2f}%)")
+        print(f"    Lemma 3  lattice closure        : {int(s['lemma3_frac']*n):>3d}/{n:<3d} layers ({s['lemma3_frac']*100:6.2f}%)")
+        print(f"    Assumption A — α statistics across {n} layers:")
+        print(f"        mean(α) = {s['alpha_mean']:+9.5f}    std(α)  = {s['alpha_std']:9.5f}")
+        print(f"        min(α)  = {s['alpha_min']:+9.5f}    max(α)  = {s['alpha_max']:+9.5f}")
+        print(f"        frac. of layers with α ≤ 0: {s['alpha_frac_le_zero']*100:6.2f}%")
+        verdict_A = "HOLDS" if s['alpha_mean'] <= 0 else "VIOLATED on this run"
+        print(f"        Assumption A (E[α] ≤ 0)  :  {verdict_A}")
+        print(f"    Dominance check (Eq. 4):  E[|ΔB|] vs E[‖Δ‖² · ‖Σ‖]")
+        print(f"        E[|ΔB|]           = {s['avg_bias_gain']:.6e}")
+        print(f"        E[‖Δ‖_F² ‖Σ‖_∞]   = {s['avg_quad_budget']:.6e}")
+        print(f"        ratio             = {s['dominance_ratio']:.2f}×    ({'HOLDS' if s['dominance_holds'] else 'fails'})")
+        print(f"    Theorem 1 conclusion (per-layer total descent observed):")
+        print(f"        {int(s['fact_iii_frac']*n):>3d}/{n:<3d} layers have T(W_q') < T(W_q)   "
+              f"(avg ΔT/T = {s['avg_dT_rel']*100:+.3f}%)")
+        print(f"    Magnitudes (avg across layers):")
+        print(f"        ΔB/B  = {s['avg_dB_rel']*100:+7.3f}%   (bias reduced by this fraction)")
+        print(f"        ΔV/V  = {s['avg_dV_rel']*100:+7.3f}%   (negative = V shrank too)")
+        print(f"        ΔT/T  = {s['avg_dT_rel']*100:+7.3f}%   (total layer L2 loss reduced)")
+        print(f"    Aggregate (sum over layers):")
+        print(f"        B: {s['sum_B_before']:.4e} → {s['sum_B_after']:.4e}    "
+              f"({s['sum_B_before']/max(s['sum_B_after'],1e-30):.1f}× reduction)")
+        print(f"        V: {s['sum_V_before']:.4e} → {s['sum_V_after']:.4e}")
+        print(f"        T: {s['sum_T_before']:.4e} → {s['sum_T_after']:.4e}    "
+              f"({100*(s['sum_T_before']-s['sum_T_after'])/max(s['sum_T_before'],1e-30):+.3f}% reduction)")
 
-    # ----- Theorem 2 verdict ---------------------------------------------
+    # ----- Verdict --------------------------------------------------------
     print()
     print("═" * 96)
-    print("THEOREM 2 (universality) — verdict")
+    print("THEOREM 1 (under Lemma 3 universality) — verdict on insample")
     print("═" * 96)
-    print(f"  Gating facts (≥ {t2['threshold_pct']:.0f}% on insample): (i) bias descent, "
-          f"(ii) variance budget, (iii) total L2 descent.")
-    print(f"  Bases tested:                  {t2['bases_tested']}")
+    print(f"  Gating checks (≥ {t2['threshold_pct']:.0f}% on insample):")
+    print(f"     – Lemma 1  (bias descent)")
+    print(f"     – Lemma 2  (variance budget)")
+    print(f"     – Lemma 3  (lattice closure)")
+    print(f"     – Assumption A  (E[α] ≤ 0)")
+    print(f"     – Theorem 1 conclusion  (per-layer total descent observed)")
+    print(f"  Bases tested:  {t2['bases_tested']}")
     if t2["pass"]:
-        print(f"  VERDICT:  PASS  ✓   Theorem 2 verified across {t2['bases_tested']}.")
+        print(f"  VERDICT:  PASS  ✓   Theorem 1 (under verified Assumption A) holds across {t2['bases_tested']}.")
     else:
         print(f"  VERDICT:  FAIL  ✗")
         for f in t2["failures"]:
             print(f"    – {f}")
-    # Additional context on Fact (iv)
-    if "fact_iv_observed" in t2:
-        print()
-        print(f"  Fact (iv) observation (variance term on average — reported, not gating):")
-        for base, info in t2["fact_iv_observed"].items():
-            print(f"    – {base.upper()}: per-layer strict {info['per_layer_strict_frac']*100:.1f}%, "
-                  f"avg ΔV/V = {info['avg_dV_rel']*100:+.3f}%  →  {info['interpretation']}")
     print()
 
     # ----- Paper-ready sentences -----------------------------------------
     print("═" * 96)
-    print("PAPER-READY SENTENCES (paste these into the experiments section)")
+    print("PAPER-READY SENTENCES")
     print("═" * 96)
     insample_keys = [k for k in summary.keys() if k.endswith("::insample")]
     if insample_keys:
@@ -421,20 +517,18 @@ What each Fact corresponds to in the paper:
         for k in sorted(insample_keys):
             s = summary[k]
             n = s["n_layers"]
-            v_avg = s["avg_dV_rel"] * 100
-            v_avg_word = ("decreased" if v_avg < 0 else "grew") + f" by {abs(v_avg):.3f}%"
-            print(f"  On {s['base'].upper()}-base, in-sample (the literal claim of Theorems 1 and 2):")
-            print(f"    – Theorem 1(i):    bias descended on {int(s['fact_i_frac']*n)}/{n} layers (100%).")
-            print(f"    – Theorem 1(ii):   variance perturbation stayed within the budget on "
-                  f"{int(s['fact_ii_frac']*n)}/{n} layers (100%).")
-            print(f"    – Empirical (iii): total layer L2 loss strictly decreased on "
-                  f"{int(s['fact_iii_frac']*n)}/{n} layers "
-                  f"(avg ΔT/T = {s['avg_dT_rel']*100:+.3f}%).")
-            print(f"    – Empirical (iv):  on average across layers, variance term {v_avg_word} "
-                  f"(strict per-layer descent on {int(s['fact_iv_frac']*n)}/{n}).")
-            print(f"    – Magnitudes:      bias reduced by {s['avg_dB_rel']*100:+.2f}% on average; "
-                  f"aggregate B: {s['sum_B_before']:.3e} → {s['sum_B_after']:.3e} "
-                  f"({s['sum_B_before']/max(s['sum_B_after'],1e-30):.1f}× reduction).")
+            print(f"  On {s['base'].upper()}-base (in-sample; the setting of Theorem 1):")
+            print(f"    – Lemma 1 (bias descent): {int(s['fact_i_frac']*n)}/{n} layers.")
+            print(f"    – Lemma 2 (variance budget): {int(s['fact_ii_frac']*n)}/{n} layers.")
+            print(f"    – Lemma 3 (lattice closure): {int(s['lemma3_frac']*n)}/{n} layers.")
+            print(f"    – Assumption A: mean α = {s['alpha_mean']:+.5f} (s.d. {s['alpha_std']:.5f}), "
+                  f"{s['alpha_frac_le_zero']*100:.0f}% of layers have α ≤ 0.")
+            print(f"    – Dominance (Eq. 4): E[|ΔB|]/E[‖Δ‖²‖Σ‖] = {s['dominance_ratio']:.1f}× "
+                  f"({'satisfied' if s['dominance_holds'] else 'violated'}).")
+            print(f"    – Theorem 1 conclusion (empirical): total layer L2 strictly decreased on "
+                  f"{int(s['fact_iii_frac']*n)}/{n} layers; avg ΔT/T = {s['avg_dT_rel']*100:+.3f}%. "
+                  f"Aggregate total: {s['sum_T_before']:.3e} → {s['sum_T_after']:.3e} "
+                  f"({100*(s['sum_T_before']-s['sum_T_after'])/max(s['sum_T_before'],1e-30):+.2f}%).")
             print()
     crossval_keys = [k for k in summary.keys() if k.endswith("::crossval")]
     if crossval_keys:
@@ -442,9 +536,9 @@ What each Fact corresponds to in the paper:
         for k in sorted(crossval_keys):
             s = summary[k]
             n = s["n_layers"]
-            print(f"    – {s['base'].upper()}: total L2 loss still descended on "
-                  f"{int(s['fact_iii_frac']*n)}/{n} layers; "
-                  f"avg ΔT/T = {s['avg_dT_rel']*100:+.3f}%.")
+            print(f"    – {s['base'].upper()}: Theorem 1 conclusion holds on "
+                  f"{int(s['fact_iii_frac']*n)}/{n} layers; avg ΔT/T = {s['avg_dT_rel']*100:+.3f}%; "
+                  f"mean α = {s['alpha_mean']:+.5f}.")
     print("═" * 96)
 
 
