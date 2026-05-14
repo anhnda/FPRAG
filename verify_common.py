@@ -344,99 +344,97 @@ def compute_flip_delta(
     flip_budget_pct: float = 5.0,
     knee_tolerance: float = 0.01,
 ) -> torch.Tensor:
-    """Run EGBC greedy on top of an existing quantization, return Δ in dequantized space.
+    """EXACT port of awq_dh_xl.py's quantize_weight_heuristic_groupwise() flip logic.
 
-    Inputs are all on the same device.  mu_cal is the *calibration* μ used to design flips.
-    Returns Δ such that W_q_post_flip = W_q + Δ where W_q = (W_int - zp) * scale.
-
-    The signs and validity rules below match the paper-aligned implementation in
-    your awq_dh_xl.py file (Heuristic-Guided Global Greedy Rounding).
+    Returns Δ in dequantized weight space such that  W_q_post_flip = W_q + Δ.
+    All conventions (sign of flip_dir, validity masks, ordering, budget) match
+    the production quantizer line-for-line.  Do not modify without keeping it
+    in sync with awq_dh_xl.py.
     """
     device = W.device
     out_features, in_features = W.shape
     max_int = 2 ** bits - 1
 
-    # Same padding trick as the production quantizer so that group structure is clean
-    group_size = (W_int.shape[1] // 1) if in_features <= scale_flat.shape[1] else in_features
-    # We don't actually need padding since callers pass already-trimmed tensors.
+    # Working tensors (production code uses float in W's dtype; we keep that)
+    W_q_pre = (W_int.to(W.dtype) - zp_flat) * scale_flat                   # [out, in]
+    act = mu_cal.to(device).to(W.dtype)                                    # [in]
 
-    # Per-row current bias  b_j = μ^T (W_q[:,row] - W[:,row])  but here rows of W are output channels
-    # In our [out, in] layout: e[j, :] = W_q[j, :] - W[j, :]  and  bias_per_row = e @ μ
-    W_q = (W_int.to(W.dtype) - zp_flat) * scale_flat
-    e = (W_q - W).to(torch.float64)
-    mu = mu_cal.to(device).to(torch.float64)
-    b = e @ mu                                              # [out]
+    # --- A. Current per-row bias error ----------------------------------------
+    # PRODUCTION CONVENTION:  W_diff = W - W_q  (NOT W_q - W)
+    # So  current_error_j  =  Σ_i (W[j,i] - W_q[j,i]) * μ_i  =  −μᵀe_j
+    # A flip ADDS flip_dir*scale to W_q (subtracts from W_diff), which therefore
+    # SUBTRACTS  flip_dir * scale * μ_i = impact_j,i  from current_error.
+    # The residual update is  new_error = current_error − cumsum(impacts).
+    W_diff = W - W_q_pre
+    current_error = (W_diff * act.unsqueeze(0)).sum(dim=1)                 # [out];  = −μᵀe
 
-    # Direction sign chosen to MOVE b toward zero.
-    # If b > 0, we want to DECREASE b => add -μ_i * scale_i ; so flip dir d_ij satisfies sign(d_ij*μ_i) = -sign(b_j).
-    # i.e.  d_ij = -sign(b_j) * sign(μ_i).   d_ij ∈ {-1, +1}.
-    sign_b = torch.sign(b).unsqueeze(1)                     # [out, 1]
-    sign_mu = torch.sign(mu).unsqueeze(0)                   # [1, in]
-    flip_dir = (-sign_b * sign_mu).to(W.dtype)              # [out, in]
-    # When sign is exactly zero, fall back to no-flip for that coordinate
-    flip_dir = torch.where(torch.isnan(flip_dir) | (flip_dir == 0),
-                           torch.zeros_like(flip_dir), flip_dir)
+    # --- B. Flip direction and impact ----------------------------------------
+    # The PRODUCTION convention: flip_dir is the direction `round` rounded TOWARD,
+    # i.e. flip_dir = sign(W/scale + zp - W_int).  Flipping moves W_int by flip_dir,
+    # which changes the de-quantized weight by  flip_dir * scale.  Hence:
+    #   flip_impact_j,i = μ_i * flip_dir_j,i * scale_j,i
+    W_div = W / scale_flat
+    flip_dir = torch.sign(W_div + zp_flat - W_int.to(W.dtype))
+    flip_dir = torch.where(flip_dir == 0, torch.ones_like(flip_dir), flip_dir)
+    flip_impacts = act.unsqueeze(0) * flip_dir * scale_flat                # [out, in]
 
-    # Lattice feasibility: integer must stay in [0, max_int]
-    W_int_new = W_int + flip_dir
-    in_range = (W_int_new >= 0) & (W_int_new <= max_int)
-
-    # Per-row sign-validity: this is automatic by construction of flip_dir, but coords where μ_i=0
-    # would have flip_dir=0 -> they're already filtered.
-
-    # Knee-point mask on |μ| (excludes dimensions whose |μ_i| is outlier-large)
-    mu_abs = mu.abs().to(torch.float32)
-    sorted_desc, _ = torch.sort(mu_abs, descending=True)
+    # --- C. Validity masks ---------------------------------------------------
+    # (i)  sign(impact) must equal sign(current_error) -- only flips that REDUCE |error|
+    target_sign = torch.sign(current_error).unsqueeze(1)                   # [out, 1]
+    valid_mask = (torch.sign(flip_impacts) == target_sign)
+    # (ii) integer stays in [0, max_int]
+    w_int_proposed = W_int + flip_dir
+    in_range = (w_int_proposed >= 0) & (w_int_proposed <= max_int)
+    valid_mask = valid_mask & in_range
+    # (iii) Knee-point outlier mask on |μ|
+    act_abs = act.abs()
+    sorted_desc, _ = torch.sort(act_abs, descending=True)
     k_idx = find_knee_index(sorted_desc, tolerance=knee_tolerance)
     threshold = float(sorted_desc[k_idx].item())
-    not_outlier = (mu_abs <= threshold)                    # [in]
-    valid = in_range & (flip_dir != 0) & not_outlier.unsqueeze(0)
+    is_outlier = act_abs > threshold                                       # [in]
+    valid_mask = valid_mask & (~is_outlier).unsqueeze(0)
 
-    # Each candidate flip i for row j changes b_j by  μ_i * (flip_dir_ij * scale_ij).
-    step = (mu.unsqueeze(0) * flip_dir.to(torch.float64) * scale_flat.to(torch.float64))   # [out, in]
+    # --- D. Sorting by rounding cost (descending) ----------------------------
+    # rounding_cost = |W/scale + zp - W_int|  in [0, 0.5]; high = close to boundary
+    rounding_costs = (W_div + zp_flat - W_int.to(W.dtype)).abs()
+    rounding_costs_masked = rounding_costs.clone()
+    rounding_costs_masked[~valid_mask] = -1.0
+    sorted_indices = torch.argsort(rounding_costs_masked, dim=1, descending=True)
 
-    # Magnitude-condition: |μ_i| * scale_i < 2 |b_j|  (paper's Prop 1)
-    cond = (mu_abs.unsqueeze(0).to(torch.float64) * scale_flat.to(torch.float64)) < (2.0 * b.abs().unsqueeze(1) + 1e-30)
-    valid = valid & cond
+    sorted_impacts = torch.gather(flip_impacts, 1, sorted_indices)
+    sorted_validity = torch.gather(valid_mask.long(), 1, sorted_indices)
+    sorted_impacts = sorted_impacts * sorted_validity                      # zero out invalid
 
-    # Ordering: prioritise coordinates with largest rounding-margin (closest to the rounding boundary)
-    # rounding margin  =  |W/scale + zp - W_int|   in [0, 0.5]; closer to 0.5 → safer flip
-    margin = ((W / scale_flat + zp_flat) - W_int.to(W.dtype)).abs().to(torch.float64)   # [out, in]
-    margin_masked = torch.where(valid, margin, torch.full_like(margin, -1.0))
-    order = torch.argsort(margin_masked, dim=1, descending=True)                         # [out, in]
+    # --- E. Greedy prefix to minimise |current_error - cumsum(impacts)| ------
+    cumsum_impacts = torch.cumsum(sorted_impacts, dim=1)
+    residuals = torch.abs(current_error.unsqueeze(1) - cumsum_impacts)
+    error_unsqueezed = torch.abs(current_error).unsqueeze(1)
+    all_residuals = torch.cat([error_unsqueezed, residuals], dim=1)        # [out, in+1]
+    best_k = torch.argmin(all_residuals, dim=1)                            # [out]; 0 = no flips
 
-    # Greedy prefix-subset over the order to minimise |b_j - cumsum(step)|
-    step_sorted = torch.gather(step, 1, order)
-    valid_sorted = torch.gather(valid.long(), 1, order).bool()
-    step_sorted = torch.where(valid_sorted, step_sorted, torch.zeros_like(step_sorted))
-    cumsum = torch.cumsum(step_sorted, dim=1)
-    # NB: each flip moves b in the direction that reduces |b|. So we want to *minimise* |b - cumsum|
-    # since cumsum is the cumulative correction injected into the error.
-    # Equivalent formulation: minimise |b - cumsum| over prefix length k.
-    target = b.unsqueeze(1)                                                              # [out, 1]
-    residual = (target + cumsum).abs()                                                   # because step is signed to reduce b
-    # Actually: e' @ μ = b + (μ^T Δ) and (μ^T Δ) accumulates as cumsum, so we minimize |b + cumsum|
-    # (we want b + cumsum → 0, and step is signed so each entry typically moves the sum toward -b)
-    # Concat the "k=0" option (no flips) at the front:
-    no_flip = b.abs().unsqueeze(1)
-    full = torch.cat([no_flip, residual], dim=1)                                         # [out, in+1]
-    best_k = torch.argmin(full, dim=1)                                                   # [out]; 0 means no flips
+    # --- F. Build initial selection in sorted order, mask invalids -----------
+    idx_range = torch.arange(in_features, device=device).unsqueeze(0)
+    flip_mask_sorted = idx_range < best_k.unsqueeze(1)
+    final_flips_sorted = flip_mask_sorted & (sorted_validity.bool())
 
-    # Budget cap: at most B_j flips per row
-    B_j = max(1, int(round(flip_budget_pct / 100.0 * in_features)))
-    best_k = best_k.clamp(max=B_j)
+    # --- G. Per-row budget cap (PRODUCTION SEMANTICS) ------------------------
+    # Cumulative VALID-flip count along the sorted axis; keep at most max_flips_per_output.
+    # This is how production limits per-row flips: NOT by clamping best_k against
+    # an index count, but by truncating the suffix of the valid-flip cumulative count.
+    max_flips_per_output = max(1, int(flip_budget_pct / 100.0 * in_features))
+    cumsum_flips = final_flips_sorted.long().cumsum(dim=1)
+    within_limit = cumsum_flips <= max_flips_per_output
+    final_flips_sorted = final_flips_sorted & within_limit
 
-    # Build a 0/1 selection mask in sorted order
-    idx = torch.arange(in_features, device=device).unsqueeze(0)
-    sel_sorted = (idx < best_k.unsqueeze(1)) & valid_sorted
+    # --- H. Build Δ in original-coordinate ordering --------------------------
+    sorted_flip_dir = torch.gather(flip_dir, 1, sorted_indices)
+    sorted_flip_dir = torch.where(final_flips_sorted, sorted_flip_dir, torch.zeros_like(sorted_flip_dir))
 
-    # Scatter back to original ordering
-    sel = torch.zeros_like(sel_sorted)
-    sel.scatter_(1, order, sel_sorted)
+    # Scatter Δ_int back to original positions, then dequantize
+    delta_int = torch.zeros_like(W_int.to(W.dtype))
+    delta_int.scatter_(1, sorted_indices, sorted_flip_dir)
 
-    # Build Δ in dequantized space:  Δ_ij = sel_ij * flip_dir_ij * scale_ij
-    flip_dir_64 = flip_dir.to(torch.float64)
-    Delta = (sel.to(torch.float64) * flip_dir_64 * scale_flat.to(torch.float64)).to(W.dtype)
+    Delta = (delta_int * scale_flat).to(W.dtype)                           # [out, in]
     return Delta
 
 

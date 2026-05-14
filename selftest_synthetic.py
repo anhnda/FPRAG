@@ -21,21 +21,35 @@ from verify_common import compute_flip_delta, group_quantize
 
 
 def run_one(out_features=256, in_features=512, bits=4, group_size=128,
-            flip_budget_pct=5.0, knee_tolerance=0.01, seed=0):
+            flip_budget_pct=5.0, knee_tolerance=0.01, seed=0,
+            mu_eval_noise_scale=0.0):
+    """One trial of the synthetic check.
+
+    Theorem 1 assumes a SINGLE μ.  The flip operator uses μ_cal to decide flips,
+    and we evaluate bias against μ_eval.  When μ_eval = μ_cal (the in-sample
+    setting that the theorem actually states), all three claims should hold.
+    `mu_eval_noise_scale > 0` introduces a calibration-vs-eval mismatch and
+    tests robustness, NOT the theorem itself.
+    """
     torch.manual_seed(seed)
     np.random.seed(seed)
 
     # Random FP weight matrix
     W = torch.randn(out_features, in_features, dtype=torch.float32)
 
-    # Random calibration μ (used to drive flips) and eval (μ, Σ) (used to evaluate)
+    # Calibration μ used by the flip operator
     mu_cal = 0.1 * torch.randn(in_features, dtype=torch.float32)
-    # Bake in some "outliers" to test the knee mask
     k = 5
     idx = torch.randperm(in_features)[:k]
     mu_cal[idx] *= 20.0
 
-    mu_eval = mu_cal + 0.02 * torch.randn(in_features, dtype=torch.float32)
+    # Evaluation μ:  by default equal to mu_cal (in-sample theorem check).
+    # Set mu_eval_noise_scale > 0 to stress-test robustness (NOT the theorem).
+    if mu_eval_noise_scale > 0:
+        mu_eval = mu_cal + mu_eval_noise_scale * torch.randn(in_features, dtype=torch.float32)
+    else:
+        mu_eval = mu_cal.clone()
+
     # PSD Σ
     A = torch.randn(in_features, in_features, dtype=torch.float32) * 0.05
     Sigma = (A @ A.t()) + 0.1 * torch.eye(in_features, dtype=torch.float32)
@@ -70,7 +84,7 @@ def run_one(out_features=256, in_features=512, bits=4, group_size=128,
     B = (Delta != 0).sum(dim=1).double()
     rhs = B * s_max * (2.0 * Se_inf + s_max * Sigma_inf)
 
-    eps = 1e-14
+    eps = 1e-10  # realistic tolerance for float32 weights / float64 accumulators
 
     # (i) bias descent
     pass_i = bias_after <= bias_before + eps * (1.0 + bias_before)
@@ -111,8 +125,10 @@ def run_one(out_features=256, in_features=512, bits=4, group_size=128,
 def main():
     print("Synthetic self-test of EGBC theorem verification code")
     print("=" * 72)
+    print("\nMODE A: in-sample (μ_eval = μ_cal) — this is what the theorem states.")
+    print("-" * 72)
     for seed in range(3):
-        r = run_one(seed=seed)
+        r = run_one(seed=seed, mu_eval_noise_scale=0.0)
         print(f"\nseed={seed}")
         for k, v in r.items():
             if isinstance(v, float):
@@ -120,11 +136,24 @@ def main():
             else:
                 print(f"  {k:32s} = {v}")
 
-    print("\nExpected behaviour:")
+    print("\n\nMODE B: noisy calibration (μ_eval ≠ μ_cal) — robustness, NOT the theorem.")
+    print("-" * 72)
+    for seed in range(3):
+        r = run_one(seed=seed, mu_eval_noise_scale=0.02)
+        print(f"\nseed={seed}")
+        for k, v in r.items():
+            if isinstance(v, float):
+                print(f"  {k:32s} = {v:.6f}")
+            else:
+                print(f"  {k:32s} = {v}")
+
+    print("\nExpected behaviour in MODE A:")
     print("  T1(i)_pass     -> 1.000000   (algorithmic guarantee)")
     print("  T1(ii)_pass    -> 1.000000   (algorithmic guarantee)")
     print("  T1(iii)_pass under dom -> 1.000000")
     print("  rhs_slack_mean -> large positive (bound is loose, which is fine)")
+    print("\nMode B may show T1(i) below 1.0 if the calibration-eval mismatch")
+    print("is large — that's about generalization of the flip, not the theorem.")
 
 
 if __name__ == "__main__":
