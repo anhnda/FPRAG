@@ -79,10 +79,11 @@ def run_one(out_features=256, in_features=512, bits=4, group_size=128,
     var_after = (Set * e_tilde).sum(dim=1)
 
     s_max = float(scale_flat.max().item())
-    Sigma_inf = float(Sig.abs().max().item())
+    Sigma_inf = float(Sigma.abs().max().item())
     Se_inf = Se.abs().max(dim=1).values
     B = (Delta != 0).sum(dim=1).double()
-    rhs = B * s_max * (2.0 * Se_inf + s_max * Sigma_inf)
+    # Theorem 1(ii) RHS:  2 B_j s_max ‖Σe_j‖∞  +  B_j² s_max² ‖Σ‖∞
+    rhs = 2.0 * B * s_max * Se_inf + (B ** 2) * (s_max ** 2) * Sigma_inf
 
     eps = 1e-10  # realistic tolerance for float32 weights / float64 accumulators
 

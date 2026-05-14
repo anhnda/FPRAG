@@ -124,8 +124,19 @@ def measure_layer(
     knee_tolerance: float,
     use_james_stein: bool,
     device: torch.device,
+    mode: str = "insample",
 ) -> Dict[str, object]:
-    """Run the base quantizer, apply EGBC, and check Theorem 1 (i)(ii)(iii) per row."""
+    """Run the base quantizer, apply EGBC, and check Theorem 1 (i)(ii)(iii) per row.
+
+    mode='insample' :  μ in the theorem is the calibration μ (the one EGBC used).
+                       This is what Theorem 1 literally states.
+                       Σ still comes from the eval set, since the eval set defines
+                       the deployment distribution we care about for V_j.
+    mode='crossval' :  μ in the theorem is the eval-set μ (different from cal).
+                       This is a robustness check: does the flip designed against
+                       μ_cal still reduce bias when measured against μ_eval?
+                       NOT what Theorem 1 states; reported separately.
+    """
     W = W_fp.to(device).float()
     out_features, in_features = W.shape
 
@@ -137,6 +148,14 @@ def measure_layer(
     if Sigma is None:
         raise RuntimeError(f"Layer {name}: full covariance required for theorem check.")
     Sigma = Sigma.to(device).double()
+
+    # The μ we EVALUATE Theorem 1 against:
+    if mode == "insample":
+        mu_for_eval = mu_cal
+    elif mode == "crossval":
+        mu_for_eval = mu_eval
+    else:
+        raise ValueError(f"Unknown mode: {mode}")
 
     # ---- salience (E[X^2]) ≈ μ^2 + diag(Σ) ---------------------------------
     diag_Sigma_cal = cal_stats.get("diag_second", None)
@@ -171,9 +190,9 @@ def measure_layer(
     e_tilde = e + Delta
 
     # ---- per-row quantities for Theorem 1 ----------------------------------
-    #   bias before / after
-    bias_before = (e @ mu_eval) ** 2                  # [out]
-    bias_after = (e_tilde @ mu_eval) ** 2             # [out]
+    #   bias before / after — evaluated against mu_for_eval per the mode setting
+    bias_before = (e @ mu_for_eval) ** 2              # [out]
+    bias_after = (e_tilde @ mu_for_eval) ** 2         # [out]
 
     #   variance before / after (these are the EXPENSIVE quadratic forms)
     Se = e @ Sigma                                    # [out, in]
@@ -181,21 +200,33 @@ def measure_layer(
     Set = e_tilde @ Sigma
     var_after = (Set * e_tilde).sum(dim=1)            # [out]
 
-    #   variance budget RHS:  B_j · s_max · (2 ‖Σ e_j‖_∞ + s_max ‖Σ‖_∞)
-    s_max = float(scale_flat.max().item())
+    #   variance budget RHS:  2 B_j s_max ‖Σ e_j‖∞  +  B_j² s_max² ‖Σ‖∞
+    # Derivation:   |ΔV_j|  =  |2 Δ_jᵀ Σ e_j  +  Δ_jᵀ Σ Δ_j|
+    #              ≤  2 ‖Δ_j‖_1 ‖Σ e_j‖_∞  +  ‖Δ_j‖_1² ‖Σ‖_∞
+    #              ≤  2 B_j s_max ‖Σ e_j‖_∞  +  B_j² s_max² ‖Σ‖_∞
+    # using ‖Δ_j‖_1 ≤ |S_j|·‖Δ_j‖_∞ ≤ B_j · s_max.
+    # NOTE on AWQ space: the flip operates in the scaled space; Δ in original
+    # space is Δ_scaled / s_vec, so the per-coord step in the space where Σ
+    # acts is scale_flat / s_vec.  s_max must be taken in that same space.
+    if base == "awq":
+        step_orig = (scale_flat.to(torch.float64) / s_vec.unsqueeze(0).to(torch.float64))
+    else:
+        step_orig = scale_flat.to(torch.float64)
+    s_max = float(step_orig.max().item())
     Sigma_inf = float(Sigma.abs().max().item())                     # entry-wise ∞-norm
     Se_inf_per_row = Se.abs().max(dim=1).values                     # [out]
 
     #   actual budget used per row (flips actually applied)
     B_per_row = (Delta != 0).sum(dim=1).double()                    # [out]
-    var_rhs = B_per_row * s_max * (2.0 * Se_inf_per_row + s_max * Sigma_inf)
+    var_rhs = 2.0 * B_per_row * s_max * Se_inf_per_row \
+              + (B_per_row ** 2) * (s_max ** 2) * Sigma_inf
 
     #   total channel error before/after
     total_before = bias_before + var_before
     total_after = bias_after + var_after
 
     # ---- Theorem 1 checks --------------------------------------------------
-    eps_num = 1e-14  # numerical-zero tolerance for "≤"
+    eps_num = 1e-10  # realistic tolerance for float32 weights / float64 accumulators
 
     # (i) Bias descent
     pass_i_mask = bias_after <= bias_before + eps_num * (1 + bias_before)
@@ -234,6 +265,7 @@ def measure_layer(
     return {
         "name": name,
         "base": base,
+        "mode": mode,
         "n_rows": int(out_features),
         "n_flipped_rows": int((B_per_row > 0).sum().item()),
         "B_mean": float(B_per_row.mean().item()),
@@ -277,36 +309,32 @@ def measure_layer(
 # Verdict
 # --------------------------------------------------------------------------- #
 def evaluate_theorems(results: List[Dict]) -> Dict:
-    """Aggregate per-layer/per-eval/per-base results into a verdict.
+    """Aggregate per-(base, mode) results into a verdict.
 
-    Theorem 1 is the per-row claim.  Theorem 2 is satisfied iff Theorem 1 passes
-    for EVERY base quantizer in `results`.
+    Theorem 1's literal claim is the 'insample' mode (μ in the theorem is the
+    same μ the flip operator used).  'crossval' mode reports robustness to
+    cal-eval distribution shift; it is informative but NOT what the theorem states.
     """
-    # Group by base
-    by_base: Dict[str, List[Dict]] = {}
+    by_key: Dict[Tuple[str, str], List[Dict]] = {}
     for r in results:
-        by_base.setdefault(r["base"], []).append(r)
+        by_key.setdefault((r["base"], r.get("mode", "insample")), []).append(r)
 
     summary: Dict[str, object] = {}
-    for base, rs in by_base.items():
+    for (base, mode), rs in by_key.items():
         T1_i = float(np.mean([r["T1_i_pass_rate"] for r in rs]))
         T1_ii = float(np.mean([r["T1_ii_pass_rate"] for r in rs]))
-
-        # (iii) is conditional on dominance — average only over (layer, eval) that have ≥1 dom row
         iii_rates = [r["T1_iii_pass_rate"] for r in rs if r["T1_iii_dominance_rows"] > 0]
         T1_iii = float(np.mean(iii_rates)) if iii_rates else float("nan")
         dom_layer_frac = float(np.mean([1.0 if r["T1_iii_dominance_rows"] > 0 else 0.0 for r in rs]))
-
-        # Sanity: average per-row pass mass
         n_rows_total = sum(r["n_rows"] for r in rs)
         n_pass_i = sum(int(r["T1_i_pass_rate"] * r["n_rows"]) for r in rs)
         n_pass_ii = sum(int(r["T1_ii_pass_rate"] * r["n_rows"]) for r in rs)
-
-        # Strict descent stats
         strict_dec_rate = float(np.mean([r["T1_i_strict_decrease_rate"] for r in rs]))
         no_change_rate = float(np.mean([r["T1_i_no_change_rate"] for r in rs]))
 
-        summary[base] = {
+        summary[f"{base}::{mode}"] = {
+            "base": base,
+            "mode": mode,
             "T1_i_layer_avg":   T1_i,
             "T1_ii_layer_avg":  T1_ii,
             "T1_iii_layer_avg": T1_iii,
@@ -319,15 +347,19 @@ def evaluate_theorems(results: List[Dict]) -> Dict:
             "n_rows_total": n_rows_total,
         }
 
-    # Theorem 2: holds iff Theorem 1 holds for *every* base quantizer
-    T2_pass = all(
-        s["T1_i_layer_avg"] >= 0.999 and s["T1_ii_layer_avg"] >= 0.999 and
-        (np.isnan(s["T1_iii_layer_avg"]) or s["T1_iii_layer_avg"] >= 0.95)
-        for s in summary.values()
-    )
+    # Theorem 2: literal claim is the 'insample' case across all bases.
+    insample_summaries = [s for s in summary.values() if s["mode"] == "insample"]
+    if insample_summaries:
+        T2_pass = all(
+            s["T1_i_layer_avg"] >= 0.999 and s["T1_ii_layer_avg"] >= 0.999 and
+            (np.isnan(s["T1_iii_layer_avg"]) or s["T1_iii_layer_avg"] >= 0.95)
+            for s in insample_summaries
+        )
+    else:
+        T2_pass = False
 
     return {
-        "by_base": summary,
+        "by_key": summary,
         "T2_universal_pass": T2_pass,
     }
 
@@ -342,69 +374,73 @@ def print_report(results: List[Dict], verdict: Dict):
     print("""\
 Theorem 1 (per-row, per-layer):
   (i)   B_j(e') ≤ B_j(e)
-  (ii)  |V_j(e') − V_j(e)| ≤ B_j · s_max · (2 ‖Σ e_j‖_∞ + s_max ‖Σ‖_∞)
+  (ii)  |V_j(e') − V_j(e)| ≤ 2 B_j s_max ‖Σ e_j‖∞ + B_j² s_max² ‖Σ‖∞
   (iii) if B_j(e) > RHS_ii  then  B_j(e') + V_j(e') < B_j(e) + V_j(e)
 
 Theorem 2: claims (i)(ii)(iii) hold for any lattice-valued base quantizer Q.
 We verify across multiple Q ∈ {NTR, AWQ}.
+
+Modes:
+  insample — μ in the theorem = μ EGBC used (THE THEOREM)
+  crossval — μ in the theorem = eval-set μ (robustness, NOT the theorem)
 """)
 
-    # Per-(layer, eval, base) table
+    # Per-row table (base, mode, layer)
     print("-" * 96)
-    print(f"{'layer@eval':<60s} {'base':<6s} {'T1(i)%':>8s} {'T1(ii)%':>9s} "
-          f"{'T1(iii)%':>10s} {'flip_rows':>10s}")
+    print(f"{'layer@eval':<55s} {'base':<5s} {'mode':<9s} "
+          f"{'T1(i)%':>7s} {'T1(ii)%':>8s} {'T1(iii)%':>9s} {'flip_rows':>10s}")
     print("-" * 96)
-    for r in sorted(results, key=lambda x: (x["base"], x["name"])):
+    for r in sorted(results, key=lambda x: (x["base"], x.get("mode","-"), x["name"])):
         iii = r["T1_iii_pass_rate"]
         iii_str = "  n/a   " if np.isnan(iii) else f"{iii*100:8.2f}"
-        print(f"{r['name']:<60s} {r['base']:<6s} "
-              f"{r['T1_i_pass_rate']*100:7.3f} {r['T1_ii_pass_rate']*100:8.3f} "
-              f"{iii_str:>10s} {r['n_flipped_rows']:>10d}")
+        print(f"{r['name']:<55s} {r['base']:<5s} {r.get('mode','-'):<9s} "
+              f"{r['T1_i_pass_rate']*100:6.2f} {r['T1_ii_pass_rate']*100:7.2f} "
+              f"{iii_str:>9s} {r['n_flipped_rows']:>10d}")
 
     print()
     print("-" * 96)
-    print("THEOREM 1 — aggregate (per base quantizer):")
+    print("THEOREM 1 — aggregate (per base × mode):")
     print("-" * 96)
-    for base, s in verdict["by_base"].items():
-        print(f"  base = {base}")
+    # Insample first, crossval second
+    keys_ordered = sorted(verdict["by_key"].keys(), key=lambda k: (k.split("::")[1] != "insample", k))
+    for key in keys_ordered:
+        s = verdict["by_key"][key]
+        is_theorem = (s["mode"] == "insample")
+        tag = "[THEOREM]   " if is_theorem else "[robustness]"
+        print(f"  {tag}  base = {s['base']:<5s}  mode = {s['mode']}")
         print(f"    T1(i)  layer-avg pass rate:                  {s['T1_i_layer_avg']*100:7.3f}%   "
-              f"(predicted: 100.000%)")
+              + ("(predicted: 100.000%)" if is_theorem else "(generalisation; theorem mute)"))
         print(f"    T1(ii) layer-avg pass rate:                  {s['T1_ii_layer_avg']*100:7.3f}%   "
-              f"(predicted: 100.000%)")
+              + ("(predicted: 100.000%)" if is_theorem else "(generalisation; theorem mute)"))
         if np.isnan(s["T1_iii_layer_avg"]):
             print(f"    T1(iii) no layer met the dominance condition")
         else:
             print(f"    T1(iii) layer-avg pass rate (where dom.):    {s['T1_iii_layer_avg']*100:7.3f}%   "
-                  f"(predicted: 100.000%)")
+                  + ("(predicted: 100.000%)" if is_theorem else "(generalisation)"))
             print(f"    T1(iii) fraction of layers with dominance:   {s['T1_iii_layer_frac_with_dominance']*100:7.2f}%")
-        print(f"    T1(i)  total per-row pass rate:              {s['T1_i_row_total_pass_rate']*100:7.3f}%")
-        print(f"    T1(ii) total per-row pass rate:              {s['T1_ii_row_total_pass_rate']*100:7.3f}%")
         print(f"    Rows with STRICT bias decrease:              {s['T1_i_strict_decrease_rate']*100:7.3f}%")
         print(f"    Rows with NO flips (bias unchanged):         {s['T1_i_no_change_rate']*100:7.3f}%")
         print()
 
     print("-" * 96)
-    print("THEOREM 2 — universality across base quantizers:")
+    print("THEOREM 2 — universality across base quantizers (literal claim, insample only):")
     print("-" * 96)
-    bases = list(verdict["by_base"].keys())
-    print(f"    Verified for base quantizers: {bases}")
-    print(f"    Universal pass:               "
-          f"{'PASS' if verdict['T2_universal_pass'] else 'FAIL'}")
+    insample_keys = [k for k in verdict["by_key"] if k.endswith("::insample")]
+    insample_bases = [k.split("::")[0] for k in insample_keys]
+    print(f"    Verified for base quantizers: {insample_bases}")
+    print(f"    Universal pass: {'PASS' if verdict['T2_universal_pass'] else 'FAIL'}")
     print("=" * 96)
 
-    # Sanity caveats
     print("""\
 Notes on interpretation:
-  - T1(i) and T1(ii) are deterministic structural properties of the EGBC algorithm:
-    they should pass at 100% modulo fp32→fp64 round-off.  A pass rate below 99.9%
-    on a single (layer, eval) row indicates a bug in the flip operator or the
-    measurement code, NOT a failure of the theorem.
-  - T1(iii) is a *conditional* statement.  The interesting case is when the
-    dominance fraction is substantial; if it's near zero, the layer was already
-    nearly bias-free and the theorem trivially says "no improvement available."
-  - The variance bound (ii) is intentionally loose — it uses ‖·‖_∞ norms — so its
-    slack (var_rhs − |var_change|) will be large in practice.  This is FINE:
-    "the inequality holds with slack" is exactly what the theorem promises.
+  - INSAMPLE rows test the literal theorem.  Expected: T1(i)/T1(ii) at 100%.
+    Any failure here is a bug.
+  - CROSSVAL rows test robustness: does a flip designed against μ_cal still
+    reduce bias when measured against the deployment μ_eval?  T1(i) below
+    100% in this row is generalisation gap, NOT a theorem violation.
+  - T1(iii) is conditional.  Reported only over rows where the dominance
+    condition holds.  Low dominance fraction => the theorem trivially says
+    "no improvement available" for those rows.
 """)
 
 
@@ -449,6 +485,11 @@ def main():
     p.add_argument("--no-james-stein", dest="use_james_stein", action="store_false")
     p.add_argument("--base-quantizers", nargs="+", default=["ntr", "awq"],
                    choices=["ntr", "awq"])
+    p.add_argument("--mode", choices=["insample", "crossval", "both"], default="both",
+                   help="insample: evaluate Theorem 1 against the same μ EGBC used "
+                        "(this is what the theorem literally states). "
+                        "crossval: use eval-set μ; tests robustness to cal-eval shift. "
+                        "both: report both side-by-side (default).")
     p.add_argument("--model-dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
     p.add_argument("--max-cal-tokens-per-layer", type=int, default=200_000)
     p.add_argument("--max-eval-tokens-per-layer", type=int, default=200_000)
@@ -527,26 +568,34 @@ def main():
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    # ---- 3) Per-(layer, eval, base) measurement ------------------------------
-    print(f"\n[3/3] Theorem 1 checks per (layer × eval × base)")
+    # ---- 3) Per-(layer, eval, base, mode) measurement -----------------------
+    if args.mode == "both":
+        modes = ["insample", "crossval"]
+    else:
+        modes = [args.mode]
+
+    print(f"\n[3/3] Theorem 1 checks per (layer × eval × base × mode), modes={modes}")
     results: List[Dict] = []
     for name in tqdm(module_names, desc="layers"):
         mod = model.get_submodule(name)
         W = mod.weight.detach()
         for ev in args.eval_datasets:
             for base in args.base_quantizers:
-                row = measure_layer(
-                    name=f"{name}@{ev}",
-                    W_fp=W, base=base,
-                    cal_stats=cal_stats[name],
-                    eval_stats=eval_stats_per_module[name][ev],
-                    bits=args.bits, group_size=args.group_size,
-                    flip_budget_pct=args.flip_budget_pct,
-                    knee_tolerance=args.knee_tolerance,
-                    use_james_stein=args.use_james_stein,
-                    device=device,
-                )
-                results.append(row)
+                for mode in modes:
+                    row = measure_layer(
+                        name=f"{name}@{ev}",
+                        W_fp=W, base=base,
+                        cal_stats=cal_stats[name],
+                        eval_stats=eval_stats_per_module[name][ev],
+                        bits=args.bits, group_size=args.group_size,
+                        flip_budget_pct=args.flip_budget_pct,
+                        knee_tolerance=args.knee_tolerance,
+                        use_james_stein=args.use_james_stein,
+                        device=device,
+                        mode=mode,
+                    )
+                    row["mode"] = mode
+                    results.append(row)
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
