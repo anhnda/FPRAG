@@ -686,7 +686,7 @@ def main():
     p.add_argument("--knee-tolerance", type=float, default=0.01)
     p.add_argument("--use-james-stein", action="store_true", default=True)
     p.add_argument("--no-james-stein", dest="use_james_stein", action="store_false")
-    p.add_argument("--base-quantizers", nargs="+", default=["ntr", "awq"], choices=["ntr", "awq"])
+    p.add_argument("--base-quantizers", nargs="+", default=["ntr"], choices=["ntr", "awq"])
     p.add_argument("--mode", choices=["insample", "crossval", "both"], default="both")
     p.add_argument("--model-dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
     p.add_argument("--max-cal-tokens-per-layer", type=int, default=200_000)
