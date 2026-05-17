@@ -38,10 +38,10 @@ eval_quantized_model() {
 # =============================================================
 
 # 1. Evaluate the standard RTN model
-eval_quantized_model "model_rtn" "./quantized_models/model_rtn"
+# eval_quantized_model "model_rtn" "./quantized_models/model_rtn"
 
 # 2. Evaluate the RTN JS model
-eval_quantized_model "model_rtn_js" "./quantized_models/model_rtn_js_xl"
+eval_quantized_model "model_snc" "./quantized_models/model_awq_snc"
 
 
 echo "================================================="
