@@ -1,52 +1,48 @@
 """
-RTN + James-Stein Bias Correction (XL Version)
+RTN + James-Stein + Heuristic-Guided Rounding (XL Version)
 
-Extends raw RTN with a single, theoretically-motivated correction step:
-after RTN quantization, the per-output bias of each Linear layer is updated by
+This is the RTN-analog of `awq_js_xl.py`: same heuristic-guided global greedy
+rounding (Kneedle outlier detection + per-output max-flip cap), but *without*
+AWQ's per-channel scaling search. The only activation statistic consumed is
+the James-Stein-shrunk per-channel mean E[X]_JS.
 
-        b_new = b + (W - W_q) · E[X]_JS
+Why this is the right RTN counterpart
+-------------------------------------
+For Y = X W^T (+ b), the per-output expected error from quantization is
 
-where E[X]_JS is the James-Stein shrinkage estimate of the per-input-channel
-activation mean, computed from a small calibration set.
+        E[ΔY_i] = sum_j  E[X_j] * (W_ij - W_q_ij)              (1)
 
-Why this works
---------------
-For Y = X W^T + b, the expected output error introduced by replacing W with W_q is
+Plain RTN minimizes |W - W_q| element-wise, which is NOT the same as
+minimizing |E[ΔY]|. Heuristic-guided rounding starts from RTN and greedily
+"flips" rounding decisions (up <-> down by 1 quant step) to drive |E[ΔY_i]|
+toward 0 per row, ordered by rounding regret. James-Stein gives a
+low-variance estimate of E[X] under small calibration.
 
-        E[ΔY] = E[X] · (W - W_q)^T
+Knobs (same semantics as awq_js_xl.py)
+--------------------------------------
+  --knee-tolerance      Offset added to the Kneedle knee index (descending-
+                        sorted |E[X]|). Larger → MORE channels masked as
+                        outliers (more conservative).
+  --max-flip-percent    Per-output-row cap on the fraction of in-channels
+                        that may be flipped. 0.05 = 5% of in_features.
+  --skip-lm-head        Default True. Leave lm_head in full precision.
+                        If False, lm_head is processed in chunks along the
+                        output dimension.
 
-This is a constant vector per output channel and can be absorbed exactly into
-the bias term — making the *mean* of the quantization error zero per output
-channel, without touching the weights themselves. The variance of ΔY is
-unchanged; only the bias is corrected. This is "RTN, but with the first-order
-output statistics fixed for free."
-
-Using James-Stein for E[X]
---------------------------
-When p (= in_features) ≥ 3, the James-Stein estimator dominates the MLE
-(sample mean) in total MSE over the channel-wise mean vector:
-
-        μ̂_JS[j] = μ̄ + (1 - c) · (X̄[j] - μ̄),   c = (p - 2) σ² / Σ(X̄[j] - μ̄)²
-
-It shrinks noisy per-channel means toward the grand mean μ̄, which is the
-right thing to do under a small-calibration regime (few hundred samples,
-thousands of channels). Plain RTN ignores activation statistics entirely;
-JS gives us a *low-variance* estimate of the only first-order activation
-quantity that matters for bias correction.
+Pipeline per layer
+------------------
+  1. Calibrate to collect activations (CPU float32, subsampled along seq).
+  2. Compute E[X]_JS.
+  3. Group-wise asymmetric RTN → W_int, scale, zp.
+  4. Compute current per-row expected error using E[X]_JS.
+  5. Build flip candidates; mask outlier channels via Kneedle on |E[X]_JS|.
+  6. Greedily pick flips per row, capped at max_flip_percent of in_features.
+  7. Dequantize. Weight replaced; bias untouched.
 
 XL handling
 -----------
-- Batched sequential calibration to bound peak RAM/VRAM
-- lm_head split into chunks for the (W - W_q) · E[X] matmul
-- --skip-lm-head defaults to True (common practice — quantizing lm_head on
-  large-vocab models tends to hurt PPL more than it saves memory)
-
-Notes
------
-- This is a *bias-only* correction. The weights are exactly the RTN weights.
-  If a layer has no bias, one is created (shape [out_features], dtype = W.dtype).
-- Calibration is much lighter than AWQ: no grid search, no scaling search.
-  We only need E[X] per layer.
+Batched sequential calibration; lm_head split into lmhead_chunks along the
+output dim so peak memory is bounded.
 """
 
 import torch
@@ -71,26 +67,55 @@ try:
     from calibration_utils import get_c4_calibration_data, get_wikitext2_calibration_data
 except ImportError:
     print("⚠️  calibration_utils not found. Use --calib-dataset wikitext2-simple as fallback.")
-    def get_c4_calibration_data(*a, **k): raise NotImplementedError("calibration_utils.py missing")
-    def get_wikitext2_calibration_data(*a, **k): raise NotImplementedError("calibration_utils.py missing")
+    def get_c4_calibration_data(*a, **k):
+        raise NotImplementedError("calibration_utils.py missing")
+    def get_wikitext2_calibration_data(*a, **k):
+        raise NotImplementedError("calibration_utils.py missing")
 
 
 # ---------------------------------------------------------------------------
-# James-Stein estimator for the per-channel activation mean
+# Kneedle knee-point finder (matches awq_js_xl.py)
+# ---------------------------------------------------------------------------
+
+def find_knee_point(values, tolerance_offset=0.0):
+    """
+    Max-distance-from-chord knee. Returns an index in [0, n-1]; tolerance_offset
+    (as a fraction of n) shifts the knee toward later indices (more conservative).
+    """
+    n = len(values)
+    if n < 3:
+        return n // 2
+
+    if torch.is_tensor(values):
+        y = values.cpu().float().numpy()
+    else:
+        y = np.asarray(values)
+
+    y_min, y_max = y.min(), y.max()
+    if y_max - y_min < 1e-10:
+        return n // 2
+
+    y_norm = (y - y_min) / (y_max - y_min)
+    x_norm = np.linspace(0, 1, n)
+    y_line = y_norm[0] + (y_norm[-1] - y_norm[0]) * x_norm
+    distances = np.abs(y_norm - y_line)
+    knee_idx = int(np.argmax(distances))
+
+    if knee_idx < n - 1:
+        offset_indices = int(tolerance_offset * n)
+        knee_idx = max(0, min(knee_idx + offset_indices, n - 1))
+    return knee_idx
+
+
+# ---------------------------------------------------------------------------
+# James-Stein shrinkage for per-channel means
 # ---------------------------------------------------------------------------
 
 def compute_james_stein_mean(raw_means, variance_estimate=None):
     """
-    Apply James-Stein shrinkage to a vector of per-channel sample means.
+    μ̂_JS[j] = μ̄ + (1 - c) · (X̄[j] - μ̄),   c = (p - 2) σ² / Σ(X̄[j] - μ̄)²
 
-    Args:
-        raw_means: [p] tensor of sample means (one per input channel)
-        variance_estimate: optional scalar σ² estimate; if None, uses a
-            robust (mean-absolute-deviation)² estimate.
-
-    Returns:
-        [p] tensor of shrunk means. Falls back to raw_means when p < 3
-        or when the sum of squared deviations is degenerate.
+    Falls through unchanged when p < 3 or when deviations are degenerate.
     """
     p = raw_means.numel()
     if p < 3:
@@ -99,18 +124,15 @@ def compute_james_stein_mean(raw_means, variance_estimate=None):
     grand_mean = raw_means.mean()
     deviations = raw_means - grand_mean
     sum_sq_dev = (deviations ** 2).sum()
-
     if sum_sq_dev < 1e-10:
         return raw_means
 
     if variance_estimate is None:
-        # Robust scalar variance proxy: (mean |X - μ̄|)²
         variance_estimate = ((raw_means - grand_mean).abs().mean()) ** 2
         variance_estimate = variance_estimate.clamp(min=1e-8)
 
     c = ((p - 2) * variance_estimate) / sum_sq_dev
-    c = c.clamp(0.0, 1.0)  # keep in the safe shrinkage regime
-
+    c = c.clamp(0.0, 1.0)
     return grand_mean + (1.0 - c) * deviations
 
 
@@ -118,9 +140,11 @@ def compute_james_stein_mean(raw_means, variance_estimate=None):
 # Quantizer
 # ---------------------------------------------------------------------------
 
-class RTN_JS_XL_Quantizer:
+class RTN_JS_Heuristic_XL_Quantizer:
     def __init__(self, model, tokenizer, device="cuda", bits=4, group_size=128,
-                 use_james_stein=True, skip_lm_head=True,
+                 use_heuristic=True, use_james_stein=True,
+                 knee_tolerance=0.0, max_flip_percent=0.05,
+                 skip_lm_head=True,
                  max_tokens_per_sample=2048, layer_batch_size=16,
                  lmhead_chunks=4):
         self.model = model
@@ -128,55 +152,54 @@ class RTN_JS_XL_Quantizer:
         self.device = device
         self.bits = bits
         self.group_size = group_size
+        self.use_heuristic = use_heuristic
         self.use_james_stein = use_james_stein
+        self.knee_tolerance = knee_tolerance
+        self.max_flip_percent = max_flip_percent
         self.skip_lm_head = skip_lm_head
         self.max_tokens_per_sample = max_tokens_per_sample
         self.layer_batch_size = layer_batch_size
         self.lmhead_chunks = lmhead_chunks
 
-        self.activation_data = {}      # name -> list of CPU float32 tensors
-        self.layer_stats = {}          # name -> {'error': float, 'bias_norm': float, ...}
+        self.activation_data = {}    # name -> list[CPU float32 tensor]
+        self.layer_stats = {}        # name -> dict
 
-        print(f"\n[RTN + James-Stein Bias Correction (XL) Initialized]")
-        print(f"  Target bits: {bits}")
-        print(f"  Group size: {group_size}")
-        print(f"  Skip lm_head: {skip_lm_head}")
-        print(f"  Use James-Stein for E[X]: {use_james_stein}")
-        print(f"  Layer batch size: {layer_batch_size}")
-        print(f"  lm_head chunks: {lmhead_chunks}")
-        print(f"  Tokens per sample: {max_tokens_per_sample}")
-        print(f"  Quantization: GROUP-WISE ASYMMETRIC [0, {2**bits - 1}]")
+        max_int = 2 ** bits - 1
+        print(f"\n[RTN + James-Stein + Heuristic Rounding (XL) Initialized]")
+        print(f"  Target bits:          {bits}")
+        print(f"  Group size:           {group_size}")
+        print(f"  Skip lm_head:         {skip_lm_head}")
+        print(f"  Use heuristic:        {use_heuristic}")
+        print(f"  Use James-Stein E[X]: {use_james_stein}")
+        if use_heuristic:
+            print(f"  Outlier detection:    Kneedle on sorted |E[X]|")
+            print(f"  Knee tolerance:       {knee_tolerance:.6f}")
+            print(f"  Max flip percent:     {max_flip_percent*100:.2f}% per output row")
+        print(f"  Layer batch size:     {layer_batch_size}")
+        print(f"  lm_head chunks:       {lmhead_chunks}")
+        print(f"  Tokens per sample:    {max_tokens_per_sample}")
+        print(f"  Quantization:         GROUP-WISE ASYMMETRIC [0, {max_int}]")
 
-    # ----- activation hook ----------------------------------------------------
+    # ----- activation hook ---------------------------------------------------
 
     def get_hook(self, name):
         def hook(_module, input, _output):
             if name not in self.activation_data:
                 self.activation_data[name] = []
             inp = input[0] if isinstance(input, tuple) else input
-
-            # Token subsampling along seq dim
             if inp.dim() == 3 and inp.shape[1] > self.max_tokens_per_sample:
                 seq_len = inp.shape[1]
                 idx = torch.randperm(seq_len, device=inp.device)[:self.max_tokens_per_sample]
                 idx = idx.sort()[0]
                 inp = inp[:, idx, :]
-
-            # Store on CPU in float32 for numerically clean accumulation
             self.activation_data[name].append(inp.detach().cpu().float())
         return hook
 
     @torch.no_grad()
     def get_activation_mean(self, name, in_features):
-        """
-        Compute per-input-channel mean E[X[:, j]] (JS-shrunk if enabled).
-
-        Returns:
-            [in_features] tensor on CPU float32, or None if no calibration data.
-        """
+        """Return [in_features] CPU float32 tensor of E[X], JS-shrunk if enabled."""
         if name not in self.activation_data or len(self.activation_data[name]) == 0:
             return None
-
         mean_sum = torch.zeros(in_features, dtype=torch.float32)
         total = 0
         for x in self.activation_data[name]:
@@ -186,168 +209,316 @@ class RTN_JS_XL_Quantizer:
         if total == 0:
             return None
         raw_mean = mean_sum / total
+        return compute_james_stein_mean(raw_mean) if self.use_james_stein else raw_mean
 
-        if self.use_james_stein:
-            return compute_james_stein_mean(raw_mean)
-        return raw_mean
-
-    # ----- core RTN quantization ---------------------------------------------
+    # ----- Kneedle outlier threshold on |E[X]| ------------------------------
 
     @torch.no_grad()
-    def quantize_weight_groupwise_asymmetric(self, W):
-        """Standard group-wise asymmetric RTN. Returns dequantized W (same dtype)."""
+    def compute_dynamic_outlier_threshold(self, activation_means, debug=False):
+        """
+        Sort |E[X]| descending; apply Kneedle to the first half to find the
+        outlier→normal transition. Channels with |E[X]| > threshold are
+        MASKED OUT of the flip pool (we don't try to fix their error via flips).
+        Returns (threshold_value, outlier_percent).
+        """
+        sorted_desc, _ = torch.sort(activation_means.abs(), descending=True)
+        n = len(sorted_desc)
+        first_half = sorted_desc[: n // 2]
+
+        if len(first_half) < 3:
+            threshold_idx = max(0, int(0.05 * n))
+            threshold = sorted_desc[threshold_idx].item()
+            outlier_pct = 0.05
+            if debug:
+                print(f"    DEBUG: too few channels for Kneedle, using top 5%")
+            return threshold, outlier_pct
+
+        knee_idx = find_knee_point(first_half, tolerance_offset=self.knee_tolerance)
+        threshold = sorted_desc[knee_idx].item()
+        num_outliers = (activation_means.abs() >= threshold).sum().item()
+        outlier_pct = num_outliers / n
+
+        if debug:
+            print(f"    DEBUG: sorted |E[X]| desc: [{sorted_desc[0]:.4e} .. {sorted_desc[-1]:.4e}]")
+            print(f"    DEBUG: knee idx = {knee_idx}/{n} ({knee_idx/n*100:.1f}%)")
+            print(f"    DEBUG: threshold = {threshold:.4e}, outliers = "
+                  f"{num_outliers}/{n} ({outlier_pct*100:.2f}%)")
+        return threshold, outlier_pct
+
+    # ----- core: heuristic-guided group-wise asymmetric quantization --------
+
+    @torch.no_grad()
+    def quantize_weight_heuristic_groupwise(self, W, ex_mean, debug=False):
+        """
+        RTN group-wise asym → optional heuristic flips guided by E[X].
+
+        Args:
+            W: [out, in] weight, on device
+            ex_mean: [in] per-input-channel activation mean (E[X]_JS), on device
+            debug: verbose Kneedle output for first call
+
+        Returns:
+            W_dequant: [out, in] fake-quantized weight (same dtype as W)
+            outlier_percent: float or None
+            flip_stats: dict
+        """
         out_features, in_features = W.shape
         device = W.device
         dtype = W.dtype
 
+        # ---- 1. pad + group-wise asym scale/zp ----
         n_groups = (in_features + self.group_size - 1) // self.group_size
         padded_in = n_groups * self.group_size
 
         if padded_in > in_features:
             W_padded = torch.zeros(out_features, padded_in, device=device, dtype=dtype)
             W_padded[:, :in_features] = W
+            act_padded = torch.zeros(padded_in, device=device, dtype=dtype)
+            act_padded[:in_features] = ex_mean
         else:
             W_padded = W
+            act_padded = ex_mean
 
         W_g = W_padded.reshape(out_features, n_groups, self.group_size)
         w_min = W_g.min(dim=2, keepdim=True)[0]
         w_max = W_g.max(dim=2, keepdim=True)[0]
 
         max_int = 2 ** self.bits - 1
-        scale = (w_max - w_min) / max_int
-        scale = scale.clamp(min=1e-8)
+        scale = ((w_max - w_min) / max_int).clamp(min=1e-8)
         zp = torch.round(-w_min / scale).clamp(0, max_int)
 
-        W_int = torch.round(W_g / scale + zp).clamp(0, max_int)
-        W_dq_g = (W_int - zp) * scale
+        scale_flat = scale.repeat(1, 1, self.group_size).reshape(out_features, padded_in)
+        zp_flat = zp.repeat(1, 1, self.group_size).reshape(out_features, padded_in)
 
-        W_dq = W_dq_g.reshape(out_features, padded_in)
+        # ---- 2. RTN nearest-rounding ----
+        W_div = W_padded / scale_flat
+        W_int = torch.round(W_div + zp_flat).clamp(0, max_int)
+
+        # Path A: pure RTN, no flips
+        if not self.use_heuristic:
+            W_dq = (W_int - zp_flat) * scale_flat
+            if padded_in > in_features:
+                W_dq = W_dq[:, :in_features]
+            empty = {k: 0 for k in (
+                'total', 'per_row_mean', 'per_row_max', 'per_row_cap',
+                'per_channel_mean', 'per_channel_median', 'per_channel_std',
+                'per_channel_p95', 'per_channel_p99')}
+            empty['per_channel_zero_pct'] = 100.0
+            return W_dq.to(dtype), None, empty
+
+        # ---- 3. current per-row expected output error ----
+        W_quant = (W_int - zp_flat) * scale_flat
+        W_diff = W_padded - W_quant
+        current_error = (W_diff * act_padded.unsqueeze(0)).sum(dim=1)  # [out]
+
+        # ---- 4. flip candidates ----
+        # Sign of (W_div + zp_flat - W_int) gives the direction of residual.
+        # flip_dir == +1 → round() rounded DOWN, flipping would INCREMENT int
+        # flip_dir == -1 → round() rounded UP, flipping would DECREMENT int
+        flip_dir = torch.sign(W_div + zp_flat - W_int)
+        flip_dir = torch.where(flip_dir == 0, torch.ones_like(flip_dir), flip_dir)
+
+        # Δ(row_error_i) from flipping (i,j):
+        #   = ex_mean[j] * flip_dir[i,j] * scale_flat[i,j]
+        flip_impacts = act_padded.unsqueeze(0) * flip_dir * scale_flat   # [out, padded_in]
+
+        # ---- 5. validity masks ----
+        # Only flip if doing so REDUCES |current_error| → sign(impact) == sign(error)
+        target_sign = torch.sign(current_error).unsqueeze(1)
+        valid_mask = (torch.sign(flip_impacts) == target_sign)
+
+        # Proposed int must remain in [0, max_int]
+        w_int_proposed = W_int + flip_dir
+        in_range = (w_int_proposed >= 0) & (w_int_proposed <= max_int)
+        valid_mask = valid_mask & in_range
+
+        # Outlier masking: never flip in outlier channels
+        outlier_threshold, outlier_pct = self.compute_dynamic_outlier_threshold(
+            act_padded, debug=debug)
+        is_outlier = act_padded.abs() > outlier_threshold
+        valid_mask = valid_mask & (~is_outlier).unsqueeze(0)
+
+        # ---- 6. sort flips by rounding regret (closeness to 0.5) ----
+        rounding_costs = (W_div + zp_flat - W_int).abs()         # in [0, 0.5]
+        rc_masked = rounding_costs.clone()
+        rc_masked[~valid_mask] = -1.0                            # invalid → end
+
+        sorted_indices = torch.argsort(rc_masked, dim=1, descending=True)
+        sorted_impacts = torch.gather(flip_impacts, 1, sorted_indices)
+        sorted_validity = torch.gather(valid_mask.long(), 1, sorted_indices)
+        sorted_impacts = sorted_impacts * sorted_validity
+
+        # ---- 7. choose best-k per row ----
+        cumsum_impacts = torch.cumsum(sorted_impacts, dim=1)
+        residuals = torch.abs(current_error.unsqueeze(1) - cumsum_impacts)
+        zero_k = torch.abs(current_error).unsqueeze(1)
+        all_residuals = torch.cat([zero_k, residuals], dim=1)
+        best_k = torch.argmin(all_residuals, dim=1)              # in [0, padded_in]
+
+        idx_range = torch.arange(padded_in, device=device).unsqueeze(0)
+        flip_mask_sorted = idx_range < best_k.unsqueeze(1)
+        final_flips_sorted = flip_mask_sorted & sorted_validity.bool()
+
+        # ---- 8. enforce max_flip_percent per output row ----
+        # cap measured against in_features (real, not padded)
+        max_flips_per_row = max(1, int(self.max_flip_percent * in_features))
+        cumsum_flips = final_flips_sorted.long().cumsum(dim=1)
+        within_cap = cumsum_flips <= max_flips_per_row
+        final_flips_sorted = final_flips_sorted & within_cap
+
+        # ---- 9. apply flips back to W_int ----
+        sorted_flip_dir = torch.gather(flip_dir, 1, sorted_indices)
+        sorted_flip_dir = torch.where(final_flips_sorted, sorted_flip_dir,
+                                      torch.zeros_like(sorted_flip_dir))
+        W_int.scatter_add_(1, sorted_indices, sorted_flip_dir)
+        W_int.clamp_(0, max_int)
+
+        # ---- 10. flip statistics ----
+        flips_per_row = final_flips_sorted.sum(dim=1).float()        # [out]
+        flips_per_channel = final_flips_sorted.sum(dim=0).float()    # [padded_in]
         if padded_in > in_features:
-            W_dq = W_dq[:, :in_features]
-        return W_dq.to(dtype)
+            flips_per_channel = flips_per_channel[:in_features]
 
-    # ----- bias correction ----------------------------------------------------
-
-    @torch.no_grad()
-    def apply_bias_correction(self, module, W_orig, W_q, ex_mean):
-        """
-        b_new = b + (W_orig - W_q) · E[X]_JS
-
-        Args:
-            module: nn.Linear
-            W_orig: original full-precision weight [out, in] (on device)
-            W_q:    quantized (dequantized) weight  [out, in] (on device)
-            ex_mean: [in] activation-mean estimate (on device, weight dtype)
-        Returns:
-            float: L2 norm of the correction vector, for logging.
-        """
-        # delta_b[i] = sum_j (W_orig[i, j] - W_q[i, j]) * E[X][j]
-        delta = W_orig - W_q                          # [out, in]
-        delta_b = delta.matmul(ex_mean)               # [out]
-
-        out_features = module.weight.shape[0]
-        if module.bias is None:
-            module.bias = nn.Parameter(
-                torch.zeros(out_features, device=module.weight.device, dtype=module.weight.dtype),
-                requires_grad=False,
-            )
-        module.bias.data = (module.bias.data + delta_b.to(module.bias.dtype))
-        return delta_b.float().norm().item()
-
-    @torch.no_grad()
-    def apply_bias_correction_chunked(self, module, W_orig, W_q, ex_mean, n_chunks):
-        """
-        Same as apply_bias_correction but materializes (W - W_q) · E[X] in chunks
-        along the output dimension. Used for lm_head on big-vocab models.
-        """
-        out_features = module.weight.shape[0]
-        chunk_size = (out_features + n_chunks - 1) // n_chunks
-
-        if module.bias is None:
-            module.bias = nn.Parameter(
-                torch.zeros(out_features, device=module.weight.device, dtype=module.weight.dtype),
-                requires_grad=False,
-            )
-
-        total_norm_sq = 0.0
-        for start in range(0, out_features, chunk_size):
-            end = min(start + chunk_size, out_features)
-            delta_chunk = W_orig[start:end] - W_q[start:end]
-            delta_b_chunk = delta_chunk.matmul(ex_mean)
-            module.bias.data[start:end] = (
-                module.bias.data[start:end] + delta_b_chunk.to(module.bias.dtype)
-            )
-            total_norm_sq += delta_b_chunk.float().pow(2).sum().item()
-            del delta_chunk, delta_b_chunk
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        return float(np.sqrt(total_norm_sq))
-
-    # ----- per-layer driver ---------------------------------------------------
-
-    @torch.no_grad()
-    def quantize_layer(self, name, module, is_lmhead=False):
-        """
-        Apply RTN then (if calibration available) JS bias correction.
-        For lm_head, chunk the bias-correction matmul.
-        """
-        W = module.weight.data
-        in_features = W.shape[1]
-        original_dtype = W.dtype
-
-        # Keep original weights for the correction term BEFORE we overwrite them.
-        # For lm_head we keep on the same device but the per-chunk matmul keeps
-        # peak memory bounded.
-        W_orig = W.clone()
-
-        # 1. RTN
-        W_q = self.quantize_weight_groupwise_asymmetric(W)
-        module.weight.data = W_q.to(original_dtype)
-
-        # 2. JS bias correction (only if we have calibration data)
-        ex_mean = self.get_activation_mean(name, in_features)
-        if ex_mean is not None:
-            ex_mean = ex_mean.to(self.device).to(original_dtype)
-            if is_lmhead:
-                bias_norm = self.apply_bias_correction_chunked(
-                    module, W_orig, module.weight.data, ex_mean, n_chunks=self.lmhead_chunks
-                )
-            else:
-                bias_norm = self.apply_bias_correction(
-                    module, W_orig, module.weight.data, ex_mean
-                )
-        else:
-            bias_norm = 0.0
-
-        # 3. Cheap layer-wise diagnostic: weight quantization MSE
-        with torch.no_grad():
-            mse = (W_orig - module.weight.data).float().pow(2).mean().item()
-
-        self.layer_stats[name] = {
-            'weight_mse': mse,
-            'bias_correction_norm': bias_norm,
-            'had_calib': ex_mean is not None,
+        flip_stats = {
+            'total': int(final_flips_sorted.sum().item()),
+            'per_row_mean':         flips_per_row.mean().item(),
+            'per_row_max':          flips_per_row.max().item(),
+            'per_row_cap':          max_flips_per_row,
+            'per_channel_mean':     flips_per_channel.mean().item(),
+            'per_channel_median':   flips_per_channel.median().item(),
+            'per_channel_std':      flips_per_channel.std().item(),
+            'per_channel_p95':      torch.quantile(flips_per_channel, 0.95).item(),
+            'per_channel_p99':      torch.quantile(flips_per_channel, 0.99).item(),
+            'per_channel_zero_pct': (flips_per_channel == 0).float().mean().item() * 100,
         }
 
-        # Cleanup
-        del W_orig, W_q
-        if ex_mean is not None:
-            del ex_mean
+        # ---- 11. dequantize ----
+        W_dq = (W_int - zp_flat) * scale_flat
+        if padded_in > in_features:
+            W_dq = W_dq[:, :in_features]
+        return W_dq.to(dtype), outlier_pct, flip_stats
+
+    # ----- per-layer driver --------------------------------------------------
+
+    @torch.no_grad()
+    def quantize_layer(self, name, module, debug=False):
+        """One non-lm_head Linear layer."""
+        W = module.weight.data
+        in_features = W.shape[1]
+        dtype = W.dtype
+
+        ex_mean_cpu = self.get_activation_mean(name, in_features)
+        if ex_mean_cpu is None:
+            ex_mean = torch.zeros(in_features, device=W.device, dtype=dtype)
+            had_calib = False
+        else:
+            ex_mean = ex_mean_cpu.to(W.device).to(dtype)
+            had_calib = True
+
+        W_dq, outlier_pct, flip_stats = self.quantize_weight_heuristic_groupwise(
+            W, ex_mean, debug=debug
+        )
+        module.weight.data = W_dq
+
+        self.layer_stats[name] = {
+            'had_calib': had_calib,
+            'outlier_percent': outlier_pct if outlier_pct is not None else 0.0,
+            'flip_stats': flip_stats,
+        }
+
         if name in self.activation_data:
             del self.activation_data[name]
+        del ex_mean, W_dq
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         gc.collect()
 
-    # ----- calibration --------------------------------------------------------
+    @torch.no_grad()
+    def quantize_lmhead_chunked(self, name, module, debug=False):
+        """
+        Split lm_head along output dim. Each chunk runs the full heuristic-guided
+        pipeline independently. Outlier detection is identical across chunks
+        (driven by E[X], which is input-side).
+        """
+        print(f"\n  🔧 Special handling for {name} (split into {self.lmhead_chunks} chunks)")
+
+        W = module.weight.data
+        out_features, in_features = W.shape
+        dtype = W.dtype
+        print(f"     Shape: {tuple(W.shape)} ({W.numel()/1e6:.1f}M params)")
+
+        ex_mean_cpu = self.get_activation_mean(name, in_features)
+        if ex_mean_cpu is None:
+            ex_mean = torch.zeros(in_features, device=W.device, dtype=dtype)
+            had_calib = False
+        else:
+            ex_mean = ex_mean_cpu.to(W.device).to(dtype)
+            had_calib = True
+
+        n_chunks = self.lmhead_chunks
+        chunk_size = (out_features + n_chunks - 1) // n_chunks
+
+        W_chunks = []
+        chunk_stats = []
+        for ci in range(n_chunks):
+            s = ci * chunk_size
+            e = min(s + chunk_size, out_features)
+            if s >= e:
+                break
+            print(f"     Chunk {ci+1}/{n_chunks}: rows {s}-{e-1}")
+            W_chunk = W[s:e, :].contiguous()
+            W_dq, outlier_pct, flip_stats = self.quantize_weight_heuristic_groupwise(
+                W_chunk, ex_mean, debug=(debug and ci == 0)
+            )
+            W_chunks.append(W_dq)
+            chunk_stats.append({
+                'outlier_percent': outlier_pct if outlier_pct is not None else 0.0,
+                'flip_stats': flip_stats,
+            })
+            del W_chunk, W_dq
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        W_final = torch.cat(W_chunks, dim=0)
+        module.weight.data = W_final
+
+        total_flips = sum(c['flip_stats']['total'] for c in chunk_stats)
+        avg_outlier = float(np.mean([c['outlier_percent'] for c in chunk_stats]))
+        agg = {
+            'total': total_flips,
+            'per_row_mean':         float(np.mean([c['flip_stats']['per_row_mean'] for c in chunk_stats])),
+            'per_row_max':          float(np.max([c['flip_stats']['per_row_max'] for c in chunk_stats])),
+            'per_row_cap':          chunk_stats[0]['flip_stats']['per_row_cap'],
+            'per_channel_mean':     float(np.mean([c['flip_stats']['per_channel_mean'] for c in chunk_stats])),
+            'per_channel_median':   float(np.mean([c['flip_stats']['per_channel_median'] for c in chunk_stats])),
+            'per_channel_std':      float(np.mean([c['flip_stats']['per_channel_std'] for c in chunk_stats])),
+            'per_channel_p95':      float(np.mean([c['flip_stats']['per_channel_p95'] for c in chunk_stats])),
+            'per_channel_p99':      float(np.mean([c['flip_stats']['per_channel_p99'] for c in chunk_stats])),
+            'per_channel_zero_pct': float(np.mean([c['flip_stats']['per_channel_zero_pct'] for c in chunk_stats])),
+        }
+        self.layer_stats[name] = {
+            'had_calib': had_calib,
+            'outlier_percent': avg_outlier,
+            'flip_stats': agg,
+        }
+
+        if name in self.activation_data:
+            del self.activation_data[name]
+        del ex_mean, W_chunks, W_final
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+
+        print(f"     ✓ total flips={total_flips:,}, "
+              f"outlier%={avg_outlier*100:.2f}%, "
+              f"per_row mean={agg['per_row_mean']:.1f} "
+              f"(cap={agg['per_row_cap']})")
+
+    # ----- calibration -------------------------------------------------------
 
     def calibrate_layer_batch(self, layer_batch, calibration_texts, n_samples):
-        """Register hooks for a batch of layers, run a forward pass, collect E[X]."""
         self.activation_data = {}
-        handles = []
-        for name, module in layer_batch:
-            h = module.register_forward_hook(self.get_hook(name))
-            handles.append(h)
+        handles = [m.register_forward_hook(self.get_hook(n)) for n, m in layer_batch]
 
         successful = 0
         with torch.no_grad():
@@ -369,64 +540,54 @@ class RTN_JS_XL_Quantizer:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         gc.collect()
-
         if successful == 0:
             print("⚠️  No successful calibration passes in this batch.")
 
-    # ----- top-level driver ---------------------------------------------------
+    # ----- top-level driver --------------------------------------------------
 
     def quantize_model(self, calibration_texts, n_samples=128):
         print("\n" + "=" * 80)
-        print("Batched Sequential RTN + JS Bias Correction")
+        print("Batched Sequential RTN + JS + Heuristic Rounding")
         print("=" * 80)
 
-        # Collect all Linear layers, optionally skipping lm_head
         all_layers = [(name, module) for name, module in self.model.named_modules()
                       if isinstance(module, nn.Linear)]
 
-        layers_to_calibrate = []
-        layers_to_rtn_only = []
+        layers_to_q = []
         for name, module in all_layers:
             is_lmhead = ('lm_head' in name.lower()) or name.endswith('lm_head')
             if is_lmhead and self.skip_lm_head:
-                # leave entirely in full precision
                 continue
-            layers_to_calibrate.append((name, module, is_lmhead))
+            layers_to_q.append((name, module, is_lmhead))
 
-        n_total = len(layers_to_calibrate)
-        n_skipped = len(all_layers) - n_total
-        print(f"  Total Linear layers: {len(all_layers)}")
-        print(f"  To quantize:         {n_total}")
-        print(f"  Skipped (lm_head):   {n_skipped}")
+        n_total = len(layers_to_q)
+        print(f"  Total Linear: {len(all_layers)}  |  to quantize: {n_total}  "
+              f"|  skipped (lm_head): {len(all_layers) - n_total}")
 
         n_batches = (n_total + self.layer_batch_size - 1) // self.layer_batch_size
-        print(f"  Batches:             {n_batches} "
-              f"(batch size = {self.layer_batch_size})")
+        print(f"  Batches: {n_batches} (batch size = {self.layer_batch_size})")
 
         quantized = 0
         for b in range(n_batches):
-            start = b * self.layer_batch_size
-            end = min(start + self.layer_batch_size, n_total)
-            batch_triples = layers_to_calibrate[start:end]
-            batch_for_hooks = [(n, m) for (n, m, _) in batch_triples]
+            s = b * self.layer_batch_size
+            e = min(s + self.layer_batch_size, n_total)
+            batch = layers_to_q[s:e]
+            batch_for_hooks = [(n, m) for n, m, _ in batch]
 
-            print(f"\n[Batch {b+1}/{n_batches}] Layers {start}-{end-1}")
-
-            # 1. Calibrate (collect activation means)
+            print(f"\n[Batch {b+1}/{n_batches}] Layers {s}-{e-1}")
             self.calibrate_layer_batch(batch_for_hooks, calibration_texts, n_samples)
 
-            # 2. Quantize each layer + apply bias correction
-            for name, module, is_lmhead in tqdm(batch_triples,
-                                                desc="  Quantize+Correct",
-                                                leave=False):
+            for name, module, is_lmhead in tqdm(batch, desc="  Quantize", leave=False):
                 try:
-                    self.quantize_layer(name, module, is_lmhead=is_lmhead)
+                    if is_lmhead:
+                        self.quantize_lmhead_chunked(name, module, debug=(quantized < 2))
+                    else:
+                        self.quantize_layer(name, module, debug=(quantized < 2))
                     quantized += 1
-                except Exception as e:
-                    print(f"\n⚠️  Error on {name}: {e}")
+                except Exception as exc:
+                    print(f"\n⚠️  Error on {name}: {exc}")
                     continue
 
-            # 3. Wipe batch activations
             self.activation_data = {}
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -435,29 +596,31 @@ class RTN_JS_XL_Quantizer:
             if HAS_PSUTIL:
                 print(f"  RAM after batch {b+1}: {psutil.virtual_memory().percent:.1f}%")
 
-        # ----- summary --------------------------------------------------------
+        # ----- summary -------------------------------------------------------
         print("\n" + "=" * 80)
-        print(f"✓ RTN + JS complete: {quantized}/{n_total} layers")
+        print(f"✓ Done: quantized {quantized}/{n_total} layers")
         print("=" * 80)
 
         if self.layer_stats:
-            mses = [s['weight_mse'] for s in self.layer_stats.values()]
-            biases = [s['bias_correction_norm'] for s in self.layer_stats.values()
-                      if s['had_calib']]
-            n_with_calib = sum(1 for s in self.layer_stats.values() if s['had_calib'])
+            outliers = [s['outlier_percent'] for s in self.layer_stats.values()]
+            print(f"\nOutlier %:  mean={np.mean(outliers)*100:.2f}%  "
+                  f"median={np.median(outliers)*100:.2f}%  "
+                  f"min={np.min(outliers)*100:.2f}%  "
+                  f"max={np.max(outliers)*100:.2f}%")
 
-            print(f"\nWeight quantization MSE:")
-            print(f"  mean   = {np.mean(mses):.4e}")
-            print(f"  median = {np.median(mses):.4e}")
-            print(f"  max    = {np.max(mses):.4e}")
-
-            print(f"\nBias-correction stats ({n_with_calib} layers got E[X]):")
-            if biases:
-                print(f"  ||Δb||₂  mean   = {np.mean(biases):.4e}")
-                print(f"            median = {np.median(biases):.4e}")
-                print(f"            max    = {np.max(biases):.4e}")
-            else:
-                print("  (no layers received calibration — bias correction was a no-op)")
+            if self.use_heuristic:
+                totals = [s['flip_stats']['total'] for s in self.layer_stats.values()]
+                row_means = [s['flip_stats']['per_row_mean'] for s in self.layer_stats.values()]
+                row_maxes = [s['flip_stats']['per_row_max'] for s in self.layer_stats.values()]
+                zero_pcts = [s['flip_stats']['per_channel_zero_pct'] for s in self.layer_stats.values()]
+                print(f"\nFlip statistics:")
+                print(f"  total flips: {int(np.sum(totals)):,}")
+                print(f"  per-layer total: mean={np.mean(totals):,.0f}, "
+                      f"median={np.median(totals):,.0f}, max={int(np.max(totals)):,}")
+                print(f"  per-row count: mean={np.mean(row_means):.2f}, "
+                      f"max={np.max(row_maxes):.0f}  "
+                      f"(cap = {self.max_flip_percent*100:.2f}% of in_features)")
+                print(f"  channels with 0 flips (avg over layers): {np.mean(zero_pcts):.1f}%")
 
 
 # ---------------------------------------------------------------------------
@@ -473,35 +636,39 @@ def load_wikitext2_simple(n_samples=128):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="RTN + James-Stein bias correction (XL).",
+        description="RTN + James-Stein + heuristic-guided rounding (XL).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--n-calib", type=int, default=128,
-                        help="Calibration samples")
+    parser.add_argument("--n-calib", type=int, default=128)
     parser.add_argument("--bits", type=int, default=4, choices=[2, 3, 4, 8])
     parser.add_argument("--group-size", type=int, default=128)
     parser.add_argument("--max-tokens-per-sample", type=int, default=2048)
     parser.add_argument("--layer-batch-size", type=int, default=16)
-    parser.add_argument("--lmhead-chunks", type=int, default=4,
-                        help="Chunks for lm_head bias-correction matmul "
-                             "(only used if --quantize-lm-head is set)")
+    parser.add_argument("--lmhead-chunks", type=int, default=4)
 
+    # heuristic knobs
+    parser.add_argument("--use-heuristic", action="store_true", default=True)
+    parser.add_argument("--no-heuristic", dest="use_heuristic", action="store_false",
+                        help="Disable heuristic flips → pure RTN")
+    parser.add_argument("--knee-tolerance", type=float, default=0.0,
+                        help="Offset added to Kneedle knee index (fraction of n). "
+                             "Larger → more channels masked as outliers.")
+    parser.add_argument("--max-flip-percent", type=float, default=0.05,
+                        help="Max fraction of in_features that may be flipped per output row.")
+
+    # JS
+    parser.add_argument("--use-james-stein", action="store_true", default=True)
+    parser.add_argument("--no-james-stein", dest="use_james_stein", action="store_false",
+                        help="Use raw sample mean instead of JS shrinkage.")
+
+    # lm_head
     parser.add_argument("--skip-lm-head", action="store_true", default=True,
-                        help="Leave lm_head in full precision (default: True)")
-    parser.add_argument("--quantize-lm-head", dest="skip_lm_head",
-                        action="store_false",
-                        help="Quantize lm_head as well (with chunked bias correction)")
+                        help="Leave lm_head in full precision (default: True).")
+    parser.add_argument("--quantize-lm-head", dest="skip_lm_head", action="store_false",
+                        help="Quantize lm_head (chunked processing).")
 
-    parser.add_argument("--use-james-stein", action="store_true", default=True,
-                        help="Use James-Stein shrinkage for E[X] (default: True)")
-    parser.add_argument("--no-james-stein", dest="use_james_stein",
-                        action="store_false",
-                        help="Use the raw sample mean E[X] instead of JS")
-
-    parser.add_argument("--model-path", type=str,
-                        default="./models/Mistral-7B-v0.3")
-    parser.add_argument("--output-dir", type=str,
-                        default="./quantized_models/model_rtn_js_xl")
+    parser.add_argument("--model-path", type=str, default="./models/Mistral-7B-v0.3")
+    parser.add_argument("--output-dir", type=str, default="./quantized_models/model_rtn_js_xl")
     parser.add_argument("--calib-dataset", type=str, default="c4",
                         choices=["c4", "wikitext2", "wikitext2-simple"])
     parser.add_argument("--cache-dir", type=str, default="./calibration_cache")
@@ -517,17 +684,8 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     print("=" * 80)
-    print("RTN + James-Stein Bias Correction (XL)")
+    print("RTN + James-Stein + Heuristic-Guided Rounding (XL)")
     print(f"Target Model: {args.model_path}")
-    print("=" * 80)
-    print(f"Device:               {device}")
-    print(f"Bits:                 {args.bits}")
-    print(f"Group size:           {args.group_size}")
-    print(f"Skip lm_head:         {args.skip_lm_head}")
-    print(f"Use James-Stein:      {args.use_james_stein}")
-    print(f"Layer batch size:     {args.layer_batch_size}")
-    print(f"lm_head chunks:       {args.lmhead_chunks}")
-    print(f"Max tokens / sample:  {args.max_tokens_per_sample}")
     print("=" * 80)
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
@@ -546,23 +704,21 @@ def main():
     if args.calib_dataset == "c4":
         calib_texts = get_c4_calibration_data(
             tokenizer, n_samples=args.n_calib, seqlen=2048,
-            seed=args.seed, cache_dir=args.cache_dir
-        )
+            seed=args.seed, cache_dir=args.cache_dir)
     elif args.calib_dataset == "wikitext2-simple":
         calib_texts = load_wikitext2_simple(n_samples=args.n_calib)
     else:
         calib_texts = get_wikitext2_calibration_data(
             tokenizer, n_samples=args.n_calib, seqlen=2048,
-            seed=args.seed, cache_dir=args.cache_dir
-        )
+            seed=args.seed, cache_dir=args.cache_dir)
 
-    quantizer = RTN_JS_XL_Quantizer(
-        model=model,
-        tokenizer=tokenizer,
-        device=device,
-        bits=args.bits,
-        group_size=args.group_size,
+    quantizer = RTN_JS_Heuristic_XL_Quantizer(
+        model=model, tokenizer=tokenizer, device=device,
+        bits=args.bits, group_size=args.group_size,
+        use_heuristic=args.use_heuristic,
         use_james_stein=args.use_james_stein,
+        knee_tolerance=args.knee_tolerance,
+        max_flip_percent=args.max_flip_percent,
         skip_lm_head=args.skip_lm_head,
         max_tokens_per_sample=args.max_tokens_per_sample,
         layer_batch_size=args.layer_batch_size,
@@ -573,7 +729,7 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     model.save_pretrained(args.output_dir)
     tokenizer.save_pretrained(args.output_dir)
-    print(f"\n✅ Saved RTN+JS-quantized model to {args.output_dir}")
+    print(f"\n✅ Saved to {args.output_dir}")
 
 
 if __name__ == "__main__":
