@@ -178,7 +178,7 @@ class JamesSteinHeuristicAWQQuantizerXL:
     def __init__(self, model, tokenizer, device="cuda", bits=4, n_grid=20,
                  group_size=128, use_heuristic=True, knee_tolerance=0.1, max_tokens_per_sample=512,
                  layer_batch_size=16, lmhead_chunks=4, max_flip_percent=0.05,
-                 use_james_stein=True):
+                 use_james_stein=True, skip_lmhead=True):
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
@@ -192,6 +192,7 @@ class JamesSteinHeuristicAWQQuantizerXL:
         self.lmhead_chunks = lmhead_chunks
         self.max_flip_percent = max_flip_percent  # Max percentage of channel size that can be flipped
         self.use_james_stein = use_james_stein  # Enable/disable James-Stein estimation
+        self.skip_lmhead = skip_lmhead  # Skip quantization of lm_head entirely
 
         # Storage for activations
         self.activation_data = {}
@@ -212,7 +213,10 @@ class JamesSteinHeuristicAWQQuantizerXL:
             print(f"  Quantization: HEURISTIC-GUIDED GROUP-WISE ASYMMETRIC [0, {2**bits - 1}]")
         else:
             print(f"  Quantization: STANDARD GROUP-WISE ASYMMETRIC [0, {2**bits - 1}]")
-        print(f"  Special: lm_head split into {lmhead_chunks} chunks to avoid OOM")
+        if skip_lmhead:
+            print(f"  Special: lm_head SKIPPED (left unquantized)")
+        else:
+            print(f"  Special: lm_head split into {lmhead_chunks} chunks to avoid OOM")
 
     def get_hook(self, name):
         """Create a hook function for a specific layer."""
@@ -857,13 +861,26 @@ class JamesSteinHeuristicAWQQuantizerXL:
             initial_ram = psutil.virtual_memory().percent
             print(f"  Initial System RAM: {initial_ram:.1f}%")
 
-        layer_names = [(name, module) for name, module in self.model.named_modules()
-                       if isinstance(module, nn.Linear)]
+        all_layer_names = [(name, module) for name, module in self.model.named_modules()
+                           if isinstance(module, nn.Linear)]
+
+        # Optionally filter out lm_head so it is left unquantized
+        layer_names = []
+        skipped_lmhead = []
+        for name, module in all_layer_names:
+            is_lmhead = 'lm_head' in name.lower() or name.endswith('lm_head')
+            if is_lmhead and self.skip_lmhead:
+                skipped_lmhead.append(name)
+                continue
+            layer_names.append((name, module))
 
         num_layers = len(layer_names)
         num_batches = (num_layers + self.layer_batch_size - 1) // self.layer_batch_size
 
-        print(f"  Total layers: {num_layers}")
+        print(f"  Total Linear layers found: {len(all_layer_names)}")
+        if self.skip_lmhead and skipped_lmhead:
+            print(f"  Skipping lm_head (unquantized): {', '.join(skipped_lmhead)}")
+        print(f"  Total layers to quantize: {num_layers}")
         print(f"  Total batches: {num_batches}")
         print("=" * 80)
 
@@ -889,6 +906,7 @@ class JamesSteinHeuristicAWQQuantizerXL:
 
                     if is_lmhead:
                         # Use chunked processing for lm_head
+                        # (only reachable when skip_lmhead is False)
                         debug = (quantized_count < 2)
                         self.quantize_lmhead_half_by_half(name, module, debug=debug, num_chunks=self.lmhead_chunks)
                     else:
@@ -913,6 +931,8 @@ class JamesSteinHeuristicAWQQuantizerXL:
         print("\n" + "=" * 80)
         print("✓ Batched Sequential Quantization Complete")
         print(f"  Total layers quantized: {quantized_count}/{num_layers}")
+        if self.skip_lmhead and skipped_lmhead:
+            print(f"  lm_head left unquantized: {', '.join(skipped_lmhead)}")
         print("=" * 80)
 
         if self.layer_scales:
@@ -1000,6 +1020,10 @@ def main():
                        help="Enable James-Stein mean estimation (default: True)")
     parser.add_argument("--no-james-stein", dest="use_james_stein", action="store_false",
                        help="Disable James-Stein mean estimation")
+    parser.add_argument("--skip-lmhead", action="store_true", default=True,
+                       help="Skip quantization of lm_head, leaving it unquantized (default: True)")
+    parser.add_argument("--no-skip-lmhead", dest="skip_lmhead", action="store_false",
+                       help="Quantize lm_head (using chunked processing)")
     parser.add_argument("--knee-tolerance", type=float, default=0.000,
                        help="Tolerance offset for knee point (default: 0.000, higher = more conservative)")
     parser.add_argument("--max-flip-percent", type=float, default=0.05,
@@ -1041,7 +1065,10 @@ def main():
     print(f"Dynamic outlier detection: Kneedle algorithm")
     print(f"Knee tolerance offset: {args.knee_tolerance}")
     print(f"Max flip percent per channel: {args.max_flip_percent*100:.1f}%")
-    print(f"Special: lm_head split into {args.lmhead_chunks} chunks")
+    if args.skip_lmhead:
+        print(f"Special: lm_head SKIPPED (left unquantized)")
+    else:
+        print(f"Special: lm_head split into {args.lmhead_chunks} chunks")
     print("=" * 80)
 
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
@@ -1081,7 +1108,8 @@ def main():
         layer_batch_size=args.layer_batch_size,
         lmhead_chunks=args.lmhead_chunks,
         max_flip_percent=args.max_flip_percent,
-        use_james_stein=args.use_james_stein
+        use_james_stein=args.use_james_stein,
+        skip_lmhead=args.skip_lmhead
     )
 
     # Use batched sequential quantization (optimal memory/speed balance)
