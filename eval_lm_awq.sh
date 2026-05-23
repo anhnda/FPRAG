@@ -53,7 +53,7 @@ eval_model() {
     mkdir -p "$AWQ_BASE_OUT"
     python awq_stand_xl.py \
         --model-path "$MODEL_PATH" \
-        --output-dir "$AWQ_BASE_OUT" \
+        --output-dir "$AWQ_BASE_OUT" --bits 3\
         --n-calib "$N_CALIB" \
         --layer-batch-size "$LAYER_BATCH_SIZE"
 
@@ -80,7 +80,7 @@ eval_model() {
         mkdir -p "$FLIP_OUT"
         python awq_js_xl.py \
             --model-path "$MODEL_PATH" \
-            --output-dir "$FLIP_OUT" \
+            --output-dir "$FLIP_OUT" --bits 3\
             --n-calib "$N_CALIB" \
             --layer-batch-size "$LAYER_BATCH_SIZE" \
             --knee-tolerance "$KNEE" \
@@ -108,8 +108,11 @@ eval_model() {
 # =============================================================
 # EXECUTION
 # =============================================================
+eval_model "Meta-Llama-3.1-8B" \
+    "/home/DATA/prometheus/anh/.cache/huggingface/hub/models--meta-llama--Meta-Llama-3.1-8B/snapshots/d04e592bb4f6aa9cfee91e2e20afa771667e1d4b"
 eval_model "Mistral-7B-v0.3" \
     "/home/DATA/prometheus/anh/.cache/huggingface/hub/models--mistralai--Mistral-7B-v0.3/snapshots/caa1feb0e54d415e2df31207e5f4e273e33509b1"
+
 
 echo "================================================="
 echo "ALL EVALUATIONS COMPLETE. Results in: $RESULTS_DIR"
