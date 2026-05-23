@@ -42,7 +42,6 @@ eval_model() {
         --model-path "$MODEL_PATH" \
         --output-dir "$FLIP_OUT" \
         --n-calib "$N_CALIB" \
-        --adaround-lr "$ADAROUND_LR" \
         --layer-batch-size "$LAYER_BATCH_SIZE" \
         --knee-tolerance "$BEST_KNEE" \
         --max-flip-percent "$BEST_FLIP"
