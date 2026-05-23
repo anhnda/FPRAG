@@ -16,8 +16,8 @@ ADAROUND_LR=1e-3
 LAYER_BATCH_SIZE=16
 
 # Best config from grid search (same for both models)
-BEST_KNEE="0.01"
-BEST_FLIP="0.05"
+BEST_KNEE="-10"
+BEST_FLIP="1"
 
 # =============================================================
 # HELPER: evaluate one model
@@ -34,50 +34,27 @@ eval_model() {
     echo "================================================="
 
     # ----------------------------------------------------------
-    # 1. AdaRound Baseline (no flipping)
+    # 2. AWQ + Flipping — best config (knee=0.01, flip=0.05)
     # ----------------------------------------------------------
-    echo "==> STEP 1: AdaRound baseline for $MODEL_NAME"
-    mkdir -p "$BASELINE_OUT"
-    python adaround_xl.py \
-        --model-path "$MODEL_PATH" \
-        --output-dir "$BASELINE_OUT" \
-        --n-calib "$N_CALIB" \
-        --adaround-iters "$ADAROUND_ITERS" \
-        --adaround-lr "$ADAROUND_LR" \
-        --layer-batch-size "$LAYER_BATCH_SIZE"
-
-    echo "==> STEP 1b: Evaluating AdaRound baseline for $MODEL_NAME"
-    python -m lm_eval --model hf \
-        --model_args pretrained="$BASELINE_OUT" \
-        --tasks "$TASKS" \
-        --device cuda:0 \
-        --batch_size auto \
-        --output_path "${RESULTS_DIR}/${MODEL_NAME}_adaround_baseline.json"
-
-    rm -rf "$BASELINE_OUT"
-
-    # ----------------------------------------------------------
-    # 2. AdaRound + Flipping — best config (knee=0.01, flip=0.05)
-    # ----------------------------------------------------------
-    echo "==> STEP 2: AdaRound+Flip (knee=${BEST_KNEE}, flip=${BEST_FLIP}) for $MODEL_NAME"
+    echo "==> STEP 2: AWQ+Flip (knee=${BEST_KNEE}, flip=${BEST_FLIP}) for $MODEL_NAME"
     mkdir -p "$FLIP_OUT"
-    python adaround_flip_xl.py \
+    python awq_js_xl.py \
         --model-path "$MODEL_PATH" \
         --output-dir "$FLIP_OUT" \
         --n-calib "$N_CALIB" \
-        --adaround-iters "$ADAROUND_ITERS" \
         --adaround-lr "$ADAROUND_LR" \
         --layer-batch-size "$LAYER_BATCH_SIZE" \
         --knee-tolerance "$BEST_KNEE" \
         --max-flip-percent "$BEST_FLIP"
-
-    echo "==> STEP 2b: Evaluating AdaRound+Flip for $MODEL_NAME"
+    python compare_slicing.py --heuristic-path "$FLIP_OUT" 
+    
+    echo "==> STEP 2b: Evaluating AWQ+Flip for $MODEL_NAME"
     python -m lm_eval --model hf \
         --model_args pretrained="$FLIP_OUT" \
         --tasks "$TASKS" \
         --device cuda:0 \
         --batch_size auto \
-        --output_path "${RESULTS_DIR}/${MODEL_NAME}_adaround_flip_k${BEST_KNEE}_f${BEST_FLIP}.json"
+        --output_path "${RESULTS_DIR}/${MODEL_NAME}_awq_flip_k${BEST_KNEE}_f${BEST_FLIP}.json"
 
     rm -rf "$FLIP_OUT"
 
@@ -88,13 +65,13 @@ eval_model() {
 # =============================================================
 # EXECUTION
 # =============================================================
-#eval_model "Llama-3-8B" \
-#    "/home/DATA/prometheus/anh/.cache/huggingface/hub/models--meta-llama--Meta-Llama-3-8B/snapshots/8cde5ca8380496c9a6cc7ef3a8b46a0372a1d920"
+eval_model "Llama-3-8B" \
+    "/home/DATA/prometheus/anh/.cache/huggingface/hub/models--meta-llama--Meta-Llama-3-8B/snapshots/8cde5ca8380496c9a6cc7ef3a8b46a0372a1d920"
 
 #eval_model "Mistral-7B-v0.3" \
 #    "/home/DATA/prometheus/anh/.cache/huggingface/hub/models--mistralai--Mistral-7B-v0.3/snapshots/caa1feb0e54d415e2df31207e5f4e273e33509b1"
-eval_model"Qwen2.5-7B" \
-    "/home/DATA/prometheus/anh/.cache/huggingface/hub/models--Qwen--Qwen2.5-7B/snapshots/d149729398750b98c0af14eb82c78cfe92750796"
+# eval_model"Qwen2.5-7B" \
+#     "/home/DATA/prometheus/anh/.cache/huggingface/hub/models--Qwen--Qwen2.5-7B/snapshots/d149729398750b98c0af14eb82c78cfe92750796"
 
 echo "================================================="
 echo "ALL EVALUATIONS COMPLETE. Results in: $RESULTS_DIR"
