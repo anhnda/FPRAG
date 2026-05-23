@@ -4,7 +4,7 @@ ADAPTED FOR: Extra Large Models (XL) - Special handling for large layers like lm
 
 Key Features:
 - Same base algorithm as awq_standard_7b.py
-- SPECIAL: Splits lm_head into halves to avoid OOM
+- SPECIAL: Splits lm_head into halves to avoid OOM (or skips it entirely)
 - Uses E[X²] (L2 norm) for activation salience
 - Batched sequential quantization for memory efficiency
 
@@ -19,7 +19,8 @@ Algorithm:
 Special Handling for lm_head:
 - lm_head is often very large (e.g., [vocab_size × hidden_dim])
 - For models with large vocab (32k-128k), this causes OOM
-- Solution: Process output dimension in two halves
+- Default: SKIP lm_head entirely (leave it unquantized)
+- Optional: Process output dimension in chunks (--no-skip-lmhead)
 """
 
 import torch
@@ -51,7 +52,7 @@ class GroupWiseAWQAsymmetricL2Quantizer:
     Special handling for large layers (lm_head).
     """
 
-    def __init__(self, model, tokenizer, device="cuda", bits=4, n_grid=20, group_size=128, max_tokens_per_sample=512, lmhead_chunks=4):
+    def __init__(self, model, tokenizer, device="cuda", bits=4, n_grid=20, group_size=128, max_tokens_per_sample=512, lmhead_chunks=4, skip_lmhead=True):
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
@@ -60,6 +61,7 @@ class GroupWiseAWQAsymmetricL2Quantizer:
         self.group_size = group_size
         self.max_tokens_per_sample = max_tokens_per_sample  # Subsample to save memory
         self.lmhead_chunks = lmhead_chunks
+        self.skip_lmhead = skip_lmhead  # Skip quantization of lm_head entirely
 
         # Storage for activations
         self.activation_data = {}
@@ -73,7 +75,10 @@ class GroupWiseAWQAsymmetricL2Quantizer:
         print(f"  Token subsampling: {max_tokens_per_sample} tokens/sample (memory optimization)")
         print(f"  Quantization: GROUP-WISE ASYMMETRIC [0, {2**bits - 1}]")
         print(f"  Salience metric: E[X²] (L2 norm) - Better MSE alignment")
-        print(f"  Special: lm_head split into {lmhead_chunks} chunks to avoid OOM")
+        if skip_lmhead:
+            print(f"  Special: lm_head SKIPPED (left unquantized)")
+        else:
+            print(f"  Special: lm_head split into {lmhead_chunks} chunks to avoid OOM")
 
 
     @torch.no_grad()
@@ -498,10 +503,23 @@ class GroupWiseAWQAsymmetricL2Quantizer:
             initial_ram = psutil.virtual_memory().percent
             print(f"Initial System RAM: {initial_ram:.1f}%")
 
-        layer_names = [(name, module) for name, module in self.model.named_modules()
-                       if isinstance(module, nn.Linear)]
+        all_layer_names = [(name, module) for name, module in self.model.named_modules()
+                           if isinstance(module, nn.Linear)]
 
-        print(f"\nFound {len(layer_names)} linear layers to quantize")
+        # Optionally filter out lm_head so it is left unquantized
+        layer_names = []
+        skipped_lmhead = []
+        for name, module in all_layer_names:
+            is_lmhead = 'lm_head' in name.lower() or name.endswith('lm_head')
+            if is_lmhead and self.skip_lmhead:
+                skipped_lmhead.append(name)
+                continue
+            layer_names.append((name, module))
+
+        print(f"\nFound {len(all_layer_names)} linear layers total")
+        if self.skip_lmhead and skipped_lmhead:
+            print(f"Skipping lm_head (unquantized): {', '.join(skipped_lmhead)}")
+        print(f"Layers to quantize: {len(layer_names)}")
         print(f"Batch size: {layer_batch_size} layers per batch")
         num_batches = (len(layer_names) + layer_batch_size - 1) // layer_batch_size
         print(f"Total batches: {num_batches}")
@@ -530,6 +548,7 @@ class GroupWiseAWQAsymmetricL2Quantizer:
 
                     if is_lmhead:
                         # Use chunked processing for lm_head
+                        # (only reachable when skip_lmhead is False)
                         debug = (quantized_count < 2)
                         self.quantize_lmhead_half_by_half(name, module, debug=debug, num_chunks=self.lmhead_chunks)
                     else:
@@ -574,6 +593,8 @@ class GroupWiseAWQAsymmetricL2Quantizer:
 
         print(f"\n✅ Sequential Quantization Complete!")
         print(f"   Total layers quantized: {quantized_count}/{len(layer_names)}")
+        if self.skip_lmhead and skipped_lmhead:
+            print(f"   lm_head left unquantized: {', '.join(skipped_lmhead)}")
 
         if self.layer_scales:
             alphas = [info['alpha'] for info in self.layer_scales.values()]
@@ -619,6 +640,10 @@ def main():
                             "XL models require smaller batches due to larger hidden dim.")
     parser.add_argument("--lmhead-chunks", type=int, default=4,
                        help="Number of chunks to split lm_head into (default: 4, higher = less memory)")
+    parser.add_argument("--skip-lmhead", action="store_true", default=True,
+                       help="Skip quantization of lm_head, leaving it unquantized (default: True)")
+    parser.add_argument("--no-skip-lmhead", dest="skip_lmhead", action="store_false",
+                       help="Quantize lm_head (using chunked processing)")
     parser.add_argument("--cache-dir", type=str, default="./calibration_cache",
                        help="Directory to cache calibration data (default: ./calibration_cache)")
     args = parser.parse_args()
@@ -641,7 +666,10 @@ def main():
     print(f"Device: {device}")
     print(f"Group size: {args.group_size}")
     print(f"Layer Batch Size: {args.layer_batch_size}")
-    print(f"Special: lm_head split into halves")
+    if args.skip_lmhead:
+        print(f"Special: lm_head SKIPPED (left unquantized)")
+    else:
+        print(f"Special: lm_head split into {args.lmhead_chunks} chunks")
     print("=" * 80)
 
     # Load model and tokenizer
@@ -679,7 +707,8 @@ def main():
         n_grid=args.n_grid,
         group_size=args.group_size,
         max_tokens_per_sample=args.max_tokens_per_sample,
-        lmhead_chunks=args.lmhead_chunks
+        lmhead_chunks=args.lmhead_chunks,
+        skip_lmhead=args.skip_lmhead
     )
 
     # Batched sequential quantization
