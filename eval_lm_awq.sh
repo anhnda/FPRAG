@@ -15,9 +15,12 @@ ADAROUND_ITERS=10000
 ADAROUND_LR=1e-3
 LAYER_BATCH_SIZE=16
 
-# Best config from grid search (same for both models)
-BEST_KNEE="-10"
-BEST_FLIP="1"
+# Configs to test
+CONFIGS=(
+    "-10,0.05"
+    "0.03,1"
+    "-10,1"
+)
 
 # =============================================================
 # HELPER: evaluate one model
@@ -26,38 +29,44 @@ BEST_FLIP="1"
 eval_model() {
     local MODEL_NAME=$1
     local MODEL_PATH=$2
-    local BASELINE_OUT="${BASE_OUT}/${MODEL_NAME}_ar_baseline"
-    local FLIP_OUT="${BASE_OUT}/${MODEL_NAME}_arf_best"
 
     echo "================================================="
     echo "MODEL: $MODEL_NAME"
     echo "================================================="
 
-    # ----------------------------------------------------------
-    # 2. AWQ + Flipping — best config (knee=0.01, flip=0.05)
-    # ----------------------------------------------------------
-    echo "==> STEP 2: AWQ+Flip (knee=${BEST_KNEE}, flip=${BEST_FLIP}) for $MODEL_NAME"
-    mkdir -p "$FLIP_OUT"
-    python awq_js_xl.py \
-        --model-path "$MODEL_PATH" \
-        --output-dir "$FLIP_OUT" \
-        --n-calib "$N_CALIB" \
-        --layer-batch-size "$LAYER_BATCH_SIZE" \
-        --knee-tolerance "$BEST_KNEE" \
-        --max-flip-percent "$BEST_FLIP"
-    python compare_slicing.py --heuristic-path "$FLIP_OUT" 
-    
-    echo "==> STEP 2b: Evaluating AWQ+Flip for $MODEL_NAME"
-    python -m lm_eval --model hf \
-        --model_args pretrained="$FLIP_OUT" \
-        --tasks "$TASKS" \
-        --device cuda:0 \
-        --batch_size auto \
-        --output_path "${RESULTS_DIR}/${MODEL_NAME}_awq_flip_k${BEST_KNEE}_f${BEST_FLIP}.json"
+    for CONFIG in "${CONFIGS[@]}"; do
+        local KNEE="${CONFIG%%,*}"
+        local FLIP="${CONFIG##*,}"
+        local OUT_DIR="${BASE_OUT}/${MODEL_NAME}_arf_k${KNEE}_f${FLIP}"
 
-    rm -rf "$FLIP_OUT"
+        echo "==> AWQ+Flip (knee=${KNEE}, flip=${FLIP}) for $MODEL_NAME"
+        mkdir -p "$OUT_DIR"
 
-    echo "==> DONE: $MODEL_NAME"
+        python awq_js_xl.py \
+            --model-path "$MODEL_PATH" \
+            --output-dir "$OUT_DIR" \
+            --n-calib "$N_CALIB" \
+            --layer-batch-size "$LAYER_BATCH_SIZE" \
+            --knee-tolerance "$KNEE" \
+            --max-flip-percent "$FLIP"
+
+        python compare_slicing.py --heuristic-path "$OUT_DIR"
+
+        echo "==> Evaluating AWQ+Flip (knee=${KNEE}, flip=${FLIP}) for $MODEL_NAME"
+        python -m lm_eval --model hf \
+            --model_args pretrained="$OUT_DIR" \
+            --tasks "$TASKS" \
+            --device cuda:0 \
+            --batch_size auto \
+            --output_path "${RESULTS_DIR}/${MODEL_NAME}_awq_flip_k${KNEE}_f${FLIP}.json"
+
+        rm -rf "$OUT_DIR"
+
+        echo "==> Done: $MODEL_NAME | knee=${KNEE} flip=${FLIP}"
+        echo ""
+    done
+
+    echo "==> ALL CONFIGS DONE: $MODEL_NAME"
     echo ""
 }
 
@@ -69,7 +78,8 @@ eval_model() {
 
 eval_model "Mistral-7B-v0.3" \
     "/home/DATA/prometheus/anh/.cache/huggingface/hub/models--mistralai--Mistral-7B-v0.3/snapshots/caa1feb0e54d415e2df31207e5f4e273e33509b1"
-# eval_model"Qwen2.5-7B" \
+
+# eval_model "Qwen2.5-7B" \
 #     "/home/DATA/prometheus/anh/.cache/huggingface/hub/models--Qwen--Qwen2.5-7B/snapshots/d149729398750b98c0af14eb82c78cfe92750796"
 
 echo "================================================="
