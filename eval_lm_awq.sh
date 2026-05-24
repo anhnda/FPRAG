@@ -4,7 +4,7 @@ set -euo pipefail
 # --- Configuration ---
 TASKS="arc_challenge,arc_easy,boolq,hellaswag,lambada_openai,openbookqa,piqa,rte,winogrande"
 BASE_OUT="./eval_quantized_models"
-RESULTS_DIR="./eval_results_3bits"
+RESULTS_DIR="./eval_results_3bitsx"
 
 mkdir -p "$BASE_OUT"
 mkdir -p "$RESULTS_DIR"
