@@ -9,6 +9,14 @@ RESULTS_DIR="./eval_results_3bits"
 mkdir -p "$BASE_OUT"
 mkdir -p "$RESULTS_DIR"
 
+# --- Logging: send all stdout + stderr to a single timestamped log file ---
+LOG_FILE="${RESULTS_DIR}/run_$(date +%Y%m%d_%H%M%S).log"
+exec > >(tee -a "$LOG_FILE") 2>&1
+echo "================================================="
+echo "Logging all output to: $LOG_FILE"
+echo "Run started: $(date)"
+echo "================================================="
+
 # --- Shared hyperparameters ---
 N_CALIB=128
 LAYER_BATCH_SIZE=16
@@ -16,6 +24,7 @@ LAYER_BATCH_SIZE=16
 # Flip configs to test
 CONFIGS=(
     "-10,0.05"
+    "0.02,0.02"
     "0.03,1"
     "-10,1"
 )
@@ -116,3 +125,6 @@ eval_model "Mistral-7B-v0.3" \
 
 echo "================================================="
 echo "ALL EVALUATIONS COMPLETE. Results in: $RESULTS_DIR"
+echo "Full log saved to: $LOG_FILE"
+echo "Run finished: $(date)"
+echo "================================================="
