@@ -48,12 +48,12 @@ eval_model() {
     # ----------------------------------------------------------
     echo "==> STEP 0: Base model PPL + downstream — $MODEL_NAME"
     python compare_slicing.py --heuristic-path "$MODEL_PATH"
-    python -m lm_eval --model hf \
-        --model_args pretrained="$MODEL_PATH" \
-        --tasks "$TASKS" \
-        --device cuda:0 \
-        --batch_size auto \
-        --output_path "${RESULTS_DIR}/${MODEL_NAME}_base.json"
+    # python -m lm_eval --model hf \
+    #     --model_args pretrained="$MODEL_PATH" \
+    #     --tasks "$TASKS" \
+    #     --device cuda:0 \
+    #     --batch_size auto \
+    #     --output_path "${RESULTS_DIR}/${MODEL_NAME}_base.json"
 
     # ----------------------------------------------------------
     # STEP 1: AWQ baseline (no flip)
@@ -68,12 +68,12 @@ eval_model() {
 
     echo "==> STEP 1b: AWQ baseline PPL + downstream — $MODEL_NAME"
     python compare_slicing.py --heuristic-path "$AWQ_BASE_OUT"
-    python -m lm_eval --model hf \
-        --model_args pretrained="$AWQ_BASE_OUT" \
-        --tasks "$TASKS" \
-        --device cuda:0 \
-        --batch_size auto \
-        --output_path "${RESULTS_DIR}/${MODEL_NAME}_awq_base.json"
+    # python -m lm_eval --model hf \
+    #     --model_args pretrained="$AWQ_BASE_OUT" \
+    #     --tasks "$TASKS" \
+    #     --device cuda:0 \
+    #     --batch_size auto \
+    #     --output_path "${RESULTS_DIR}/${MODEL_NAME}_awq_base.json"
 
     rm -rf "$AWQ_BASE_OUT"
 
@@ -97,12 +97,12 @@ eval_model() {
 
         echo "==> STEP 2b: AWQ+Flip PPL + downstream (knee=${KNEE}, flip=${FLIP}) — $MODEL_NAME"
         python compare_slicing.py --heuristic-path "$FLIP_OUT"
-        python -m lm_eval --model hf \
-            --model_args pretrained="$FLIP_OUT" \
-            --tasks "$TASKS" \
-            --device cuda:0 \
-            --batch_size auto \
-            --output_path "${RESULTS_DIR}/${MODEL_NAME}_awq_flip_k${KNEE}_f${FLIP}.json"
+        # python -m lm_eval --model hf \
+        #     --model_args pretrained="$FLIP_OUT" \
+        #     --tasks "$TASKS" \
+        #     --device cuda:0 \
+        #     --batch_size auto \
+        #     --output_path "${RESULTS_DIR}/${MODEL_NAME}_awq_flip_k${KNEE}_f${FLIP}.json"
 
         rm -rf "$FLIP_OUT"
 
