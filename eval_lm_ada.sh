@@ -4,7 +4,7 @@ set -euo pipefail
 # --- Configuration ---
 TASKS="arc_challenge,arc_easy,boolq,hellaswag,lambada_openai,openbookqa,piqa,rte,winogrande"
 BASE_OUT="./eval_quantized_models"
-RESULTS_DIR="./eval_results_qwen25"
+RESULTS_DIR="./eval_ada_3bits"
 
 mkdir -p "$BASE_OUT"
 mkdir -p "$RESULTS_DIR"
@@ -16,8 +16,8 @@ ADAROUND_LR=1e-3
 LAYER_BATCH_SIZE=16
 
 # Best config from grid search (same for both models)
-BEST_KNEE="0.01"
-BEST_FLIP="0.05"
+BEST_KNEE="-10"
+BEST_FLIP="1"
 
 # =============================================================
 # HELPER: evaluate one model
@@ -39,7 +39,7 @@ eval_model() {
     echo "==> STEP 1: AdaRound baseline for $MODEL_NAME"
     mkdir -p "$BASELINE_OUT"
     python adaround_xl.py \
-        --model-path "$MODEL_PATH" \
+        --model-path "$MODEL_PATH" --bits 3 \
         --output-dir "$BASELINE_OUT" \
         --n-calib "$N_CALIB" \
         --adaround-iters "$ADAROUND_ITERS" \
@@ -64,6 +64,7 @@ eval_model() {
     python adaround_flip_xl.py \
         --model-path "$MODEL_PATH" \
         --output-dir "$FLIP_OUT" \
+        --bits 3 \  
         --n-calib "$N_CALIB" \
         --adaround-iters "$ADAROUND_ITERS" \
         --adaround-lr "$ADAROUND_LR" \
@@ -90,11 +91,12 @@ eval_model() {
 # =============================================================
 #eval_model "Llama-3-8B" \
 #    "/home/DATA/prometheus/anh/.cache/huggingface/hub/models--meta-llama--Meta-Llama-3-8B/snapshots/8cde5ca8380496c9a6cc7ef3a8b46a0372a1d920"
-
-#eval_model "Mistral-7B-v0.3" \
-#    "/home/DATA/prometheus/anh/.cache/huggingface/hub/models--mistralai--Mistral-7B-v0.3/snapshots/caa1feb0e54d415e2df31207e5f4e273e33509b1"
-eval_model"Qwen2.5-7B" \
-    "/home/DATA/prometheus/anh/.cache/huggingface/hub/models--Qwen--Qwen2.5-7B/snapshots/d149729398750b98c0af14eb82c78cfe92750796"
+eval_model "Meta-Llama-3.1-8B" \
+    "/home/DATA/prometheus/anh/.cache/huggingface/hub/models--meta-llama--Meta-Llama-3.1-8B/snapshots/d04e592bb4f6aa9cfee91e2e20afa771667e1d4b"
+eval_model "Mistral-7B-v0.3" \
+    "/home/DATA/prometheus/anh/.cache/huggingface/hub/models--mistralai--Mistral-7B-v0.3/snapshots/caa1feb0e54d415e2df31207e5f4e273e33509b1"
+#eval_model"Qwen2.5-7B" \
+#    "/home/DATA/prometheus/anh/.cache/huggingface/hub/models--Qwen--Qwen2.5-7B/snapshots/d149729398750b98c0af14eb82c78cfe92750796"
 
 echo "================================================="
 echo "ALL EVALUATIONS COMPLETE. Results in: $RESULTS_DIR"
